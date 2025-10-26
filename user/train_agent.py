@@ -608,6 +608,6 @@ if __name__ == '__main__':
         save_handler,
         opponent_cfg,
         CameraResolution.LOW,
-        train_timesteps=1_000_000_000,
+        train_timesteps=50_000,
         train_logging=TrainLogging.PLOT
     )

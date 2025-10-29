@@ -1157,14 +1157,237 @@ def penalize_attack_spam(env: WarehouseBrawl) -> float:
     player = env.objects["player"]
     return -0.02 if is_player_attacking(player) else 0.0
 
+# --------------------------------------------------------------------------------
+# ----------------------- ATTACK BOUNDARY SAFETY ---------------------------------
+# --------------------------------------------------------------------------------
+
+def predict_attack_danger(player, opponent, attack_type: str = "any") -> dict:
+    """
+    Predict if attacking will put player in danger
+    
+    Returns dict with:
+    - 'safe': bool
+    - 'danger_level': float (0-1)
+    - 'reason': str
+    """
+    result = {
+        'safe': True,
+        'danger_level': 0.0,
+        'reason': 'Safe to attack'
+    }
+    
+    player_pos = np.array([player.body.position.x, player.body.position.y])
+    player_vel = np.array([player.body.velocity.x, player.body.velocity.y]) if hasattr(player.body, 'velocity') else np.array([0, 0])
+    
+    # Define stage boundaries (adjust to your stage)
+    STAGE_X_LIMIT = 10.0
+    STAGE_Y_MIN = -1.0
+    
+    # Predict position after attack (simplified physics)
+    # Different attacks have different momentum
+    attack_momentum = {
+        'light': (0.5, 0.2),      # (forward, upward)
+        'heavy': (1.2, 0.1),      # Heavy attacks push forward
+        'aerial': (0.3, -0.8),    # Aerial attacks move down
+        'dash_attack': (2.0, 0.0) # Dash attacks move far
+    }
+    
+    # Use 'heavy' as default worst case
+    momentum_x, momentum_y = attack_momentum.get(attack_type, (1.0, 0.0))
+    
+    # Add attack momentum to current velocity
+    predicted_vel_x = player_vel[0] + momentum_x * np.sign(player_vel[0] if abs(player_vel[0]) > 0.1 else 1.0)
+    predicted_vel_y = player_vel[1] + momentum_y
+    
+    # Predict position 30 frames (0.5 seconds) ahead
+    frames_ahead = 30
+    predicted_x = player_pos[0] + predicted_vel_x * frames_ahead * 0.016  # assuming ~60fps
+    predicted_y = player_pos[1] + predicted_vel_y * frames_ahead * 0.016
+    
+    # Check boundaries
+    danger_reasons = []
+    danger_score = 0.0
+    
+    # X boundary danger
+    if abs(predicted_x) > STAGE_X_LIMIT - 1.0:
+        danger_score += 0.5
+        danger_reasons.append("Will approach X boundary")
+        
+    if abs(predicted_x) > STAGE_X_LIMIT:
+        danger_score += 0.5
+        danger_reasons.append("Will exceed X boundary!")
+    
+    # Y boundary danger (falling)
+    if predicted_y < STAGE_Y_MIN + 0.5:
+        danger_score += 0.4
+        danger_reasons.append("Will fall too low")
+        
+    if predicted_y < STAGE_Y_MIN:
+        danger_score += 0.6
+        danger_reasons.append("Will fall off stage!")
+    
+    # Current position already dangerous
+    if abs(player_pos[0]) > STAGE_X_LIMIT - 2.0:
+        danger_score += 0.3
+        danger_reasons.append("Currently near edge")
+    
+    if player_pos[1] < STAGE_Y_MIN + 1.0:
+        danger_score += 0.3
+        danger_reasons.append("Currently near fall zone")
+    
+    # Final assessment
+    result['danger_level'] = min(danger_score, 1.0)
+    result['safe'] = danger_score < 0.3
+    result['reason'] = "; ".join(danger_reasons) if danger_reasons else "Safe to attack"
+    
+    return result
+
+
+def safe_attack_reward(env: WarehouseBrawl) -> float:
+    """
+    Reward safe attacks, heavily penalize dangerous attacks
+    """
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+    
+    # Only evaluate when attacking
+    if not is_player_attacking(player):
+        return 0.0
+    
+    # Determine attack type based on action
+    action = player.cur_action if hasattr(player, 'cur_action') else None
+    attack_type = "light" if (action is not None and action[7] > 0.5) else "heavy"
+    
+    # Check if dash attacking
+    if is_player_dashing(player) and is_player_attacking(player):
+        attack_type = "dash_attack"
+    
+    # Predict danger
+    danger_info = predict_attack_danger(player, opponent, attack_type)
+    
+    if not danger_info['safe']:
+        # Penalize based on danger level
+        penalty = -5.0 * danger_info['danger_level']
+        
+        # Extra penalty for extremely dangerous attacks
+        if danger_info['danger_level'] > 0.7:
+            penalty *= 2.0
+        
+        return penalty
+    else:
+        # Small reward for safe aggression
+        return 0.3
+    
+    return 0.0
+
+
+def momentum_awareness_reward(env: WarehouseBrawl) -> float:
+    """
+    Teach agent to respect attack momentum and positioning
+    """
+    player = env.objects["player"]
+    
+    if not hasattr(player.body, 'velocity'):
+        return 0.0
+    
+    velocity_magnitude = np.linalg.norm([player.body.velocity.x, player.body.velocity.y])
+    
+    # If moving fast toward edge, penalize attacking
+    edge_distance = min(
+        10.0 - abs(player.body.position.x),  # Distance to left/right edge
+        player.body.position.y - (-1.0)       # Distance to bottom
+    )
+    
+    if edge_distance < 2.0 and velocity_magnitude > 1.0:
+        if is_player_attacking(player):
+            # Moving fast near edge and attacking = very bad
+            return -3.0 * (2.0 - edge_distance)
+        else:
+            # Moving fast near edge without attacking = still concerning
+            return -1.0 * (2.0 - edge_distance)
+    
+    return 0.0
+
+
+def recovery_priority_reward(env: WarehouseBrawl) -> float:
+    """
+    When in danger, prioritize recovery over attacking
+    """
+    player = env.objects["player"]
+    
+    # Check if in danger
+    in_danger = (
+        player.body.position.y < 0.5 or 
+        abs(player.body.position.x) > 8.0
+    )
+    
+    if in_danger:
+        # Heavily penalize attacking when in danger
+        if is_player_attacking(player):
+            return -4.0
+        
+        # Reward defensive actions
+        if is_player_jumping(player):
+            return 2.0  # Jump to recover
+        
+        if is_player_dashing(player) and not is_player_attacking(player):
+            # Dash toward center
+            moving_toward_center = (
+                (player.body.position.x > 0 and is_player_moving(player) and player.cur_action[1] > 0.5) or  # Left when right side
+                (player.body.position.x < 0 and is_player_moving(player) and player.cur_action[3] > 0.5)     # Right when left side
+            )
+            if moving_toward_center:
+                return 1.5
+    
+    return 0.0
+
+
+def attack_commitment_reward(env: WarehouseBrawl) -> float:
+    """
+    Reward finishing attack strings, penalize half-committed attacks
+    """
+    if not hasattr(env, "attack_state"):
+        env.attack_state = {
+            'in_attack': False,
+            'attack_frames': 0,
+            'completed_attacks': 0
+        }
+    
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+    
+    currently_attacking = is_player_attacking(player)
+    
+    # Track attack state
+    if currently_attacking:
+        if not env.attack_state['in_attack']:
+            env.attack_state['in_attack'] = True
+            env.attack_state['attack_frames'] = 0
+        env.attack_state['attack_frames'] += 1
+    else:
+        if env.attack_state['in_attack']:
+            # Just finished attacking
+            env.attack_state['in_attack'] = False
+            
+            # Check if it was a good attack (lasted reasonable duration)
+            if env.attack_state['attack_frames'] >= 10:
+                # Good commitment
+                env.attack_state['completed_attacks'] += 1
+                return 0.8
+            elif env.attack_state['attack_frames'] < 5:
+                # Panic attack / accidental input
+                return -0.5
+    
+    return 0.0
+
 # -------------------------------------------------------------------------
 # ----------------------------- REWARD MANAGER -----------------------------
 # -------------------------------------------------------------------------
 
 def gen_reward_manager():
     """
-    Enhanced tournament-optimized reward configuration
-    With correct action indices
+    Tournament-optimized reward configuration
+    WITH ATTACK BOUNDARY SAFETY
     """
     reward_functions = {
         # === SURVIVAL & SAFETY (HIGHEST PRIORITY) ===
@@ -1172,6 +1395,12 @@ def gen_reward_manager():
         'self_preservation_reward': RewTerm(func=self_preservation_reward, weight=2.5),
         'ledge_safety_reward': RewTerm(func=ledge_safety_reward, weight=1.8),
         'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=-2.0),
+        
+        # === ATTACK SAFETY ===
+        'safe_attack_reward': RewTerm(func=safe_attack_reward, weight=2.0),
+        'momentum_awareness_reward': RewTerm(func=momentum_awareness_reward, weight=1.5),
+        'recovery_priority_reward': RewTerm(func=recovery_priority_reward, weight=2.2),
+        'attack_commitment_reward': RewTerm(func=attack_commitment_reward, weight=0.6),
         
         # === PLATFORM AWARENESS ===
         'platform_awareness_reward': RewTerm(func=platform_awareness_reward, weight=1.5),
@@ -1183,7 +1412,7 @@ def gen_reward_manager():
         # === SMART COMBAT ===
         'damage_interaction_reward': RewTerm(
             func=lambda env: damage_interaction_reward(env, mode=RewardMode.SYMMETRIC),
-            weight=2.0
+            weight=1.8  # Slightly reduced since we added safe_attack_reward
         ),
         'situational_aggression_reward': RewTerm(func=situational_aggression_reward, weight=1.0),
         
@@ -1381,6 +1610,145 @@ def setup_training_configuration(
     
     return reward_manager, selfplay_handler, save_handler, opponent_cfg, curriculum
 
+# --------------------------------------------------------------------------------
+# --------------------------- REWARD TARGET SYSTEM -------------------------------
+# --------------------------------------------------------------------------------
+
+class RewardTargets:
+    """Expected reward ranges for different performance levels"""
+    
+    # Per Episode (full match) targets
+    EXCELLENT_WIN = 300      # Dominant victory with minimal damage taken
+    GOOD_WIN = 200           # Solid win
+    CLOSE_WIN = 100          # Narrow victory
+    CLOSE_LOSS = -50         # Lost but played well
+    BAD_LOSS = -150          # Got dominated
+    TERRIBLE = -300          # Died multiple times, played recklessly
+    
+    # Key milestones
+    WIN_BONUS = 250          # From win signal
+    DEATH_PENALTY = -50      # From knockout signal
+    GOOD_COMBO = 20          # 4-5 hit combo
+    FIRST_BLOOD = 20         # First hit bonus
+    
+    @classmethod
+    def get_performance_level(cls, total_reward: float) -> str:
+        """Return performance description based on reward"""
+        if total_reward >= cls.EXCELLENT_WIN:
+            return "EXCELLENT - Dominated opponent!"
+        elif total_reward >= cls.GOOD_WIN:
+            return "GOOD - Solid victory"
+        elif total_reward >= cls.CLOSE_WIN:
+            return "OKAY - Close win"
+        elif total_reward >= cls.CLOSE_LOSS:
+            return "DECENT - Close loss"
+        elif total_reward >= cls.BAD_LOSS:
+            return "POOR - Got dominated"
+        else:
+            return "TERRIBLE - Very reckless play"
+
+# --------------------------------------------------------------------------------
+# ------------------------- REWARD MONITORING SYSTEM -----------------------------
+# --------------------------------------------------------------------------------
+
+class RewardMonitor:
+    """
+    Monitor and log reward statistics during training
+    """
+    def __init__(self, window_size: int = 100):
+        self.window_size = window_size
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.win_count = 0
+        self.loss_count = 0
+        self.avg_damage_dealt = []
+        self.avg_damage_taken = []
+        self.death_count = 0
+        
+    def log_episode(self, total_reward: float, episode_length: int, 
+                    won: bool, damage_dealt: float, damage_taken: float,
+                    died: bool):
+        """Log episode statistics"""
+        self.episode_rewards.append(total_reward)
+        self.episode_lengths.append(episode_length)
+        self.avg_damage_dealt.append(damage_dealt)
+        self.avg_damage_taken.append(damage_taken)
+        
+        if won:
+            self.win_count += 1
+        else:
+            self.loss_count += 1
+            
+        if died:
+            self.death_count += 1
+        
+        # Keep only recent episodes
+        if len(self.episode_rewards) > self.window_size:
+            self.episode_rewards.pop(0)
+            self.episode_lengths.pop(0)
+            self.avg_damage_dealt.pop(0)
+            self.avg_damage_taken.pop(0)
+    
+    def get_statistics(self) -> dict:
+        """Get current statistics"""
+        if not self.episode_rewards:
+            return {}
+        
+        total_games = self.win_count + self.loss_count
+        win_rate = (self.win_count / total_games * 100) if total_games > 0 else 0
+        
+        return {
+            'avg_reward': np.mean(self.episode_rewards),
+            'min_reward': np.min(self.episode_rewards),
+            'max_reward': np.max(self.episode_rewards),
+            'std_reward': np.std(self.episode_rewards),
+            'avg_episode_length': np.mean(self.episode_lengths),
+            'win_rate': win_rate,
+            'total_games': total_games,
+            'deaths': self.death_count,
+            'avg_damage_dealt': np.mean(self.avg_damage_dealt),
+            'avg_damage_taken': np.mean(self.avg_damage_taken),
+            'kd_ratio': np.mean(self.avg_damage_dealt) / max(np.mean(self.avg_damage_taken), 1.0)
+        }
+    
+    def print_statistics(self):
+        """Print formatted statistics"""
+        stats = self.get_statistics()
+        if not stats:
+            print("No statistics available yet")
+            return
+        
+        print("\n" + "="*70)
+        print("TRAINING STATISTICS (Last {} episodes)".format(self.window_size))
+        print("="*70)
+        print(f"Average Reward:        {stats['avg_reward']:>8.2f}")
+        print(f"Reward Range:          {stats['min_reward']:>8.2f} to {stats['max_reward']:>8.2f}")
+        print(f"Reward Std Dev:        {stats['std_reward']:>8.2f}")
+        print(f"Avg Episode Length:    {stats['avg_episode_length']:>8.0f} steps")
+        print(f"\nWin Rate:              {stats['win_rate']:>7.1f}%")
+        print(f"Total Games:           {stats['total_games']:>8d}")
+        print(f"Deaths:                {stats['deaths']:>8d}")
+        print(f"\nAvg Damage Dealt:      {stats['avg_damage_dealt']:>8.2f}")
+        print(f"Avg Damage Taken:      {stats['avg_damage_taken']:>8.2f}")
+        print(f"K/D Ratio:             {stats['kd_ratio']:>8.2f}")
+        print("="*70)
+        
+        # Performance assessment
+        performance = RewardTargets.get_performance_level(stats['avg_reward'])
+        print(f"Performance Level: {performance}")
+        print("="*70 + "\n")
+
+
+def create_monitored_reward_manager(monitor: RewardMonitor):
+    """
+    Create reward manager with monitoring capabilities
+    """
+    base_manager = gen_reward_manager()
+    
+    # You can wrap reward functions to track them if needed
+    # For now, just return the base manager
+    return base_manager
+
 
 # -------------------------------------------------------------------------
 # ----------------------------- MAIN FUNCTION -----------------------------
@@ -1393,47 +1761,42 @@ if __name__ == '__main__':
     
     # ==================== CONFIGURATION ====================
     
-    # Choose agent type: "custom", "recurrent", "standard", or "simple"
-    # Use "simple" if you encounter NaN errors with "custom"
-    AGENT_TYPE = "simple"  # Changed to simple for better stability
-    
-    # Training settings
-    TOTAL_TRAINING_TIMESTEPS = 8_000_000  # 5M total timesteps
-    TRAINING_BATCH_SIZE = 100_000  # Train in batches for curriculum updates
-    
-    # Enable curriculum learning (recommended)
+    AGENT_TYPE = "simple"
+    TOTAL_TRAINING_TIMESTEPS = 8_000_000
+    TRAINING_BATCH_SIZE = 100_000
     CURRICULUM_ENABLED = True
-    
-    # Resume from checkpoint (set to None to start fresh)
-    RESUME_FROM = None  # e.g., 'checkpoints/tournament_run/rl_model_1200000_steps.zip'
-    
-    # Experiment name
-    RUN_NAME = "tournament_elite_v1"
-    
-    # Save settings
+    RESUME_FROM = None
+    RUN_NAME = "tournament_safe_attack_v1"
     SAVE_FREQUENCY = 100_000
     MAX_CHECKPOINTS = 500
+    
+    # Monitoring
+    ENABLE_MONITORING = True
+    MONITOR_INTERVAL = 10_000  # Print stats every 10k steps
     
     print(f"\nConfiguration:")
     print(f"  Agent Type: {AGENT_TYPE}")
     print(f"  Training Timesteps: {TOTAL_TRAINING_TIMESTEPS:,}")
     print(f"  Curriculum Learning: {CURRICULUM_ENABLED}")
-    print(f"  Resume From: {RESUME_FROM or 'Starting fresh'}")
+    print(f"  Monitoring: {ENABLE_MONITORING}")
     print(f"  Run Name: {RUN_NAME}")
-    print("=" * 70)
+    print("="*70)
     
-    # ==================== AGENT CREATION ====================
+    # ==================== SETUP ====================
     
-    print("\n[1/5] Creating agent...")
+    print("\n[1/6] Creating agent...")
     my_agent = create_tournament_agent(
         agent_type=AGENT_TYPE,
         load_path=RESUME_FROM
     )
     print(f"✓ {AGENT_TYPE.capitalize()} agent created")
     
-    # ==================== TRAINING SETUP ====================
+    print("\n[2/6] Setting up monitoring...")
+    reward_monitor = RewardMonitor(window_size=100) if ENABLE_MONITORING else None
+    if reward_monitor:
+        print("✓ Reward monitoring enabled")
     
-    print("\n[2/5] Setting up training configuration...")
+    print("\n[3/6] Setting up training configuration...")
     reward_manager, selfplay_handler, save_handler, opponent_cfg, curriculum = setup_training_configuration(
         agent=my_agent,
         curriculum_enabled=CURRICULUM_ENABLED,
@@ -1441,7 +1804,11 @@ if __name__ == '__main__':
         save_freq=SAVE_FREQUENCY,
         max_checkpoints=MAX_CHECKPOINTS
     )
-    print("✓ Reward manager configured with 13 reward functions")
+    
+    # Use the new reward manager with attack safety
+    reward_manager = gen_reward_manager()
+    
+    print("✓ Reward manager configured with attack boundary safety")
     print("✓ Self-play handler initialized")
     print("✓ Save handler configured")
     print("✓ Opponent configuration set")
@@ -1452,12 +1819,12 @@ if __name__ == '__main__':
     
     # ==================== TRAINING LOOP ====================
     
-    print("\n[3/5] Starting training...")
-    print("=" * 70)
+    print("\n[4/6] Starting training...")
+    print("="*70)
     
     if CURRICULUM_ENABLED:
-        # Train with curriculum updates
         timesteps_trained = 0
+        last_monitor_check = 0
         
         while timesteps_trained < TOTAL_TRAINING_TIMESTEPS:
             remaining = TOTAL_TRAINING_TIMESTEPS - timesteps_trained
@@ -1479,14 +1846,19 @@ if __name__ == '__main__':
             
             timesteps_trained += batch_size
             
+            # Print monitoring statistics
+            if ENABLE_MONITORING and (timesteps_trained - last_monitor_check) >= MONITOR_INTERVAL:
+                reward_monitor.print_statistics()
+                last_monitor_check = timesteps_trained
+            
             # Update curriculum
             phase_changed = curriculum.update(batch_size)
             
             if phase_changed:
-                print(f"\n{'!' * 70}")
+                print(f"\n{'!'*70}")
                 print(f"PHASE TRANSITION!")
                 print(f"{curriculum.get_phase_message()}")
-                print(f"{'!' * 70}\n")
+                print(f"{'!'*70}\n")
                 
                 # Update opponent configuration for new phase
                 new_opponent_spec = curriculum.get_opponent_config()
@@ -1507,22 +1879,26 @@ if __name__ == '__main__':
     
     # ==================== TRAINING COMPLETE ====================
     
-    print("\n" + "=" * 70)
-    print("[4/5] Training complete!")
-    print("=" * 70)
+    print("\n" + "="*70)
+    print("[5/6] Training complete!")
+    print("="*70)
+    
+    if ENABLE_MONITORING:
+        print("\nFinal Statistics:")
+        reward_monitor.print_statistics()
     
     # ==================== FINAL SAVE ====================
     
-    print("\n[5/5] Saving final model...")
+    print("\n[6/6] Saving final model...")
     final_path = f"checkpoints/{RUN_NAME}/final_model.zip"
     my_agent.save(final_path)
     print(f"✓ Final model saved to: {final_path}")
     
     # ==================== SUMMARY ====================
     
-    print("\n" + "=" * 70)
+    print("\n" + "="*70)
     print("TRAINING SUMMARY")
-    print("=" * 70)
+    print("="*70)
     print(f"Total timesteps trained: {TOTAL_TRAINING_TIMESTEPS:,}")
     print(f"Checkpoints saved: Every {SAVE_FREQUENCY:,} steps")
     print(f"Final model location: {final_path}")
@@ -1530,3 +1906,16 @@ if __name__ == '__main__':
     if CURRICULUM_ENABLED:
         print(f"\nCurriculum Progress:")
         print(f"  Final Phase: {curriculum.get_phase_message()}")
+    
+    if ENABLE_MONITORING:
+        stats = reward_monitor.get_statistics()
+        if stats:
+            print(f"\nFinal Performance Metrics:")
+            print(f"  Average Reward: {stats['avg_reward']:.2f}")
+            print(f"  Win Rate: {stats['win_rate']:.1f}%")
+            print(f"  K/D Ratio: {stats['kd_ratio']:.2f}")
+            print(f"  Performance: {RewardTargets.get_performance_level(stats['avg_reward'])}")
+    
+    print("\n" + "="*70)
+    print("Training complete! Your agent is ready for tournament play.")
+    print("="*70)

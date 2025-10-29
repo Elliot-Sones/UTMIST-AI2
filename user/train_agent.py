@@ -13,6 +13,7 @@ Logic overview
 UTMIST AI² - Transformer-Based Strategy Recognition Training System
 
 Training:
+
 1. Encoder model (transformer strategy encoder)
 At every frame, the model encodes the opponents actions into a 256-dim vector that represents the opponents strategy 
 
@@ -43,14 +44,15 @@ Sections of the code:
 --------------------------------------------------------------------------------
 1. Imports
 2. Editable Training Configuration
-3 Encoder Model: 
-3. Main Agent (TransformerStrategyAgent)
-4. Supporting Training Agents
-5. Reward Shaping Library
-6. Self-Play Infrastructure
-7. Training Loop (train)
-8. Evaluation and Match Helpers
-9. Main Entrypoint (__main__)
+
+3 Encoder Model
+4. Main Agent (TransformerStrategyAgent)
+5. Supporting Training Agents
+6. Reward Shaping Library
+7. Self-Play Infrastructure
+8. Training Loop (train)
+9. Evaluation and Match Helpers
+10. Main Entrypoint (__main__)
 
 =============================================================================
 WHAT WE ARE BUILDING: AlphaGo-Style Strategy Understanding
@@ -149,8 +151,10 @@ TRAIN_CONFIG_TRANSFORMER: Dict[str, dict] = {
 # Use the transformer strategy configuration exclusively
 TRAIN_CONFIG = TRAIN_CONFIG_TRANSFORMER  # Transformer with pure latent space
 
+
+
 # --------------------------------------------------------------------------------
-# ----------------------------- 2.5. Transformer-Based Strategy Recognition -----------------------------
+# ----------------------------- 3. Encoder-Based Strategy Recognition -----------------------------
 # --------------------------------------------------------------------------------
 # Pure latent space learning with self-attention for infinite strategy understanding.
 # NO pre-defined concepts - learns abstract representations like AlphaGo.

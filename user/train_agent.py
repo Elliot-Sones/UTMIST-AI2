@@ -31,6 +31,10 @@ from environment.agent import *
 from typing import Optional, Type, List, Tuple
 from functools import partial
 
+import csv
+import os
+from datetime import datetime
+
 # -------------------------------------------------------------------------
 # ----------------------------- AGENT CLASSES -----------------------------
 # -------------------------------------------------------------------------
@@ -1653,9 +1657,9 @@ class RewardTargets:
 
 class RewardMonitor:
     """
-    Monitor and log reward statistics during training
+    Monitor, log, and save reward statistics during training
     """
-    def __init__(self, window_size: int = 100):
+    def __init__(self, window_size: int = 100, log_dir: str = "./checkpoints/logs"):
         self.window_size = window_size
         self.episode_rewards = []
         self.episode_lengths = []
@@ -1664,7 +1668,23 @@ class RewardMonitor:
         self.avg_damage_dealt = []
         self.avg_damage_taken = []
         self.death_count = 0
-        
+
+        # Ensure log directory exists
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_file = os.path.join(log_dir, "training_stats.csv")
+
+        # Initialize CSV file if it doesn't exist
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, mode='w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp",
+                    "avg_reward", "min_reward", "max_reward", "std_reward",
+                    "avg_episode_length", "win_rate", "total_games",
+                    "deaths", "avg_damage_dealt", "avg_damage_taken", "kd_ratio",
+                    "performance_level"
+                ])
+
     def log_episode(self, total_reward: float, episode_length: int, 
                     won: bool, damage_dealt: float, damage_taken: float,
                     died: bool):
@@ -1711,8 +1731,28 @@ class RewardMonitor:
             'kd_ratio': np.mean(self.avg_damage_dealt) / max(np.mean(self.avg_damage_taken), 1.0)
         }
     
+    def _save_statistics(self, stats, performance):
+        """Internal: append stats to CSV"""
+        with open(self.log_file, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                stats['avg_reward'],
+                stats['min_reward'],
+                stats['max_reward'],
+                stats['std_reward'],
+                stats['avg_episode_length'],
+                stats['win_rate'],
+                stats['total_games'],
+                stats['deaths'],
+                stats['avg_damage_dealt'],
+                stats['avg_damage_taken'],
+                stats['kd_ratio'],
+                performance
+            ])
+
     def print_statistics(self):
-        """Print formatted statistics"""
+        """Print formatted statistics and log to file"""
         stats = self.get_statistics()
         if not stats:
             print("No statistics available yet")
@@ -1733,10 +1773,16 @@ class RewardMonitor:
         print(f"K/D Ratio:             {stats['kd_ratio']:>8.2f}")
         print("="*70)
         
-        # Performance assessment
-        performance = RewardTargets.get_performance_level(stats['avg_reward'])
+        try:
+            performance = RewardTargets.get_performance_level(stats['avg_reward'])
+        except NameError:
+            performance = "N/A"
+        
         print(f"Performance Level: {performance}")
         print("="*70 + "\n")
+
+        # Save the same stats to CSV
+        self._save_statistics(stats, performance)
 
 
 def create_monitored_reward_manager(monitor: RewardMonitor):

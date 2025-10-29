@@ -762,6 +762,214 @@ def first_hit_reward(env: WarehouseBrawl) -> float:
             return -10.0  # Penalty for getting hit first
     
     return 0.0
+def self_preservation_reward(env: WarehouseBrawl) -> float:
+    """
+    Heavily penalize actions that lead to mutual deaths
+    """
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+    
+    # Track if both players are in danger
+    player_danger = player.body.position.y < 0.5 or abs(player.body.position.x) > 8.0
+    opponent_danger = opponent.body.position.y < 0.5 or abs(opponent.body.position.x) > 8.0
+    
+    # CRITICAL: If player is in danger, penalize being near opponent
+    if player_danger:
+        dist = np.linalg.norm([
+            player.body.position.x - opponent.body.position.x,
+            player.body.position.y - opponent.body.position.y
+        ])
+        
+        if dist < 2.5:
+            # Very close while in danger = likely mutual death
+            return -8.0
+        elif dist < 4.0:
+            return -3.0
+        else:
+            # Reward escaping danger
+            return 1.5
+    
+    # If opponent is in danger but player is safe, reward pressure
+    if opponent_danger and not player_danger:
+        return 2.0
+    
+    return 0.0
+
+
+def ledge_safety_reward(env: WarehouseBrawl) -> float:
+    """
+    Prevent ledge deaths
+    """
+    player = env.objects["player"]
+    
+    # Define stage boundaries (adjust based on your stage)
+    stage_x_limit = 9.0
+    stage_y_limit = -1.0
+    
+    # Distance from edge
+    edge_dist_x = stage_x_limit - abs(player.body.position.x)
+    edge_dist_y = player.body.position.y - stage_y_limit
+    
+    # Penalize being near edges
+    if edge_dist_x < 2.0:
+        penalty = -1.5 * (2.0 - edge_dist_x)
+        return penalty
+    
+    if edge_dist_y < 1.5:
+        penalty = -2.0 * (1.5 - edge_dist_y)
+        return penalty
+    
+    # Reward staying in safe zone
+    if edge_dist_x > 5.0 and edge_dist_y > 3.0:
+        return 0.4
+    
+    return 0.0
+
+
+def situational_aggression_reward(env: WarehouseBrawl) -> float:
+    """
+    Only be aggressive when safe to do so
+    """
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+    
+    # Check if player is in safe position
+    player_safe = (
+        1.0 <= player.body.position.y <= 5.0 and
+        abs(player.body.position.x) < 7.0
+    )
+    
+    # Check if attacking
+    is_attacking = isinstance(player.state, AttackState)
+    
+    if is_attacking:
+        if player_safe:
+            # Reward safe aggression
+            return 0.5
+        else:
+            # Heavily penalize risky aggression
+            return -2.5
+    
+    return 0.0
+
+def respect_knockout_reward(env: WarehouseBrawl) -> float:
+    """
+    Penalize wasting actions when opponent is knocked out
+    """
+    opponent = env.objects["opponent"]
+    player = env.objects["player"]
+    
+    # Check if opponent is in knockout/respawn state
+    opponent_knocked_out = opponent.state in [5, 11]  # Adjust state IDs as needed
+    
+    if opponent_knocked_out:
+        # Heavily penalize any movement or attacks
+        action = player.cur_action if hasattr(player, 'cur_action') else None
+        
+        if action is not None:
+            # Count active inputs
+            active_inputs = (action > 0.5).sum()
+            
+            if active_inputs > 0:
+                return -1.5 * active_inputs
+        
+        # Reward staying still
+        velocity = np.linalg.norm([player.body.velocity.x, player.body.velocity.y])
+        if velocity < 0.1:
+            return 0.5
+    
+    return 0.0
+
+
+def opportunistic_positioning_reward(env: WarehouseBrawl) -> float:
+    """
+    Encourage good positioning during opponent respawn
+    """
+    opponent = env.objects["opponent"]
+    player = env.objects["player"]
+    
+    opponent_knocked_out = opponent.state in [5, 11]
+    
+    if opponent_knocked_out:
+        # Reward moving to center stage
+        center_distance = abs(player.body.position.x)
+        
+        if center_distance < 2.0:
+            return 1.0
+        elif center_distance < 4.0:
+            return 0.5
+    
+    return 0.0
+
+def platform_awareness_reward(env: WarehouseBrawl) -> float:
+    """
+    Reward proper platform navigation and jumping (without JumpState dependency)
+    """
+    player = env.objects["player"]
+    
+    # Get platform positions (adjust based on your platform names)
+    platforms = [obj for name, obj in env.objects.items() if 'platform' in name.lower()]
+    
+    if not platforms:
+        return 0.0
+    
+    # Find nearest platform
+    min_dist = float('inf')
+    nearest_platform = None
+    
+    for platform in platforms:
+        dist = abs(player.body.position.x - platform.body.position.x)
+        if dist < min_dist:
+            min_dist = dist
+            nearest_platform = platform
+    
+    if nearest_platform is None:
+        return 0.0
+    
+    # Reward being above platforms (not falling)
+    if player.body.position.y > nearest_platform.body.position.y - 0.5:
+        return 0.5
+    
+    # Penalize being below platforms
+    if player.body.position.y < nearest_platform.body.position.y - 2.0:
+        return -1.5
+    
+    # Reward jumping when approaching platform edge (check action instead of state)
+    platform_edge_threshold = 1.5
+    if min_dist < platform_edge_threshold:
+        # Check if space key (jump) is pressed in the action
+        if hasattr(player, 'cur_action'):
+            action = player.cur_action
+            # Assuming 'space' is one of the action dimensions
+            # You may need to adjust the index based on your action space
+            # Typically: ['w', 'a', 's', 'd', 'space', 'h', 'j', 'k', 'l', 'g']
+            # So 'space' is at index 4
+            if len(action) > 4 and action[4] > 0.5:
+                return 1.0
+        
+        # Alternative: check if player has upward velocity (is jumping)
+        if hasattr(player.body, 'velocity') and player.body.velocity.y > 0.5:
+            return 1.0
+    
+    return 0.0
+
+def survive_reward(env: WarehouseBrawl) -> float:
+    """
+    Strong penalty for falling/dying
+    """
+    player = env.objects["player"]
+    
+    # Penalize being too low (about to fall)
+    if player.body.position.y < -2.0:
+        return -5.0
+    elif player.body.position.y < 0.0:
+        return -2.0
+    
+    # Reward staying on platforms
+    if 1.0 <= player.body.position.y <= 4.0:
+        return 0.3
+    
+    return 0.0
 
 # -------------------------------------------------------------------------
 # ----------------------------- REWARD MANAGER -----------------------------
@@ -769,64 +977,70 @@ def first_hit_reward(env: WarehouseBrawl) -> float:
 
 def gen_reward_manager():
     """
-    Tournament-optimized reward configuration
+    Enhanced tournament-optimized reward configuration
     
-    Design philosophy:
-    1. Aggression: High rewards for damage and combos
-    2. Adaptation: Penalties for predictable play
-    3. Positioning: Rewards for spacing and stage control
-    4. Intelligence: Rewards for neutral wins and defensive play when losing
-    
-    NOTE: All signal-based rewards are handled by the existing signal system.
-    We only define frame-based rewards here that don't require Signal() objects.
+    NEW PRIORITIES:
+    1. Survival & Safety (prevent reckless deaths)
+    2. Platform awareness (proper jumping)
+    3. Situational awareness (respect knockouts)
+    4. Smart aggression (only when safe)
     """
     reward_functions = {
-        # === CORE COMBAT (Highest Priority) ===
+        # === SURVIVAL & SAFETY (HIGHEST PRIORITY) ===
+        'survive_reward': RewTerm(func=survive_reward, weight=2.0),
+        'self_preservation_reward': RewTerm(func=self_preservation_reward, weight=2.5),
+        'ledge_safety_reward': RewTerm(func=ledge_safety_reward, weight=1.8),
+        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=-2.0),
+        
+        # === PLATFORM AWARENESS ===
+        'platform_awareness_reward': RewTerm(func=platform_awareness_reward, weight=1.5),
+        
+        # === SITUATIONAL AWARENESS ===
+        'respect_knockout_reward': RewTerm(func=respect_knockout_reward, weight=1.2),
+        'opportunistic_positioning_reward': RewTerm(func=opportunistic_positioning_reward, weight=0.8),
+        
+        # === SMART COMBAT ===
         'damage_interaction_reward': RewTerm(
             func=lambda env: damage_interaction_reward(env, mode=RewardMode.SYMMETRIC),
-            weight=2.5  # Primary objective
+            weight=2.0  # Reduced from 2.5
         ),
+        'situational_aggression_reward': RewTerm(func=situational_aggression_reward, weight=1.0),
         
-        # === FIRST HIT (Frame-based, not signal-based) ===
-        'first_hit_reward': RewTerm(func=first_hit_reward, weight=1.0),  # Applied via frame detection
+        # === COMBO & SKILL ===
+        'combo_extension_reward': RewTerm(func=combo_extension_reward, weight=0.8),
+        'hit_confirm_reward': RewTerm(func=hit_confirm_reward, weight=0.5),
+        'neutral_win_reward': RewTerm(func=neutral_win_reward, weight=0.6),
         
-        # === COMBO & AGGRESSION ===
-        'combo_extension_reward': RewTerm(func=combo_extension_reward, weight=1.0),
-        'burst_damage_reward': RewTerm(func=burst_damage_reward, weight=0.9),
-        'hit_confirm_reward': RewTerm(func=hit_confirm_reward, weight=0.6),
-        'neutral_win_reward': RewTerm(func=neutral_win_reward, weight=0.7),
-        
-        # # === POSITIONING & MOVEMENT ===
-        'optimal_distance_reward': RewTerm(func=optimal_distance_reward, weight=0.6),
-        # 'move_to_opponent_reward': RewTerm(func=move_to_opponent_reward, weight=0.4),
-        'stage_control_reward': RewTerm(func=stage_control_reward, weight=0.5),
-        'edge_guard_reward': RewTerm(func=edge_guard_reward, weight=0.7),
+        # === POSITIONING (REDUCED WEIGHTS) ===
+        'optimal_distance_reward': RewTerm(func=optimal_distance_reward, weight=0.4),
+        'stage_control_reward': RewTerm(func=stage_control_reward, weight=0.3),
+        'edge_guard_reward': RewTerm(func=edge_guard_reward, weight=0.4),
         
         # === DEFENSIVE INTELLIGENCE ===
         'defensive_spacing_reward': RewTerm(func=defensive_spacing_reward, weight=0.4),
-        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=-1.5),
         
         # === WEAPON MANAGEMENT ===
-        'weapon_priority_reward': RewTerm(func=weapon_priority_reward, weight=0.4),
+        'weapon_priority_reward': RewTerm(func=weapon_priority_reward, weight=0.3),
         
-        # === ANTI-SPAM & EFFICIENCY ===
+        # === ANTI-SPAM ===
         'penalize_attack_reward': RewTerm(
             func=in_state_reward, 
-            weight=-0.03, 
+            weight=-0.02,  # Reduced
             params={'desired_state': AttackState}
         ),
         'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-0.02),
-        'punish_predictable_patterns': RewTerm(func=punish_predictable_patterns, weight=-0.35),
+        'punish_predictable_patterns': RewTerm(func=punish_predictable_patterns, weight=-0.25),
+        
+        # === FIRST BLOOD ===
+        'first_hit_reward': RewTerm(func=first_hit_reward, weight=0.8),
     }
 
-    # === EVENT-BASED REWARDS (Signals) ===
-    # Only include signals that are already defined in the environment
     signal_subscriptions = {
-        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=200)),
-        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=25)),
-        'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=15)),
-        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=12)),
-        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=-8)),
+        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=250)),  # Increased win value
+        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=-50)),  # HUGE penalty for dying
+        'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=12)),
+        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=10)),
+        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=-6)),
     }
 
     return RewardManager(reward_functions, signal_subscriptions)
@@ -849,8 +1063,8 @@ class CurriculumManager:
     def __init__(self, initial_phase: TrainingPhase = TrainingPhase.FUNDAMENTALS):
         self.current_phase = initial_phase
         self.phase_timesteps = {
-            TrainingPhase.FUNDAMENTALS: 500_000,
-            TrainingPhase.AGGRESSION: 1_500_000,
+            TrainingPhase.FUNDAMENTALS: 1_000_000,
+            TrainingPhase.AGGRESSION: 2_500_000,
             TrainingPhase.ADVANCED: float('inf')
         }
         self.total_timesteps = 0
@@ -944,7 +1158,7 @@ def setup_training_configuration(
     curriculum_enabled: bool = True,
     run_name: str = "tournament_run",
     save_freq: int = 100_000,
-    max_checkpoints: int = 50
+    max_checkpoints: int = 500
 ) -> tuple:
     """
     Sets up complete training configuration
@@ -1005,7 +1219,7 @@ if __name__ == '__main__':
     AGENT_TYPE = "simple"  # Changed to simple for better stability
     
     # Training settings
-    TOTAL_TRAINING_TIMESTEPS = 5_000_000  # 5M total timesteps
+    TOTAL_TRAINING_TIMESTEPS = 8_000_000  # 5M total timesteps
     TRAINING_BATCH_SIZE = 100_000  # Train in batches for curriculum updates
     
     # Enable curriculum learning (recommended)
@@ -1019,7 +1233,7 @@ if __name__ == '__main__':
     
     # Save settings
     SAVE_FREQUENCY = 100_000
-    MAX_CHECKPOINTS = 50
+    MAX_CHECKPOINTS = 500
     
     print(f"\nConfiguration:")
     print(f"  Agent Type: {AGENT_TYPE}")
@@ -1137,24 +1351,3 @@ if __name__ == '__main__':
     if CURRICULUM_ENABLED:
         print(f"\nCurriculum Progress:")
         print(f"  Final Phase: {curriculum.get_phase_message()}")
-    
-    print("\nKey Features Trained:")
-    print("  ✓ Damage optimization & combo extensions")
-    print("  ✓ Optimal spacing & positioning")
-    print("  ✓ Edge guarding & stage control")
-    print("  ✓ Defensive adaptation when losing")
-    print("  ✓ Weapon prioritization")
-    print("  ✓ Anti-spam & unpredictable play")
-    print("  ✓ Neutral game wins")
-    print("  ✓ First hit aggression (frame-based)")
-    
-    print("\n" + "=" * 70)
-    print("READY FOR TOURNAMENT!")
-    print("=" * 70)
-    print("\nNext steps:")
-    print("  1. Test agent against various opponents")
-    print("  2. Analyze replay footage for weaknesses")
-    print("  3. Fine-tune reward weights if needed")
-    print("  4. Consider additional training phases")
-    print("\nGood luck in the AI Squared tournament! 🏆")
-    print("=" * 70)

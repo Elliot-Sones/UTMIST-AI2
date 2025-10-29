@@ -6,10 +6,8 @@ To do:
 
 
 
-
-
 --------------------------------------------------------
---------------------------------------------------------
+Logic overview
 --------------------------------------------------------
 
 UTMIST AI² - Transformer-Based Strategy Recognition Training System
@@ -40,11 +38,13 @@ Runs the model vs past versions of ITSELF (snapshots) and scripted bots
 
 
 
-Sections of the file: 
+--------------------------------------------------------------------------------
+Sections of the code: 
+--------------------------------------------------------------------------------
 1. Imports
 2. Editable Training Configuration
-2.5. Transformer-Based Strategy Recognition 
-3. Main Agent (RecurrentPPOAgent & TransformerStrategyAgent)
+3 Encoder Model: 
+3. Main Agent (TransformerStrategyAgent)
 4. Supporting Training Agents
 5. Reward Shaping Library
 6. Self-Play Infrastructure
@@ -56,91 +56,16 @@ Sections of the file:
 WHAT WE ARE BUILDING: AlphaGo-Style Strategy Understanding
 =============================================================================
 
-TWO TRAINING MODES AVAILABLE:
+TRAINING MODE:
 
-1. STANDARD MODE (RecurrentPPOAgent):
-   - Learner: Recurrent PPO (LSTM) with small MLP heads
-   - Training: Self-play vs. snapshots + scripted bots
-   - Rewards: Dense shaping + event signals
-   - Good for: Quick experiments, baseline performance
-   
-2. TRANSFORMER MODE (TransformerStrategyAgent): **NEW!**
-   - Pure Latent Space Learning: NO pre-defined concepts
-   - Self-Attention: Automatically discovers opponent patterns
-   - Infinite Strategies: Continuous 256-dim representation space
-   - Like AlphaGo: Learns abstract representations from experience
-   - Good for: Competition, robust generalization to unseen opponents
+• TRANSFORMER MODE (TransformerStrategyAgent):
+  - Pure Latent Space Learning: NO pre-defined concepts
+  - Self-Attention: Automatically discovers opponent patterns
+  - Infinite Strategies: Continuous 256-dim representation space
+  - Like AlphaGo: Learns abstract representations from experience
+  - Good for: Competition, robust generalization to unseen opponents
 
-=============================================================================
-KEY INNOVATION: Transformer Strategy Encoder
-=============================================================================
 
-Traditional Approach (Limitation):
-  - Pre-define concepts: "aggression", "defensive", "spacing"
-  - Force opponent into 8 discrete clusters
-  - Cannot handle novel strategies outside training distribution
-
-Transformer Approach (Infinite Generalization):
-  - NO pre-defined concepts or clusters
-  - Learn 256-dim continuous latent space
-  - Self-attention discovers patterns automatically
-  - Infinite possible strategies as combinations of latent dimensions
-  - Generalizes to completely novel opponents
-
-Example:
-  Opponent does: [dash, wait, dash, attack, retreat, dash, attack]
-  
-  Standard: "Fits cluster 3 (aggressive)" ← Forced categorization
-  Transformer: [0.23, -0.71, 0.88, ..., 0.15] ← Unique representation
-               Self-attention learns: "dash→attack pattern with spacing"
-               NO human labeling required!
-
-=============================================================================
-HOW TO USE
-=============================================================================
-
-SWITCH MODES (Line 154):
-  # TRAIN_CONFIG = TRAIN_CONFIG           # Standard RecurrentPPO
-  TRAIN_CONFIG = TRAIN_CONFIG_TRANSFORMER  # Transformer (recommended)
-
-RUN TRAINING:
-  python user/train_agent.py
-
-VISUALIZE ATTENTION (optional):
-  During inference, call agent.visualize_attention(obs) to see what
-  the transformer focuses on in opponent behavior.
-
-=============================================================================
-ARCHITECTURE DETAILS
-=============================================================================
-
-Transformer Strategy Encoder:
-  - Input: Sequence of opponent observations (90 frames = 3 seconds)
-  - Embedding: Each frame → 256-dim vector
-  - Positional Encoding: Temporal order information
-  - Self-Attention: 6 layers × 8 heads
-  - Output: Single 256-dim strategy latent vector
-  
-Policy Conditioning:
-  - RecurrentPPO policy receives strategy latent
-  - Cross-attention: "Given opponent strategy, what should I do?"
-  - Actions adapt based on recognized patterns
-  
-Online Learning:
-  - Strategy understanding refines during match
-  - Handles opponent adaptation mid-game
-  - No pre-training needed - learns from experience
-
-=============================================================================
-EXPECTED BENEFITS
-=============================================================================
-
-✓ True generalization to infinite opponent strategies
-✓ NO finite strategy categorization 
-✓ Automatic pattern discovery via self-attention
-✓ Handles novel opponents never seen in training
-✓ AlphaGo-level strategic understanding
-✓ Robust performance in competition scenarios
 
 """
 
@@ -174,42 +99,6 @@ from environment.agent import run_real_time_match as env_run_real_time_match
 # ----------------------------- 2. Editable Training Configuration -----------------------------
 # --------------------------------------------------------------------------------
 # Centralised knobs for experiments; update these values to change training behaviour.
-TRAIN_CONFIG: Dict[str, dict] = {
-    "agent": {
-        "type": "recurrent_ppo",     # options: "recurrent_ppo", "custom", "sb3"
-        "load_path": None,            # resume from checkpoint path
-        # LSTM / PPO hyperparameters
-        "policy_kwargs": {
-            "activation_fn": nn.ReLU,
-            "lstm_hidden_size": 512,
-            "net_arch": [dict(pi=[32, 32], vf=[32, 32])],
-            "shared_lstm": True,
-            "enable_critic_lstm": False,
-            "share_features_extractor": True,
-        },
-        "n_steps": 30 * 90 * 20,
-        "batch_size": 16,
-        "ent_coef": 0.05,
-        "sb3_class": PPO,             # used when type == "custom" or "sb3"
-        "extractor_class": None,      # optional custom features extractor for CustomAgent
-    },
-    "reward": {
-        "factory": None,              # callable returning RewardManager; None => gen_reward_manager()
-    },
-    "self_play": {
-        "run_name": "experiment_9",
-        "save_freq": 100_000,
-        "max_saved": 40,
-        "mode": SaveHandlerMode.FORCE,
-        "opponent_mix": None,         # override dict[str, tuple] to customise opponent sampling
-        "handler": SelfPlayRandom,    # SelfPlayRandom or SelfPlayLatest
-    },
-    "training": {
-        "resolution": CameraResolution.LOW,
-        "timesteps": 50_000,
-        "logging": TrainLogging.PLOT,
-    },
-}
 
 # ============ TRANSFORMER-BASED CONFIGURATION (AlphaGo-Style) ============
 # Pure latent space learning with self-attention - NO pre-defined concepts
@@ -257,10 +146,8 @@ TRAIN_CONFIG_TRANSFORMER: Dict[str, dict] = {
 }
 
 # ============ SWITCH CONFIGURATION HERE ============
-# Uncomment the configuration you want to use:
-
-# TRAIN_CONFIG = TRAIN_CONFIG          # Standard RecurrentPPO
-# TRAIN_CONFIG = TRAIN_CONFIG_TRANSFORMER  # Transformer with pure latent space
+# Use the transformer strategy configuration exclusively
+TRAIN_CONFIG = TRAIN_CONFIG_TRANSFORMER  # Transformer with pure latent space
 
 # --------------------------------------------------------------------------------
 # ----------------------------- 2.5. Transformer-Based Strategy Recognition -----------------------------
@@ -534,73 +421,9 @@ class TransformerConditionedExtractor(BaseFeaturesExtractor):
 
 
 # --------------------------------------------------------------------------------
-# ----------------------------- 3. Main Agent (RecurrentPPOAgent) -----------------------------
+# ----------------------------- 3. Main Agent (TransformerStrategyAgent) -----------------------------
 # --------------------------------------------------------------------------------
 # Primary sequence-based learner used for AlphaGo-style self-play training.
-
-class RecurrentPPOAgent(Agent):
-    '''
-    Main Recurrent PPO Agent:
-    - Leverages sb3-contrib's RecurrentPPO (LSTM + PPO) to model temporal dynamics
-    - Maintains hidden state across timesteps to anticipate combos and counters
-    '''
-    def __init__(
-            self,
-            file_path: Optional[str] = None
-    ):
-        super().__init__(file_path)
-        self.lstm_states = None
-        self.episode_starts = np.ones((1,), dtype=bool)
-        self.default_policy_kwargs: Optional[dict] = None
-        self.default_n_steps: Optional[int] = None
-        self.default_batch_size: Optional[int] = None
-        self.default_ent_coef: Optional[float] = None
-
-    def _initialize(self) -> None:
-        if self.file_path is None:
-            policy_kwargs = self.default_policy_kwargs or {
-                'activation_fn': nn.ReLU,
-                'lstm_hidden_size': 512,
-                'net_arch': [dict(pi=[32, 32], vf=[32, 32])],
-                'shared_lstm': True,
-                'enable_critic_lstm': False,
-                'share_features_extractor': True,
-            }
-            self.model = RecurrentPPO(
-                "MlpLstmPolicy",
-                self.env,
-                verbose=0,
-                n_steps=self.default_n_steps or 30*90*20,
-                batch_size=self.default_batch_size or 16,
-                ent_coef=self.default_ent_coef or 0.05,
-                policy_kwargs=policy_kwargs,
-            )
-            del self.env
-        else:
-            self.model = RecurrentPPO.load(self.file_path)
-
-    def reset(self) -> None:
-        self.episode_starts = True
-
-    def predict(self, obs):
-        action, self.lstm_states = self.model.predict(
-            obs,
-            state=self.lstm_states,
-            episode_start=self.episode_starts,
-            deterministic=True,
-        )
-        if self.episode_starts:
-            self.episode_starts = False
-        return action
-
-    def save(self, file_path: str) -> None:
-        self.model.save(file_path)
-
-    def learn(self, env, total_timesteps, log_interval: int = 2, verbose=0):
-        self.model.set_env(env)
-        self.model.verbose = verbose
-        self.model.learn(total_timesteps=total_timesteps, log_interval=log_interval)
-
 
 class TransformerStrategyAgent(Agent):
     """
@@ -1121,14 +944,6 @@ def create_learning_agent(agent_cfg: Dict[str, object]) -> Agent:
         extractor_cls = _resolve_callable(agent_cfg.get("extractor_class"), MLPExtractor)
         sb3_cls = _resolve_callable(agent_cfg.get("sb3_class"), PPO)
         return CustomAgent(sb3_class=sb3_cls, file_path=load_path, extractor=extractor_cls)
-
-    if agent_type == "recurrent_ppo":
-        agent = RecurrentPPOAgent(file_path=load_path)
-        agent.default_policy_kwargs = agent_cfg.get("policy_kwargs")
-        agent.default_n_steps = agent_cfg.get("n_steps")
-        agent.default_batch_size = agent_cfg.get("batch_size")
-        agent.default_ent_coef = agent_cfg.get("ent_coef")
-        return agent
     
     if agent_type == "transformer_strategy":
         # Create transformer-based strategy-aware agent
@@ -1545,4 +1360,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-

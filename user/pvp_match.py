@@ -8,7 +8,6 @@ from user.train_agent import (
     ConstantAgent,
     ClockworkAgent,
     SB3Agent,
-    RecurrentPPOAgent,
 )  # add anymore custom Agents (from train_agent.py) here as needed
 from user.my_agent import SubmittedAgent
 import pygame

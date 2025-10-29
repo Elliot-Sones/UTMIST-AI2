@@ -402,13 +402,20 @@ def danger_zone_reward(
 
 def in_state_reward(
     env: WarehouseBrawl,
-    desired_state: Type[PlayerObjectState]=BackDashState,
+    desired_state: str = "attack",  # Changed to string
 ) -> float:
     """
-    Reward/penalize being in specific states
+    Reward/penalize being in specific states (SAFE VERSION)
     """
-    player: Player = env.objects["player"]
-    reward = 1 if isinstance(player.state, desired_state) else 0.0
+    player = env.objects["player"]
+    
+    if desired_state == "attack":
+        reward = 1.0 if is_player_attacking(player) else 0.0
+    elif desired_state == "jump":
+        reward = 1.0 if is_player_jumping(player) else 0.0
+    else:
+        return 0.0
+    
     return reward * env.dt
 
 def head_to_middle_reward(env: WarehouseBrawl) -> float:
@@ -585,15 +592,17 @@ def weapon_priority_reward(env: WarehouseBrawl) -> float:
 
 def punish_predictable_patterns(env: WarehouseBrawl) -> float:
     """
-    Penalize repetitive actions to encourage adaptation
+    Penalize repetitive actions to encourage adaptation (updated)
     """
     if not hasattr(env, "action_history"):
         env.action_history = []
     
     player = env.objects["player"]
-    current_action = tuple(player.cur_action) if hasattr(player, 'cur_action') else None
     
-    if current_action is not None:
+    # Create action signature (which buttons are pressed)
+    if hasattr(player, 'cur_action'):
+        current_action = tuple((player.cur_action > 0.5).astype(int))
+        
         env.action_history.append(current_action)
         
         if len(env.action_history) > 30:
@@ -608,6 +617,107 @@ def punish_predictable_patterns(env: WarehouseBrawl) -> float:
                 return -0.4
             elif repetition_count >= 5:
                 return -0.2
+    
+    return 0.0
+
+def dash_usage_reward(env: WarehouseBrawl) -> float:
+    """
+    Reward using dash for mobility (but not spamming)
+    """
+    if not hasattr(env, "dash_cooldown"):
+        env.dash_cooldown = 0
+    
+    player = env.objects["player"]
+    
+    # Reduce cooldown
+    if env.dash_cooldown > 0:
+        env.dash_cooldown -= 1
+    
+    # Reward dash usage when cooldown is ready
+    if is_player_dashing(player) and env.dash_cooldown == 0:
+        env.dash_cooldown = 60  # 60 frames cooldown
+        
+        # Extra reward if escaping danger
+        if player.body.position.y < 1.0 or abs(player.body.position.x) > 7.0:
+            return 1.5
+        
+        return 0.5
+    
+    # Penalize spamming dash when on cooldown
+    if is_player_dashing(player) and env.dash_cooldown > 0:
+        return -0.3
+    
+    return 0.0
+
+
+def smart_movement_reward(env: WarehouseBrawl) -> float:
+    """
+    Reward moving toward objectives (opponent or center)
+    """
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+    
+    if not is_player_moving(player):
+        return 0.0
+    
+    # Initialize previous position
+    if not hasattr(env, "prev_player_x"):
+        env.prev_player_x = player.body.position.x
+        return 0.0
+    
+    # Calculate movement direction
+    moved_distance = player.body.position.x - env.prev_player_x
+    env.prev_player_x = player.body.position.x
+    
+    # Reward moving toward opponent (when safe)
+    player_safe = 1.0 <= player.body.position.y <= 5.0
+    if player_safe and not is_opponent_knocked_out(opponent):
+        opponent_direction = 1 if opponent.body.position.x > player.body.position.x else -1
+        
+        if np.sign(moved_distance) == opponent_direction:
+            return 0.3
+    
+    # Reward moving to center when in danger
+    player_danger = abs(player.body.position.x) > 7.0 or player.body.position.y < 1.0
+    if player_danger:
+        toward_center = -1 if player.body.position.x > 0 else 1
+        
+        if np.sign(moved_distance) == toward_center:
+            return 0.5
+    
+    return 0.0
+
+
+def weapon_management_reward(env: WarehouseBrawl) -> float:
+    """
+    Reward smart weapon pickup/throw decisions
+    """
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+    
+    if not is_player_throwing(player):
+        return 0.0
+    
+    # Check current weapon (you may need to adjust attribute name)
+    current_weapon = getattr(player, 'weapon', "Punch")
+    
+    # Reward picking up good weapons
+    if current_weapon == "Punch":
+        # Trying to pick up weapon
+        return 0.8
+    
+    # Reward throwing weapon at opponent
+    dist = np.linalg.norm([
+        player.body.position.x - opponent.body.position.x,
+        player.body.position.y - opponent.body.position.y
+    ])
+    
+    if dist < 3.0:  # Close enough to hit
+        return 1.2
+    
+    # Slight penalty for throwing weapon when far
+    if dist > 5.0:
+        return -0.2
     
     return 0.0
 
@@ -656,11 +766,12 @@ def hit_confirm_reward(env: WarehouseBrawl) -> float:
 
 def holding_more_than_3_keys(env: WarehouseBrawl) -> float:
     """
-    Penalize input spam
+    Penalize input spam (updated with helper)
     """
     player: Player = env.objects["player"]
-    a = player.cur_action
-    if (a > 0.5).sum() > 3:
+    active_count = get_active_input_count(player)
+    
+    if active_count > 3:
         return -env.dt
     return 0.0
 
@@ -731,6 +842,110 @@ def on_drop_reward(env: WarehouseBrawl, agent: str) -> float:
         if env.objects["player"].weapon == "Punch":
             return -1.5
     return 0.0
+
+# --------------------------------------------------------------------------------
+# ----------------------------- HELPER FUNCTIONS ---------------------------------
+# --------------------------------------------------------------------------------
+
+def is_player_attacking(player) -> bool:
+    """
+    Helper to check if player is attacking without state dependency
+    
+    Action indices:
+    - 7: 'j' (Light Attack)
+    - 8: 'k' (Heavy Attack)
+    """
+    if hasattr(player, 'cur_action'):
+        action = player.cur_action
+        if len(action) > 8:
+            # Check light attack (j) and heavy attack (k)
+            light_attack = action[7] > 0.5
+            heavy_attack = action[8] > 0.5
+            return light_attack or heavy_attack
+    return False
+
+def is_player_jumping(player) -> bool:
+    """
+    Helper to check if player is jumping
+    
+    Action index:
+    - 4: 'space' (Jump)
+    """
+    # Method 1: Check space key (index 4)
+    if hasattr(player, 'cur_action'):
+        action = player.cur_action
+        if len(action) > 4 and action[4] > 0.5:
+            return True
+    
+    # Method 2: Check upward velocity
+    if hasattr(player.body, 'velocity') and player.body.velocity.y > 0.5:
+        return True
+    
+    return False
+
+def is_player_dashing(player) -> bool:
+    """
+    Helper to check if player is dashing/dodging
+    
+    Action index:
+    - 6: 'l' (Dash/Dodge)
+    """
+    if hasattr(player, 'cur_action'):
+        action = player.cur_action
+        if len(action) > 6 and action[6] > 0.5:
+            return True
+    return False
+
+def is_player_moving(player) -> bool:
+    """
+    Helper to check if player is moving horizontally
+    
+    Action indices:
+    - 1: 'a' (Left)
+    - 3: 'd' (Right)
+    """
+    if hasattr(player, 'cur_action'):
+        action = player.cur_action
+        if len(action) > 3:
+            moving_left = action[1] > 0.5
+            moving_right = action[3] > 0.5
+            return moving_left or moving_right
+    return False
+
+def is_player_throwing(player) -> bool:
+    """
+    Helper to check if player is picking up/throwing weapon
+    
+    Action index:
+    - 5: 'h' (Pickup/Throw)
+    """
+    if hasattr(player, 'cur_action'):
+        action = player.cur_action
+        if len(action) > 5 and action[5] > 0.5:
+            return True
+    return False
+
+def is_opponent_knocked_out(opponent) -> bool:
+    """Helper to check if opponent is knocked out or respawning"""
+    opponent_out_of_bounds = (
+        abs(opponent.body.position.x) > 12.0 or 
+        opponent.body.position.y < -3.0 or
+        opponent.body.position.y > 10.0
+    )
+    opponent_stationary = (
+        hasattr(opponent.body, 'velocity') and
+        abs(opponent.body.velocity.x) < 0.1 and 
+        abs(opponent.body.velocity.y) < 0.1 and
+        opponent.body.position.y > 5.0
+    )
+    return opponent_out_of_bounds or opponent_stationary
+
+def get_active_input_count(player) -> int:
+    """Count how many buttons are being pressed"""
+    if hasattr(player, 'cur_action'):
+        action = player.cur_action
+        return int((action > 0.5).sum())
+    return 0
 
 # --------------------------------------------------------------------------------
 # ----------------------- FIRST HIT REWARD (FRAME-BASED) -------------------------
@@ -828,10 +1043,9 @@ def ledge_safety_reward(env: WarehouseBrawl) -> float:
 
 def situational_aggression_reward(env: WarehouseBrawl) -> float:
     """
-    Only be aggressive when safe to do so
+    Only be aggressive when safe to do so (SAFE VERSION)
     """
     player = env.objects["player"]
-    opponent = env.objects["opponent"]
     
     # Check if player is in safe position
     player_safe = (
@@ -840,14 +1054,10 @@ def situational_aggression_reward(env: WarehouseBrawl) -> float:
     )
     
     # Check if attacking
-    is_attacking = isinstance(player.state, AttackState)
-    
-    if is_attacking:
+    if is_player_attacking(player):
         if player_safe:
-            # Reward safe aggression
             return 0.5
         else:
-            # Heavily penalize risky aggression
             return -2.5
     
     return 0.0
@@ -859,38 +1069,29 @@ def respect_knockout_reward(env: WarehouseBrawl) -> float:
     opponent = env.objects["opponent"]
     player = env.objects["player"]
     
-    # Check if opponent is in knockout/respawn state
-    opponent_knocked_out = opponent.state in [5, 11]  # Adjust state IDs as needed
-    
-    if opponent_knocked_out:
-        # Heavily penalize any movement or attacks
-        action = player.cur_action if hasattr(player, 'cur_action') else None
+    if is_opponent_knocked_out(opponent):
+        active_inputs = get_active_input_count(player)
         
-        if action is not None:
-            # Count active inputs
-            active_inputs = (action > 0.5).sum()
-            
-            if active_inputs > 0:
-                return -1.5 * active_inputs
+        if active_inputs > 0:
+            return -1.5 * active_inputs
         
         # Reward staying still
-        velocity = np.linalg.norm([player.body.velocity.x, player.body.velocity.y])
-        if velocity < 0.1:
-            return 0.5
+        if hasattr(player.body, 'velocity'):
+            velocity = np.linalg.norm([player.body.velocity.x, player.body.velocity.y])
+            if velocity < 0.1:
+                return 0.5
     
     return 0.0
 
 
 def opportunistic_positioning_reward(env: WarehouseBrawl) -> float:
     """
-    Encourage good positioning during opponent respawn
+    Encourage good positioning during opponent respawn (SAFE VERSION)
     """
     opponent = env.objects["opponent"]
     player = env.objects["player"]
     
-    opponent_knocked_out = opponent.state in [5, 11]
-    
-    if opponent_knocked_out:
+    if is_opponent_knocked_out(opponent):
         # Reward moving to center stage
         center_distance = abs(player.body.position.x)
         
@@ -903,53 +1104,33 @@ def opportunistic_positioning_reward(env: WarehouseBrawl) -> float:
 
 def platform_awareness_reward(env: WarehouseBrawl) -> float:
     """
-    Reward proper platform navigation and jumping (without JumpState dependency)
+    Reward proper platform navigation and jumping (SAFE VERSION)
     """
     player = env.objects["player"]
     
-    # Get platform positions (adjust based on your platform names)
-    platforms = [obj for name, obj in env.objects.items() if 'platform' in name.lower()]
+    # Reward staying at platform height
+    ideal_height_min = 1.5
+    ideal_height_max = 4.5
     
-    if not platforms:
-        return 0.0
+    player_height = player.body.position.y
     
-    # Find nearest platform
-    min_dist = float('inf')
-    nearest_platform = None
-    
-    for platform in platforms:
-        dist = abs(player.body.position.x - platform.body.position.x)
-        if dist < min_dist:
-            min_dist = dist
-            nearest_platform = platform
-    
-    if nearest_platform is None:
-        return 0.0
-    
-    # Reward being above platforms (not falling)
-    if player.body.position.y > nearest_platform.body.position.y - 0.5:
+    # Reward being at good height
+    if ideal_height_min <= player_height <= ideal_height_max:
         return 0.5
     
-    # Penalize being below platforms
-    if player.body.position.y < nearest_platform.body.position.y - 2.0:
-        return -1.5
+    # Strong penalty for being too low (falling)
+    if player_height < 0.0:
+        return -3.0
+    elif player_height < ideal_height_min:
+        return -1.0 * (ideal_height_min - player_height)
     
-    # Reward jumping when approaching platform edge (check action instead of state)
-    platform_edge_threshold = 1.5
-    if min_dist < platform_edge_threshold:
-        # Check if space key (jump) is pressed in the action
-        if hasattr(player, 'cur_action'):
-            action = player.cur_action
-            # Assuming 'space' is one of the action dimensions
-            # You may need to adjust the index based on your action space
-            # Typically: ['w', 'a', 's', 'd', 'space', 'h', 'j', 'k', 'l', 'g']
-            # So 'space' is at index 4
-            if len(action) > 4 and action[4] > 0.5:
-                return 1.0
-        
-        # Alternative: check if player has upward velocity (is jumping)
-        if hasattr(player.body, 'velocity') and player.body.velocity.y > 0.5:
-            return 1.0
+    # Mild penalty for being too high
+    if player_height > ideal_height_max + 1.0:
+        return -0.3
+    
+    # Reward jumping when low (trying to recover)
+    if player_height < ideal_height_min and is_player_jumping(player):
+        return 1.5
     
     return 0.0
 
@@ -971,6 +1152,11 @@ def survive_reward(env: WarehouseBrawl) -> float:
     
     return 0.0
 
+def penalize_attack_spam(env: WarehouseBrawl) -> float:
+    """Penalize excessive attacking"""
+    player = env.objects["player"]
+    return -0.02 if is_player_attacking(player) else 0.0
+
 # -------------------------------------------------------------------------
 # ----------------------------- REWARD MANAGER -----------------------------
 # -------------------------------------------------------------------------
@@ -978,12 +1164,7 @@ def survive_reward(env: WarehouseBrawl) -> float:
 def gen_reward_manager():
     """
     Enhanced tournament-optimized reward configuration
-    
-    NEW PRIORITIES:
-    1. Survival & Safety (prevent reckless deaths)
-    2. Platform awareness (proper jumping)
-    3. Situational awareness (respect knockouts)
-    4. Smart aggression (only when safe)
+    With correct action indices
     """
     reward_functions = {
         # === SURVIVAL & SAFETY (HIGHEST PRIORITY) ===
@@ -1002,7 +1183,7 @@ def gen_reward_manager():
         # === SMART COMBAT ===
         'damage_interaction_reward': RewTerm(
             func=lambda env: damage_interaction_reward(env, mode=RewardMode.SYMMETRIC),
-            weight=2.0  # Reduced from 2.5
+            weight=2.0
         ),
         'situational_aggression_reward': RewTerm(func=situational_aggression_reward, weight=1.0),
         
@@ -1011,7 +1192,7 @@ def gen_reward_manager():
         'hit_confirm_reward': RewTerm(func=hit_confirm_reward, weight=0.5),
         'neutral_win_reward': RewTerm(func=neutral_win_reward, weight=0.6),
         
-        # === POSITIONING (REDUCED WEIGHTS) ===
+        # === POSITIONING ===
         'optimal_distance_reward': RewTerm(func=optimal_distance_reward, weight=0.4),
         'stage_control_reward': RewTerm(func=stage_control_reward, weight=0.3),
         'edge_guard_reward': RewTerm(func=edge_guard_reward, weight=0.4),
@@ -1019,25 +1200,23 @@ def gen_reward_manager():
         # === DEFENSIVE INTELLIGENCE ===
         'defensive_spacing_reward': RewTerm(func=defensive_spacing_reward, weight=0.4),
         
-        # === WEAPON MANAGEMENT ===
-        'weapon_priority_reward': RewTerm(func=weapon_priority_reward, weight=0.3),
+        # === MOBILITY & WEAPON ===
+        'dash_usage_reward': RewTerm(func=dash_usage_reward, weight=0.6),
+        'smart_movement_reward': RewTerm(func=smart_movement_reward, weight=0.4),
+        'weapon_management_reward': RewTerm(func=weapon_management_reward, weight=0.5),
         
         # === ANTI-SPAM ===
-        'penalize_attack_reward': RewTerm(
-            func=in_state_reward, 
-            weight=-0.02,  # Reduced
-            params={'desired_state': AttackState}
-        ),
-        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-0.02),
-        'punish_predictable_patterns': RewTerm(func=punish_predictable_patterns, weight=-0.25),
+        'penalize_attack_spam': RewTerm(func=penalize_attack_spam, weight=1.0),
+        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=1.0),
+        'punish_predictable_patterns': RewTerm(func=punish_predictable_patterns, weight=1.0),
         
         # === FIRST BLOOD ===
         'first_hit_reward': RewTerm(func=first_hit_reward, weight=0.8),
     }
 
     signal_subscriptions = {
-        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=250)),  # Increased win value
-        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=-50)),  # HUGE penalty for dying
+        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=250)),
+        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=-50)),
         'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=12)),
         'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=10)),
         'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=-6)),

@@ -15,6 +15,8 @@ Key improvements:
 # -------------------------------------------------------------------
 # ----------------------------- IMPORTS -----------------------------
 # -------------------------------------------------------------------
+from stable_baselines3.common.vec_env import SubprocVecEnv
+from typing import Optional, Type
 
 import torch 
 import gymnasium as gym
@@ -40,52 +42,81 @@ from datetime import datetime
 # -------------------------------------------------------------------------
 
 class SB3Agent(Agent):
-    '''
+    """
     SB3Agent:
-    - Defines an AI Agent that takes an SB3 class input for specific SB3 algorithm (e.g. PPO, SAC)
-    '''
+    - Defines an AI Agent using an SB3 algorithm (e.g. PPO, SAC, A2C).
+    - GPU-optimized and safely interruptible.
+    """
     def __init__(
-            self,
-            sb3_class: Optional[Type[BaseAlgorithm]] = PPO,
-            file_path: Optional[str] = None
+        self,
+        sb3_class: Optional[Type[BaseAlgorithm]] = PPO,
+        file_path: Optional[str] = None
     ):
         self.sb3_class = sb3_class
         super().__init__(file_path)
 
+    # -----------------------------
+    # ENVIRONMENT INITIALIZATION
+    # -----------------------------
+    def _make_env(self, env_fn, n_envs: int = 8):
+        """
+        Create parallel environments for faster GPU training.
+        """
+        return SubprocVecEnv([env_fn for _ in range(n_envs)])
+
+    # -----------------------------
+    # MODEL INITIALIZATION
+    # -----------------------------
     def _initialize(self) -> None:
         if self.file_path is None:
             self.model = self.sb3_class(
-                "MlpPolicy", 
-                self.env, 
-                verbose=0, 
-                n_steps=30*90*3, 
-                batch_size=128, 
+                "MlpPolicy",
+                self.env,
+                verbose=0,
+                device="cuda",                # 👈 GPU explicitly
+                n_steps=30 * 90 * 3,          # 8100
+                batch_size=2048,              # large batch for GPU utilization
                 ent_coef=0.01,
                 learning_rate=3e-4,
-                max_grad_norm=0.5,  # Prevent exploding gradients
-                normalize_advantage=True,  # Normalize advantages for stability
+                max_grad_norm=0.5,
+                normalize_advantage=True,
             )
-            del self.env
         else:
-            self.model = self.sb3_class.load(self.file_path)
+            print(f"Loading model from {self.file_path}")
+            self.model = self.sb3_class.load(self.file_path, device="cuda")
 
-    def _gdown(self) -> str:
-        return
-
+    # -----------------------------
+    # PREDICTION
+    # -----------------------------
     def predict(self, obs):
         action, _ = self.model.predict(obs)
         return action
 
+    # -----------------------------
+    # SAVE / LOAD
+    # -----------------------------
     def save(self, file_path: str) -> None:
-        self.model.save(file_path, include=['num_timesteps'])
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        self.model.save(file_path)
+        print(f"✅ Model saved at {file_path}")
 
+    # -----------------------------
+    # LEARNING LOOP
+    # -----------------------------
     def learn(self, env, total_timesteps, log_interval: int = 1, verbose=0):
+        """
+        Starts training and supports safe interruption with Ctrl+C.
+        """
         self.model.set_env(env)
         self.model.verbose = verbose
-        self.model.learn(
-            total_timesteps=total_timesteps,
-            log_interval=log_interval,
-        )
+        try:
+            self.model.learn(total_timesteps=total_timesteps, log_interval=log_interval)
+        except KeyboardInterrupt:
+            print("\n⚠️ Training interrupted. Saving current progress...")
+            self.save("./checkpoints/interrupted_model.zip")
+
+        torch.cuda.empty_cache()
+        print("🏁 Training complete or safely stopped.")
 
 class RecurrentPPOAgent(Agent):
     '''

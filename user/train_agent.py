@@ -277,7 +277,7 @@ class OptimizedSB3Agent(Agent):
             batch_size = 256
             n_epochs = 4
             learning_rate = 3e-4
-            ent_coef = 0.01
+            ent_coef = 0.05
             print(f"✓ CPU-only configuration")
 
         total_buffer_size = n_steps * actual_n_envs
@@ -2685,6 +2685,7 @@ if __name__ == '__main__':
     TRAINING_BATCH_SIZE = 100_000
     CURRICULUM_ENABLED = True
     RESUME_FROM = "rl-model.zip"
+    # RESUME_FROM = None
     RUN_NAME = "tournament_safe_attack_v1"
     SAVE_FREQUENCY = 100_000
     MAX_CHECKPOINTS = 500

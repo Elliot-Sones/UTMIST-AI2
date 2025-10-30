@@ -1,41 +1,4 @@
 """
-================================================================================
-UTMIST AI² - 10M Timestep Training Script (T4 GPU Optimized)
-================================================================================
-
-QUICK START:
-1. Run 50k test first:  python user/train_agent.py  (line 374: TRAIN_CONFIG_TEST)
-2. Takes ~15 minutes on T4 GPU, validates all systems working
-3. Check results in checkpoints/test_50k_t4/ folder
-4. If satisfied, switch to 10M: Line 373, change to TRAIN_CONFIG_10M
-5. Run full training:  python user/train_agent.py  (~10-12 hours on T4)
-
-WHAT THIS SCRIPT DOES:
-- Trains a transformer-based RL agent to play fighting game
-- Uses AlphaGo-style strategy understanding (learns abstract patterns)
-- Self-adversarial training: agent plays vs past versions of itself
-- Curriculum learning: mixes self-play (80%) with scripted bots (20%)
-- Proper scaling laws: 50k test behaves identically to 10M (just 200x shorter)
-
-KEY COMPONENTS:
-✅ Transformer Encoder: Discovers opponent patterns automatically (6 layers, 8 heads)
-✅ LSTM RNN Policy: Adapts strategy based on transformer understanding (512 hidden)
-✅ Reward Shaping: Damage, survival, weapon use, strategic attacks
-✅ Self-Play Loop: Trains vs past snapshots + scripted opponents
-✅ PPO Learning: Updates both transformer and policy end-to-end
-
-CONFIGURATIONS:
-- TRAIN_CONFIG_TEST:  50k timesteps, ~15 min on T4, full debugging enabled
-- TRAIN_CONFIG_10M:   10M timesteps, ~10-12 hrs on T4, production training
-
-To do: 
-[✅] Add heavy tracking system for training against 1 agent
-[✅] Train and tweak model against 1 agent until satisfied  
-[✅] Add in the adversarial training loop (self-play implemented)
-[✅] Optimize for T4 GPU (16GB VRAM)
-[✅] Add proper scaling law configurations (50k:10M = 1:200)
-
-
 --------------------------------------------------------
 Logic overview
 --------------------------------------------------------
@@ -67,22 +30,6 @@ the policy win, policy learns how to use those patterns.
 Runs the model vs past versions of ITSELF (snapshots) and scripted bots
 
 
-
-
---------------------------------------------------------------------------------
-Sections of the code: 
---------------------------------------------------------------------------------
-1. Imports
-2. Editable Training Configuration
-
-3 Encoder Model
-4. Main Agent (TransformerStrategyAgent)
-5. Supporting Training Agents
-6. Reward Shaping Library
-7. Self-Play Infrastructure
-8. Training Loop (train)
-9. Evaluation and Match Helpers
-10. Main Entrypoint (__main__)
 
 =============================================================================
 WHAT WE ARE BUILDING: AlphaGo-Style Strategy Understanding

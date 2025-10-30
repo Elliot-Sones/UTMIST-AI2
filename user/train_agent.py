@@ -1,6 +1,19 @@
 """
 Version: new
 --------------------------------------------------------
+🚀 QUICK START FOR GOOGLE COLAB
+--------------------------------------------------------
+
+For quick experiments (< 2 hours) with auto-download to desktop:
+1. See COLAB_QUICK_START.md for step-by-step guide
+2. Or copy-paste COLAB_ONE_CELL_SETUP.py into a Colab cell
+3. Results auto-download to your Downloads folder every 15 minutes!
+
+For long training (> 2 hours):
+- Remove QUICK_EXPERIMENT flag to use Google Drive storage
+- Files persist even if Colab disconnects
+
+--------------------------------------------------------
 Logic overview
 --------------------------------------------------------
 
@@ -69,10 +82,18 @@ import torch
 # --------------------------------------------------------------------------------
 def setup_colab_environment():
     """
-    Automatically detects Google Colab and sets up persistent storage.
+    Automatically detects Google Colab and sets up storage.
+    
+    Storage Strategy:
+    - Quick experiments (<2 hours): Local storage for speed, auto-download CSVs
+    - Long training (>2 hours): Google Drive for persistence across disconnects
     
     Returns:
-        checkpoint_path: Path to use for checkpoints (Drive if Colab, local otherwise)
+        checkpoint_path: Path to use for checkpoints
+    
+    Environment Variables:
+        QUICK_EXPERIMENT=1  : Use local storage (fast, no Drive needed)
+        USE_DRIVE=1        : Force Google Drive storage (persistent)
     
     Note:
         google.colab only exists in Colab environment - linter warnings are expected
@@ -89,6 +110,24 @@ def setup_colab_environment():
         IN_COLAB = False
     
     if IN_COLAB:
+        # Check for quick experiment mode
+        use_quick_mode = os.environ.get('QUICK_EXPERIMENT', '0') == '1'
+        force_drive = os.environ.get('USE_DRIVE', '0') == '1'
+        
+        if use_quick_mode and not force_drive:
+            # Quick experiment mode - use local storage
+            print("⚡ QUICK EXPERIMENT MODE")
+            print("  ℹ️  Using local storage (fast, no Drive needed)")
+            print("  ℹ️  Perfect for experiments < 2 hours")
+            print("  ℹ️  Use colab_helper.py to auto-download results")
+            print("  ⚠️  Checkpoints will be lost if Colab disconnects")
+            checkpoint_path = "/tmp/checkpoints"
+            os.makedirs(checkpoint_path, exist_ok=True)
+            print(f"  ✓ Checkpoints saving to: {checkpoint_path}")
+            print("=" * 70 + "\n")
+            return checkpoint_path
+        
+        # Long training mode - use Google Drive
         print("📁 Setting up Google Drive for persistent checkpoint storage...")
         
         # Check if Drive is already mounted
@@ -100,8 +139,10 @@ def setup_colab_environment():
                 print("  ✓ Google Drive mounted successfully!")
             except Exception as e:
                 print(f"  ⚠️  Warning: Could not mount Drive: {e}")
-                print("  ℹ️  Checkpoints will save locally (lost on disconnect)")
-                return "checkpoints"
+                print("  ℹ️  Falling back to local storage")
+                checkpoint_path = "/tmp/checkpoints"
+                os.makedirs(checkpoint_path, exist_ok=True)
+                return checkpoint_path
         else:
             print("  ✓ Google Drive already mounted!")
         
@@ -1003,11 +1044,24 @@ class TransformerStrategyAgent(Agent):
             torch.save(self.strategy_encoder.state_dict(), encoder_path)
             print(f"Saved transformer strategy encoder to {encoder_path}")
     
-    def learn(self, env, total_timesteps, log_interval: int = 2, verbose=0):
-        """Standard learning interface."""
+    def learn(self, env, total_timesteps, log_interval: int = 2, verbose=0, callback=None):
+        """
+        Standard learning interface with callback support.
+        
+        Args:
+            env: Training environment
+            total_timesteps: Total training timesteps
+            log_interval: Logging interval
+            verbose: Verbosity level
+            callback: Optional callback for monitoring (Stable-Baselines3 callback)
+        """
         self.model.set_env(env)
         self.model.verbose = verbose
-        self.model.learn(total_timesteps=total_timesteps, log_interval=log_interval)
+        self.model.learn(
+            total_timesteps=total_timesteps, 
+            log_interval=log_interval,
+            callback=callback
+        )
 
 
 # --------------------------------------------------------------------------------
@@ -1534,571 +1588,606 @@ def gen_reward_manager():
 
 
 # --------------------------------------------------------------------------------
-# ----------------------------- 6. Test & Debug Infrastructure -----------------------------
+# ----------------------------- 6. Optimized Training Monitoring System -----------------------------
 # --------------------------------------------------------------------------------
-# Tools for quick iteration, reward debugging, and validation during test runs.
+# Lightweight, hierarchical logging with minimal overhead during training.
+# Tracks critical metrics at different frequencies to balance insight vs performance.
 
-class RewardDebugger:
+from stable_baselines3.common.callbacks import BaseCallback
+from collections import deque
+import time
+import csv
+
+class TransformerHealthMonitor:
     """
-    Enhanced reward tracking with CSV logging and alert system.
-    
-    Features:
-    - Logs each reward term's contribution to CSV
-    - Calculates percentage breakdown
-    - Detects stuck/broken reward terms
-    - Prints alerts only (no console spam)
+    Monitors transformer encoder health during training.
+    Tracks latent vector statistics and attention patterns.
     """
     
-    def __init__(self, reward_manager: RewardManager, log_dir: str, alert_interval: int = 500):
+    def __init__(self):
+        # Circular buffer for recent latent norms (lightweight memory)
+        self.latent_norms = deque(maxlen=100)
+        self.attention_entropies = deque(maxlen=100)
+        
+    def update(self, agent: 'TransformerStrategyAgent'):
         """
+        Extract health metrics from transformer agent.
+        
         Args:
-            reward_manager: RewardManager instance to track
-            log_dir: Directory to save CSV logs
-            alert_interval: Steps between checking for alerts
+            agent: TransformerStrategyAgent instance
         """
+        if not isinstance(agent, TransformerStrategyAgent):
+            return
+        
+        # Get latent vector norm (is encoder producing meaningful outputs?)
+        if agent.current_strategy_latent is not None:
+            norm = torch.norm(agent.current_strategy_latent, p=2).item()
+            self.latent_norms.append(norm)
+        
+        # Get attention entropy (is transformer focusing or diffuse?)
+        if len(agent.opponent_history) >= 10:
+            try:
+                history_array = np.array(agent.opponent_history)
+                history_tensor = torch.tensor(
+                    history_array, 
+                    dtype=torch.float32, 
+                    device=TORCH_DEVICE
+                ).unsqueeze(0)
+                
+                with torch.no_grad():
+                    _, attention_info = agent.strategy_encoder(
+                        history_tensor, 
+                        return_attention=True
+                    )
+                    
+                    # Calculate entropy of pooling attention
+                    attn_weights = attention_info['pooling_attention'].squeeze().cpu().numpy()
+                    # Entropy: -sum(p * log(p))
+                    attn_weights = attn_weights + 1e-10  # Avoid log(0)
+                    entropy = -np.sum(attn_weights * np.log(attn_weights))
+                    self.attention_entropies.append(entropy)
+            except:
+                pass  # Silent fail - don't disrupt training
+    
+    def get_stats(self) -> Dict[str, float]:
+        """Get current health statistics."""
+        stats = {}
+        
+        if len(self.latent_norms) > 0:
+            stats['latent_norm_mean'] = np.mean(self.latent_norms)
+            stats['latent_norm_std'] = np.std(self.latent_norms)
+        
+        if len(self.attention_entropies) > 0:
+            stats['attention_entropy_mean'] = np.mean(self.attention_entropies)
+        
+        return stats
+
+
+class RewardBreakdownTracker:
+    """
+    Tracks reward term contributions with minimal overhead.
+    Accumulates data in memory, writes to CSV periodically.
+    """
+    
+    def __init__(self, reward_manager: RewardManager, log_dir: str):
         self.reward_manager = reward_manager
         self.log_dir = log_dir
-        self.alert_interval = alert_interval
-        
-        # Tracking data
-        self.step_count = 0
-        self.reward_history: Dict[str, List[float]] = {}
-        self.signal_history: Dict[str, List[float]] = {}
-        
-        # Initialize tracking for each reward term
-        if reward_manager.reward_functions:
-            for name in reward_manager.reward_functions.keys():
-                self.reward_history[name] = []
-        
-        if reward_manager.signal_subscriptions:
-            for name in reward_manager.signal_subscriptions.keys():
-                self.signal_history[name] = []
-        
-        # CSV file
         self.csv_path = os.path.join(log_dir, "reward_breakdown.csv")
-        self._init_csv()
         
-        # Alert tracking
-        self.last_alert_check = 0
-        self.term_activation_count: Dict[str, int] = {}
+        # In-memory accumulation (write every N steps)
+        self.accumulated_data = []
+        self.term_activation_counts = {}
+        self.total_steps = 0
+        
+        # Initialize CSV
+        self._init_csv()
     
     def _init_csv(self):
-        """Initialize CSV file with headers."""
+        """Initialize CSV with headers."""
         os.makedirs(self.log_dir, exist_ok=True)
         
-        headers = ["step", "total_reward"]
+        headers = ["step"]
         if self.reward_manager.reward_functions:
             headers.extend(self.reward_manager.reward_functions.keys())
-        if self.reward_manager.signal_subscriptions:
-            headers.extend([f"signal_{name}" for name in self.reward_manager.signal_subscriptions.keys()])
+        headers.append("total_reward")
         
-        with open(self.csv_path, 'w') as f:
-            f.write(','.join(headers) + '\n')
+        with open(self.csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
     
-    def log_step(self, env, dt: float):
+    def compute_breakdown(self, env) -> Dict[str, float]:
         """
-        Log reward breakdown for current step.
-        
-        Args:
-            env: Game environment
-            dt: Delta time
+        Compute reward breakdown for current step.
+        Returns dict of term contributions.
         """
-        self.step_count += 1
+        breakdown = {}
+        total = 0.0
         
-        # Calculate reward breakdown
-        reward_breakdown = {}
-        total_reward = 0.0
-        
-        # Dense rewards
         if self.reward_manager.reward_functions:
             for name, term_cfg in self.reward_manager.reward_functions.items():
                 if term_cfg.weight == 0.0:
                     value = 0.0
                 else:
                     value = _to_float(term_cfg.func(env, **term_cfg.params) * term_cfg.weight)
-                    total_reward += value
+                    total += value
                     
                     # Track activation
                     if abs(value) > 1e-6:
-                        self.term_activation_count[name] = self.term_activation_count.get(name, 0) + 1
+                        self.term_activation_counts[name] = self.term_activation_counts.get(name, 0) + 1
                 
-                reward_breakdown[name] = value
-                self.reward_history[name].append(value)
+                breakdown[name] = value
         
-        # Signal rewards (track separately)
-        signal_reward = _to_float(self.reward_manager.collected_signal_rewards)
-        total_reward += signal_reward
-        
-        # Write to CSV
-        row = [str(self.step_count), f"{total_reward:.6f}"]
-        if self.reward_manager.reward_functions:
-            row.extend([f"{reward_breakdown[name]:.6f}" for name in self.reward_manager.reward_functions.keys()])
-        if self.reward_manager.signal_subscriptions:
-            row.append(f"{signal_reward:.6f}")
-        
-        with open(self.csv_path, 'a') as f:
-            f.write(','.join(row) + '\n')
-        
-        # Check for alerts periodically
-        if self.step_count - self.last_alert_check >= self.alert_interval:
-            self._check_alerts()
-            self.last_alert_check = self.step_count
+        breakdown['total_reward'] = total
+        return breakdown
     
-    def _check_alerts(self):
-        """Check for potential issues and print alerts."""
-        alerts = []
-        
-        # Check if any reward term never activates
-        if self.reward_manager.reward_functions:
-            for name in self.reward_manager.reward_functions.keys():
-                activation_count = self.term_activation_count.get(name, 0)
-                if activation_count == 0 and self.step_count > 100:
-                    alerts.append(f"⚠️  Reward '{name}' has NEVER activated (might be broken)")
-                elif activation_count < self.step_count * 0.01 and self.step_count > 500:
-                    # Less than 1% activation
-                    percentage = (activation_count / self.step_count) * 100
-                    alerts.append(f"⚠️  Reward '{name}' rarely activates ({percentage:.1f}% of steps)")
-        
-        # Check if total reward is stuck at same value
-        if len(self.reward_history) > 0:
-            recent_rewards = list(self.reward_history.values())[0][-100:] if len(list(self.reward_history.values())[0]) >= 100 else []
-            if recent_rewards and len(set([round(r, 3) for r in recent_rewards])) == 1:
-                alerts.append(f"⚠️  Reward appears STUCK at {recent_rewards[0]:.3f}")
-        
-        # Print alerts
-        if alerts:
-            print("\n" + "="*70)
-            print(f"🔍 REWARD DEBUG ALERTS (Step {self.step_count})")
-            print("="*70)
-            for alert in alerts:
-                print(alert)
-            print("="*70 + "\n")
+    def record_step(self, step: int, breakdown: Dict[str, float]):
+        """Record breakdown for a step (in memory)."""
+        self.total_steps += 1
+        self.accumulated_data.append((step, breakdown))
     
-    def print_summary(self):
-        """Print final summary of reward contributions."""
-        print("\n" + "="*70)
-        print("📊 REWARD BREAKDOWN SUMMARY")
-        print("="*70)
+    def flush_to_csv(self):
+        """Write accumulated data to CSV and clear buffer."""
+        if not self.accumulated_data:
+            return
         
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            for step, breakdown in self.accumulated_data:
+                row = [step]
         if self.reward_manager.reward_functions:
-            # Calculate average contribution per term
-            print("\nAverage Reward Contribution per Term:")
-            total_abs_contribution = 0.0
-            contributions = {}
-            
-            for name, history in self.reward_history.items():
-                if history:
-                    avg = np.mean(history)
-                    abs_avg = np.mean(np.abs(history))
-                    contributions[name] = (avg, abs_avg)
-                    total_abs_contribution += abs_avg
-            
-            # Sort by absolute contribution
-            sorted_terms = sorted(contributions.items(), key=lambda x: abs(x[1][1]), reverse=True)
-            
-            for name, (avg, abs_avg) in sorted_terms:
-                percentage = (abs_avg / total_abs_contribution * 100) if total_abs_contribution > 0 else 0
-                activation_pct = (self.term_activation_count.get(name, 0) / self.step_count * 100)
-                print(f"  {name:30s}: {avg:+8.4f}  ({percentage:5.1f}% impact, {activation_pct:5.1f}% active)")
+                    row.extend([f"{breakdown.get(name, 0.0):.6f}" 
+                               for name in self.reward_manager.reward_functions.keys()])
+                row.append(f"{breakdown.get('total_reward', 0.0):.6f}")
+                writer.writerow(row)
         
-        print(f"\n✓ Detailed breakdown saved to: {self.csv_path}")
-        print("="*70 + "\n")
+        self.accumulated_data.clear()
+    
+    def get_active_terms(self) -> List[str]:
+        """Get list of reward terms that have activated."""
+        return [name for name, count in self.term_activation_counts.items() if count > 0]
 
 
-class BehaviorMetrics:
+class PerformanceBenchmark:
     """
-    Track key agent behaviors to validate learning progress.
-    
-    Monitors:
-    - Damage dealt vs taken ratio
-    - Knockouts and deaths
-    - Time in danger zone
-    - Weapon pickups
-    - Attack frequency
-    - Movement patterns
+    Runs comprehensive performance evaluation at checkpoint saves.
+    Tests against multiple opponent types and measures strategy diversity.
     """
     
     def __init__(self, log_dir: str):
         self.log_dir = log_dir
-        self.csv_path = os.path.join(log_dir, "behavior_metrics.csv")
+        self.csv_path = os.path.join(log_dir, "checkpoint_benchmarks.csv")
         
-        # Episode-level tracking
-        self.episode_count = 0
-        self.current_episode_data = self._new_episode_data()
+        # Track latent vectors for diversity analysis
+        self.recent_latent_vectors = deque(maxlen=50)
         
-        # Initialize CSV
-        self._init_csv()
-    
-    def _new_episode_data(self) -> Dict:
-        """Create fresh episode data dictionary."""
-        return {
-            "damage_dealt": 0.0,
-            "damage_taken": 0.0,
-            "knockouts_dealt": 0,
-            "knockouts_taken": 0,
-            "danger_zone_frames": 0,
-            "weapons_picked_up": 0,
-            "attacks_attempted": 0,
-            "total_frames": 0,
-            "won": False,
-        }
-    
-    def _init_csv(self):
-        """Initialize CSV file with headers."""
-        os.makedirs(self.log_dir, exist_ok=True)
-        headers = [
-            "episode", "damage_dealt", "damage_taken", "damage_ratio",
-            "knockouts_dealt", "knockouts_taken", "danger_zone_pct",
-            "weapons_picked_up", "attacks_attempted", "attack_rate",
-            "survival_time", "won"
-        ]
-        with open(self.csv_path, 'w') as f:
-            f.write(','.join(headers) + '\n')
-    
-    def update(self, env):
-        """
-        Update metrics from current environment state.
-        
-        Args:
-            env: Game environment
-        """
-        player = env.objects.get("player")
-        opponent = env.objects.get("opponent")
-        
-        if player and opponent:
-            # Track damage
-            self.current_episode_data["damage_dealt"] += opponent.damage_taken_this_frame
-            self.current_episode_data["damage_taken"] += player.damage_taken_this_frame
-            
-            # Track danger zone (height > 4.2)
-            if player.body.position.y >= 4.2:
-                self.current_episode_data["danger_zone_frames"] += 1
-            
-            # Track attacks (check if in attack state)
-            if isinstance(player.state, AttackState):
-                # Only count new attacks (not continuation)
-                if not hasattr(self, '_last_was_attacking') or not self._last_was_attacking:
-                    self.current_episode_data["attacks_attempted"] += 1
-                self._last_was_attacking = True
-            else:
-                self._last_was_attacking = False
-            
-            self.current_episode_data["total_frames"] += 1
-    
-    def on_knockout(self, agent: str):
-        """Called when a knockout occurs."""
-        if agent == "player":
-            self.current_episode_data["knockouts_taken"] += 1
-        else:
-            self.current_episode_data["knockouts_dealt"] += 1
-    
-    def on_weapon_pickup(self):
-        """Called when agent picks up a weapon."""
-        self.current_episode_data["weapons_picked_up"] += 1
-    
-    def on_episode_end(self, won: bool):
-        """
-        Called at end of episode to save metrics.
-        
-        Args:
-            won: Whether the agent won the episode
-        """
-        self.episode_count += 1
-        self.current_episode_data["won"] = won
-        
-        # Calculate derived metrics
-        damage_dealt = self.current_episode_data["damage_dealt"]
-        damage_taken = max(self.current_episode_data["damage_taken"], 0.001)  # Avoid division by zero
-        damage_ratio = damage_dealt / damage_taken
-        
-        danger_zone_pct = (self.current_episode_data["danger_zone_frames"] / 
-                          max(self.current_episode_data["total_frames"], 1) * 100)
-        
-        attack_rate = (self.current_episode_data["attacks_attempted"] /
-                      max(self.current_episode_data["total_frames"], 1) * 30)  # Attacks per second
-        
-        survival_time = self.current_episode_data["total_frames"] / 30  # Convert to seconds
-        
-        # Write to CSV
-        row = [
-            str(self.episode_count),
-            f"{damage_dealt:.2f}",
-            f"{damage_taken:.2f}",
-            f"{damage_ratio:.2f}",
-            str(self.current_episode_data["knockouts_dealt"]),
-            str(self.current_episode_data["knockouts_taken"]),
-            f"{danger_zone_pct:.1f}",
-            str(self.current_episode_data["weapons_picked_up"]),
-            str(self.current_episode_data["attacks_attempted"]),
-            f"{attack_rate:.2f}",
-            f"{survival_time:.1f}",
-            "1" if won else "0"
-        ]
-        
-        with open(self.csv_path, 'a') as f:
-            f.write(','.join(row) + '\n')
-        
-        # Reset for next episode
-        self.current_episode_data = self._new_episode_data()
-    
-    def print_summary(self, last_n: int = 10):
-        """Print summary of recent episodes."""
-        # Read last N episodes from CSV
-        try:
-            import pandas as pd
-            df = pd.read_csv(self.csv_path)
-            
-            if len(df) == 0:
-                print("⚠️  No behavior metrics recorded yet")
-                return
-            
-            recent = df.tail(last_n)
-            
-            print("\n" + "="*70)
-            print(f"📈 BEHAVIOR METRICS (Last {min(last_n, len(recent))} Episodes)")
-            print("="*70)
-            print(f"  Win Rate:            {recent['won'].mean()*100:.1f}%")
-            print(f"  Avg Damage Ratio:    {recent['damage_ratio'].mean():.2f}  (dealt/taken)")
-            print(f"  Avg Knockouts:       {recent['knockouts_dealt'].mean():.2f} dealt, {recent['knockouts_taken'].mean():.2f} taken")
-            print(f"  Danger Zone Time:    {recent['danger_zone_pct'].mean():.1f}% of episode")
-            print(f"  Weapon Pickups:      {recent['weapons_picked_up'].mean():.2f} per episode")
-            print(f"  Attack Rate:         {recent['attack_rate'].mean():.2f} per second")
-            print(f"  Avg Survival:        {recent['survival_time'].mean():.1f} seconds")
-            print(f"\n✓ Detailed metrics saved to: {self.csv_path}")
-            print("="*70 + "\n")
-        except ImportError:
-            print("⚠️  pandas not available, skipping behavior summary")
-        except Exception as e:
-            print(f"⚠️  Could not load behavior metrics: {e}")
-
-
-class QuickEvaluator:
-    """
-    Runs quick validation matches during training.
-    
-    Pauses training, runs N matches vs scripted opponent,
-    logs performance metrics, then resumes training.
-    """
-    
-    def __init__(self, log_dir: str, eval_interval: int = 2500, num_episodes: int = 3):
-        """
-        Args:
-            log_dir: Directory to save evaluation logs
-            eval_interval: Steps between evaluations
-            num_episodes: Number of matches per evaluation
-        """
-        self.log_dir = log_dir
-        self.eval_interval = eval_interval
-        self.num_episodes = num_episodes
-        
-        self.csv_path = os.path.join(log_dir, "evaluation_results.csv")
-        self.next_eval_step = eval_interval
-        
-        # Initialize CSV
         self._init_csv()
     
     def _init_csv(self):
-        """Initialize CSV file with headers."""
+        """Initialize benchmark CSV."""
         os.makedirs(self.log_dir, exist_ok=True)
         headers = [
-            "timestep", "win_rate", "avg_damage_dealt", "avg_damage_taken",
-            "avg_knockouts", "avg_survival_time", "evaluation_time_sec"
+            "checkpoint_step", "vs_based_winrate", "vs_constant_winrate",
+            "avg_damage_ratio", "strategy_diversity_score", "eval_time_sec"
         ]
-        with open(self.csv_path, 'w') as f:
-            f.write(','.join(headers) + '\n')
+        with open(self.csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
     
-    def should_evaluate(self, current_step: int) -> bool:
-        """Check if it's time to run evaluation."""
-        return current_step >= self.next_eval_step
-    
-    def run_evaluation(self, agent: Agent, current_step: int) -> Dict[str, float]:
+    def run_benchmark(self, agent: Agent, checkpoint_step: int, num_matches: int = 5) -> Dict[str, float]:
         """
-        Run evaluation matches and return metrics.
+        Run full performance benchmark at checkpoint save.
         
         Args:
-            agent: Agent to evaluate
-            current_step: Current training timestep
+            agent: Agent to benchmark
+            checkpoint_step: Current training step
+            num_matches: Number of matches per opponent type
             
         Returns:
-            Dictionary of evaluation metrics
+            Dictionary of benchmark results
         """
-        import time
         start_time = time.time()
         
         print("\n" + "="*70)
-        print(f"🎯 RUNNING EVALUATION at step {current_step}")
+        print(f"🎯 CHECKPOINT BENCHMARK (Step {checkpoint_step})")
         print("="*70)
         
-        results = []
+        # Test vs BasedAgent
+        print(f"Testing vs BasedAgent ({num_matches} matches)...")
+        based_results = self._run_matches(agent, partial(BasedAgent), num_matches)
+        based_winrate = np.mean([r['won'] for r in based_results]) * 100
         
-        for i in range(self.num_episodes):
-            print(f"  Match {i+1}/{self.num_episodes}...", end=" ", flush=True)
-            
-            # Run match vs BasedAgent
-            match_stats = env_run_match(
-                agent,
-                partial(BasedAgent),
-                max_timesteps=30*90,  # 90 seconds
-                resolution=CameraResolution.LOW,
-                train_mode=True
-            )
-            
-            # Extract metrics
-            won = match_stats.player1_result == Result.WIN
-            damage_dealt = match_stats.player2.total_damage  # Damage to opponent
-            damage_taken = match_stats.player1.total_damage
-            knockouts = match_stats.player2.stocks_lost
-            survival_time = match_stats.match_time
-            
-            results.append({
-                "won": won,
-                "damage_dealt": damage_dealt,
-                "damage_taken": damage_taken,
-                "knockouts": knockouts,
-                "survival_time": survival_time
-            })
-            
-            print(f"{'WIN' if won else 'LOSS'} (Damage: {damage_dealt:.0f}/{damage_taken:.0f})")
+        # Test vs ConstantAgent
+        print(f"Testing vs ConstantAgent ({num_matches} matches)...")
+        constant_results = self._run_matches(agent, partial(ConstantAgent), num_matches)
+        constant_winrate = np.mean([r['won'] for r in constant_results]) * 100
         
-        # Calculate averages
-        win_rate = np.mean([r["won"] for r in results]) * 100
-        avg_damage_dealt = np.mean([r["damage_dealt"] for r in results])
-        avg_damage_taken = np.mean([r["damage_taken"] for r in results])
-        avg_knockouts = np.mean([r["knockouts"] for r in results])
-        avg_survival = np.mean([r["survival_time"] for r in results])
+        # Calculate average damage ratio
+        all_results = based_results + constant_results
+        avg_damage_ratio = np.mean([
+            r['damage_dealt'] / max(r['damage_taken'], 1.0) 
+            for r in all_results
+        ])
+        
+        # Calculate strategy diversity score
+        diversity_score = self._calculate_strategy_diversity(agent)
         
         eval_time = time.time() - start_time
         
         # Print summary
         print("-" * 70)
-        print(f"  Win Rate:        {win_rate:.1f}%")
-        print(f"  Damage Ratio:    {avg_damage_dealt:.1f} dealt / {avg_damage_taken:.1f} taken")
-        print(f"  Avg Knockouts:   {avg_knockouts:.2f}")
-        print(f"  Avg Survival:    {avg_survival:.1f}s")
-        print(f"  Eval Time:       {eval_time:.1f}s")
+        print(f"  vs BasedAgent:       {based_winrate:.1f}% wins")
+        print(f"  vs ConstantAgent:    {constant_winrate:.1f}% wins")
+        print(f"  Avg Damage Ratio:    {avg_damage_ratio:.2f}")
+        print(f"  Strategy Diversity:  {diversity_score:.3f}")
+        print(f"  Benchmark Time:      {eval_time:.1f}s")
         print("="*70 + "\n")
         
         # Save to CSV
-        row = [
-            str(current_step),
-            f"{win_rate:.2f}",
-            f"{avg_damage_dealt:.2f}",
-            f"{avg_damage_taken:.2f}",
-            f"{avg_knockouts:.2f}",
-            f"{avg_survival:.2f}",
-            f"{eval_time:.1f}"
-        ]
-        
-        with open(self.csv_path, 'a') as f:
-            f.write(','.join(row) + '\n')
-        
-        # Schedule next evaluation
-        self.next_eval_step = current_step + self.eval_interval
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                checkpoint_step,
+                f"{based_winrate:.2f}",
+                f"{constant_winrate:.2f}",
+                f"{avg_damage_ratio:.2f}",
+                f"{diversity_score:.4f}",
+                f"{eval_time:.1f}"
+            ])
         
         return {
-            "win_rate": win_rate,
-            "avg_damage_dealt": avg_damage_dealt,
-            "avg_damage_taken": avg_damage_taken,
-            "avg_knockouts": avg_knockouts,
-            "avg_survival": avg_survival,
-            "eval_time": eval_time
+            'based_winrate': based_winrate,
+            'constant_winrate': constant_winrate,
+            'avg_damage_ratio': avg_damage_ratio,
+            'diversity_score': diversity_score
         }
+    
+    def _run_matches(self, agent: Agent, opponent_factory, num_matches: int) -> List[Dict]:
+        """Run matches and return results."""
+        results = []
+        for _ in range(num_matches):
+            match_stats = env_run_match(
+                agent,
+                opponent_factory,
+                max_timesteps=30*60,  # 60 seconds
+                resolution=CameraResolution.LOW,
+                train_mode=True
+            )
+            
+            results.append({
+                'won': match_stats.player1_result == Result.WIN,
+                'damage_dealt': match_stats.player2.total_damage,
+                'damage_taken': match_stats.player1.total_damage
+            })
+        
+        return results
+    
+    def _calculate_strategy_diversity(self, agent: Agent) -> float:
+        """
+        Calculate strategy diversity score from recent latent vectors.
+        Higher score = more diverse strategies employed.
+        
+        Returns standard deviation of latent vector norms.
+        """
+        if not isinstance(agent, TransformerStrategyAgent):
+            return 0.0
+        
+        if len(self.recent_latent_vectors) < 10:
+            return 0.0
+        
+        # Calculate std dev of norms (diversity in strategy strength)
+        norms = [np.linalg.norm(v) for v in self.recent_latent_vectors]
+        diversity = np.std(norms)
+        
+        return diversity
+    
+    def record_latent_vector(self, agent: Agent):
+        """Record latent vector for diversity tracking."""
+        if not isinstance(agent, TransformerStrategyAgent):
+                return
+            
+        if agent.current_strategy_latent is not None:
+            latent_numpy = agent.current_strategy_latent.cpu().detach().numpy().flatten()
+            self.recent_latent_vectors.append(latent_numpy)
 
 
-class SanityChecker:
+class TrainingMonitorCallback(BaseCallback):
     """
-    Auto-detects broken configurations and training issues.
+    Stable-Baselines3 callback for hierarchical training monitoring.
     
-    Monitors training and raises alerts for:
-    - Reward not changing (agent stuck)
-    - Always losing (reward weights wrong)
-    - Loss exploding (learning rate too high)
-    - No improvement after many steps
+    Logging Hierarchy:
+    - Every 100 steps: Light checks (alerts only)
+    - Every 500-1000 steps: Reward breakdown, transformer health, PPO metrics
+    - Every 5000 steps: Quick evaluation, behavior summary, sanity checks
+    - Every checkpoint: Full benchmark
     """
     
-    def __init__(self, check_interval: int = 1000, early_stop_threshold: int = 5000):
-        """
-        Args:
-            check_interval: Steps between sanity checks
-            early_stop_threshold: Steps before suggesting early stop if broken
-        """
-        self.check_interval = check_interval
-        self.early_stop_threshold = early_stop_threshold
+    def __init__(
+        self,
+        agent: Agent,
+        reward_manager: RewardManager,
+        save_handler: SaveHandler,
+        log_dir: str,
+        light_log_freq: int = 500,
+        eval_freq: int = 5000,
+        eval_matches: int = 3,
+        verbose: int = 1
+    ):
+        super().__init__(verbose)
         
-        self.step_count = 0
-        self.reward_history: List[float] = []
-        self.loss_history: List[float] = []
+        self.agent = agent
+        self.reward_manager = reward_manager
+        self.save_handler = save_handler
+        self.log_dir = log_dir
+        self.light_log_freq = light_log_freq
+        self.eval_freq = eval_freq
+        self.eval_matches = eval_matches
         
-        self.last_check_step = 0
-        self.issues_detected: List[str] = []
+        # Initialize tracking components
+        self.transformer_monitor = TransformerHealthMonitor()
+        self.reward_tracker = RewardBreakdownTracker(reward_manager, log_dir)
+        self.benchmark = PerformanceBenchmark(log_dir)
+        
+        # Frame-level alert buffers
+        self.recent_rewards = deque(maxlen=100)
+        self.recent_losses = deque(maxlen=100)
+        
+        # Episode tracking
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.current_episode_reward = 0.0
+        self.current_episode_length = 0
+        
+        # Behavior tracking (lightweight)
+        self.total_damage_dealt = 0.0
+        self.total_damage_taken = 0.0
+        self.danger_zone_steps = 0
+        self.total_steps = 0
+        
+        # Sanity check state
+        self.reward_stuck_warning_issued = False
+        self.loss_explosion_warning_issued = False
+        
+        # Timing
+        self.last_light_log = 0
+        self.last_eval = 0
+        self.last_checkpoint_step = 0
+        
+        print(f"✓ Training monitor initialized (log_dir: {log_dir})")
     
-    def update(self, reward: float, loss: Optional[float] = None):
-        """
-        Update with current step data.
-        
-        Args:
-            reward: Current episode reward
-            loss: Current policy loss (if available)
-        """
-        self.step_count += 1
-        self.reward_history.append(reward)
-        
-        if loss is not None:
-            self.loss_history.append(loss)
-        
-        # Run checks periodically
-        if self.step_count - self.last_check_step >= self.check_interval:
-            self._run_checks()
-            self.last_check_step = self.step_count
+    def _init_callback(self) -> None:
+        """Called once at start of training."""
+        # Create summary CSV for episode-level metrics
+        self.episode_csv_path = os.path.join(self.log_dir, "episode_summary.csv")
+        with open(self.episode_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['step', 'episode', 'reward', 'length', 'damage_ratio'])
     
-    def _run_checks(self):
-        """Run all sanity checks."""
-        new_issues = []
+    def _on_step(self) -> bool:
+        """
+        Called at every training step.
+        Performs lightweight checks and periodic logging.
+        """
+        self.current_episode_length += 1
+        self.total_steps += 1
         
-        # Check 1: Reward stuck at same value
-        if len(self.reward_history) >= 100:
-            recent_rewards = self.reward_history[-100:]
-            unique_values = len(set([round(r, 2) for r in recent_rewards]))
-            if unique_values <= 3:
-                new_issues.append("Reward appears STUCK (very little variation)")
+        # Extract current reward (from training env)
+        if len(self.model.ep_info_buffer) > 0:
+            recent_ep = self.model.ep_info_buffer[-1]
+            step_reward = recent_ep.get('r', 0.0)
+            self.current_episode_reward = step_reward
         
-        # Check 2: Always losing/negative rewards
-        if len(self.reward_history) >= 50:
-            recent_rewards = self.reward_history[-50:]
-            if all(r < 0 for r in recent_rewards):
-                new_issues.append("Agent ALWAYS getting negative rewards (weights may be wrong)")
+        # Frame-level alerts (console only, no file I/O)
+        self._check_frame_alerts()
         
-        # Check 3: Loss exploding
-        if len(self.loss_history) >= 10:
-            recent_loss = self.loss_history[-10:]
-            if any(l > 1000 for l in recent_loss):
-                new_issues.append("Loss EXPLODING (learning rate may be too high)")
+        # Light logging every N steps
+        if self.num_timesteps - self.last_light_log >= self.light_log_freq:
+            self._light_logging()
+            self.last_light_log = self.num_timesteps
         
-        # Check 4: No improvement
-        if len(self.reward_history) >= 500:
-            early_rewards = np.mean(self.reward_history[100:200])
-            recent_rewards = np.mean(self.reward_history[-100:])
-            if recent_rewards <= early_rewards * 1.05:  # Less than 5% improvement
-                new_issues.append("NO IMPROVEMENT detected (agent not learning)")
+        # Quick evaluation every N steps
+        if self.num_timesteps - self.last_eval >= self.eval_freq:
+            self._quick_evaluation()
+            self.last_eval = self.num_timesteps
         
-        # Print new issues
-        for issue in new_issues:
-            if issue not in self.issues_detected:
-                print("\n" + "🚨 " + "="*68)
-                print(f"SANITY CHECK ALERT (Step {self.step_count}): {issue}")
-                print("="*70 + "\n")
-                self.issues_detected.append(issue)
+        # Check if checkpoint was just saved
+        if self.save_handler is not None:
+            current_checkpoint_step = self.save_handler.num_timesteps
+            if current_checkpoint_step > self.last_checkpoint_step + self.save_handler.save_freq - 100:
+                self._checkpoint_benchmark()
+                self.last_checkpoint_step = current_checkpoint_step
         
-        # Suggest early stop if many issues and past threshold
-        if len(self.issues_detected) >= 2 and self.step_count >= self.early_stop_threshold:
-            print("\n" + "💥 " + "="*68)
-            print(f"CRITICAL: Multiple issues detected after {self.step_count} steps")
-            print("Consider stopping training and adjusting configuration!")
-            print("="*70 + "\n")
+        return True  # Continue training
     
-    def is_healthy(self) -> bool:
-        """Check if training appears healthy."""
-        return len(self.issues_detected) == 0
+    def _check_frame_alerts(self):
+        """
+        Frame-level alerts (console only, no disk writes).
+        Checks for critical issues that need immediate attention.
+        """
+        # Check for gradient explosions
+        if hasattr(self.model, 'logger') and self.model.logger:
+            try:
+                # Try to get loss from logger
+                log_data = self.model.logger.name_to_value
+                if 'train/policy_gradient_loss' in log_data:
+                    loss = log_data['train/policy_gradient_loss']
+                    self.recent_losses.append(loss)
+                    
+                    if loss > 100 and not self.loss_explosion_warning_issued:
+                        print(f"\n⚠️  ALERT: Gradient explosion detected (loss={loss:.2f}) at step {self.num_timesteps}\n")
+                        self.loss_explosion_warning_issued = True
+                
+                # Check for NaN
+                if 'train/loss' in log_data:
+                    total_loss = log_data['train/loss']
+                    if np.isnan(total_loss):
+                        print(f"\n🚨 CRITICAL: NaN detected in loss at step {self.num_timesteps}!\n")
+            except:
+                pass  # Silent fail
+        
+        # Check for reward spikes
+        if len(self.recent_rewards) > 10:
+            recent_mean = np.mean(list(self.recent_rewards)[-10:])
+            if self.current_episode_reward > 1000 * abs(recent_mean) + 1e-6:
+                print(f"\n⚠️  ALERT: Reward spike detected ({self.current_episode_reward:.1f}) at step {self.num_timesteps}\n")
+    
+    def _light_logging(self):
+        """
+        Light logging every 500-1000 steps.
+        - Reward breakdown
+        - Transformer health
+        - PPO core metrics
+        """
+        print(f"\n--- Step {self.num_timesteps} ---")
+        
+        # 1. Reward breakdown
+        if hasattr(self.training_env, 'envs') and len(self.training_env.envs) > 0:
+            try:
+                env = self.training_env.envs[0]
+                # Get to the base environment
+                while hasattr(env, 'env'):
+                    env = env.env
+                if hasattr(env, 'raw_env'):
+                    breakdown = self.reward_tracker.compute_breakdown(env.raw_env)
+                    active_terms = [k for k, v in breakdown.items() if k != 'total_reward' and abs(v) > 1e-6]
+                    print(f"  Reward Breakdown: {', '.join([f'{k}={v:.3f}' for k, v in breakdown.items() if k in active_terms[:3]])}")
+                    print(f"  Active Terms: {', '.join(active_terms)}")
+                    
+                    # Record for later flush
+                    self.reward_tracker.record_step(self.num_timesteps, breakdown)
+            except:
+                pass
+        
+        # 2. Transformer health
+        self.transformer_monitor.update(self.agent)
+        health_stats = self.transformer_monitor.get_stats()
+        if health_stats:
+            print(f"  Transformer: Latent Norm={health_stats.get('latent_norm_mean', 0):.3f} " +
+                  f"(±{health_stats.get('latent_norm_std', 0):.3f}), " +
+                  f"Attention Entropy={health_stats.get('attention_entropy_mean', 0):.3f}")
+        
+        # 3. PPO core metrics
+        if hasattr(self.model, 'logger') and self.model.logger:
+            try:
+                log_data = self.model.logger.name_to_value
+                policy_loss = log_data.get('train/policy_gradient_loss', 0)
+                value_loss = log_data.get('train/value_loss', 0)
+                explained_var = log_data.get('train/explained_variance', 0)
+                
+                print(f"  PPO: Policy Loss={policy_loss:.4f}, Value Loss={value_loss:.4f}, " +
+                      f"Explained Var={explained_var:.3f}")
+            except:
+                pass
+        
+        # Flush reward data to CSV every 10 light logs
+        if self.num_timesteps % (self.light_log_freq * 10) == 0:
+            self.reward_tracker.flush_to_csv()
+    
+    def _quick_evaluation(self):
+        """
+        Quick evaluation every 5000 steps.
+        - Win rate spot check
+        - Behavior metrics summary
+        - Sanity checks
+        """
+        print(f"\n{'='*70}")
+        print(f"🔍 QUICK EVALUATION (Step {self.num_timesteps})")
+        print(f"{'='*70}")
+        
+        # 1. Win rate spot check (3 quick matches)
+        wins = 0
+        total_damage_dealt = 0
+        total_damage_taken = 0
+        
+        for i in range(self.eval_matches):
+            try:
+                match_stats = env_run_match(
+                    self.agent,
+                    partial(BasedAgent),
+                    max_timesteps=30*60,
+                    resolution=CameraResolution.LOW,
+                    train_mode=True
+                )
+                if match_stats.player1_result == Result.WIN:
+                    wins += 1
+                total_damage_dealt += match_stats.player2.total_damage
+                total_damage_taken += match_stats.player1.total_damage
+            except:
+                pass
+        
+        win_rate = (wins / self.eval_matches) * 100
+        avg_damage_ratio = total_damage_dealt / max(total_damage_taken, 1.0)
+        
+        print(f"  Win Rate: {win_rate:.1f}% ({wins}/{self.eval_matches} matches)")
+        print(f"  Damage Ratio: {avg_damage_ratio:.2f}")
+        
+        # 2. Behavior metrics summary (from episode buffer)
+        if len(self.model.ep_info_buffer) >= 10:
+            recent_rewards = [ep['r'] for ep in list(self.model.ep_info_buffer)[-10:]]
+            recent_lengths = [ep['l'] for ep in list(self.model.ep_info_buffer)[-10:]]
+            
+            print(f"  Avg Episode Reward (last 10): {np.mean(recent_rewards):.2f}")
+            print(f"  Avg Episode Length (last 10): {np.mean(recent_lengths):.1f}")
+        
+        # 3. Sanity checks
+        self._run_sanity_checks()
+        
+        print(f"{'='*70}\n")
+        
+        # Record latent vector for diversity tracking
+        self.benchmark.record_latent_vector(self.agent)
+    
+    def _run_sanity_checks(self):
+        """Run sanity checks on training progress."""
+        issues = []
+        
+        # Check if reward is stuck
+        if len(self.model.ep_info_buffer) >= 50:
+            recent_rewards = [ep['r'] for ep in list(self.model.ep_info_buffer)[-50:]]
+            unique_values = len(set([round(r, 1) for r in recent_rewards]))
+            if unique_values <= 3 and not self.reward_stuck_warning_issued:
+                issues.append("Reward appears STUCK (very little variation)")
+                self.reward_stuck_warning_issued = True
+        
+        # Check if agent is improving
+        if len(self.model.ep_info_buffer) >= 100:
+            early_rewards = [ep['r'] for ep in list(self.model.ep_info_buffer)[20:40]]
+            recent_rewards = [ep['r'] for ep in list(self.model.ep_info_buffer)[-20:]]
+            
+            if np.mean(recent_rewards) <= np.mean(early_rewards) * 1.05:
+                issues.append("NO IMPROVEMENT detected (agent not learning)")
+        
+        # Check for loss explosions
+        if len(self.recent_losses) >= 10:
+            recent_losses = list(self.recent_losses)[-10:]
+            if any(l > 1000 for l in recent_losses):
+                issues.append("Loss values very high (check learning rate)")
+        
+        # Print issues
+        if issues:
+            print(f"  ⚠️  Sanity Check Issues:")
+            for issue in issues:
+                print(f"      - {issue}")
+        else:
+            print(f"  ✓ Sanity checks passed")
+    
+    def _checkpoint_benchmark(self):
+        """
+        Full performance benchmark when checkpoint is saved.
+        Most comprehensive evaluation.
+        """
+        try:
+            self.benchmark.run_benchmark(
+                self.agent,
+                self.num_timesteps,
+                num_matches=5
+            )
+        except Exception as e:
+            print(f"⚠️  Checkpoint benchmark failed: {e}")
+    
+    def _on_rollout_end(self) -> None:
+        """Called at end of each rollout (batch of episodes)."""
+        # Flush reward breakdown to CSV
+        self.reward_tracker.flush_to_csv()
 
 
 # --------------------------------------------------------------------------------
@@ -2187,8 +2276,21 @@ def run_training_loop(
     resolution: CameraResolution = CameraResolution.LOW,
     train_timesteps: int = 50_000,
    train_logging: TrainLogging = TrainLogging.PLOT,
+    monitor_callback: Optional[TrainingMonitorCallback] = None,
 ):
-    """Launch training with the provided environment, reward, and self-play setup."""
+    """
+    Launch training with the provided environment, reward, and self-play setup.
+    
+    Args:
+        agent: Agent to train
+        reward_manager: Reward function manager
+        save_handler: Checkpoint save handler
+        opponent_cfg: Opponent configuration
+        resolution: Camera resolution for rendering
+        train_timesteps: Total training timesteps
+        train_logging: Logging mode
+        monitor_callback: Optional training monitor callback for enhanced logging
+    """
 
     debug_log(
         "training_loop",
@@ -2198,17 +2300,53 @@ def run_training_loop(
         ),
     )
 
-    result = env_train(
-        agent,
-        reward_manager,
-        save_handler,
-        opponent_cfg,
-        resolution,
-        train_timesteps=train_timesteps,
-        train_logging=train_logging,
+    # Create environment
+    from environment.agent import SelfPlayWarehouseBrawl
+    from stable_baselines3.common.monitor import Monitor
+    
+    env = SelfPlayWarehouseBrawl(
+        reward_manager=reward_manager,
+        opponent_cfg=opponent_cfg,
+        save_handler=save_handler,
+        resolution=resolution
     )
+    reward_manager.subscribe_signals(env.raw_env)
+    
+    if train_logging != TrainLogging.NONE:
+        # Create log dir
+        log_dir = f"{save_handler._experiment_path()}/" if save_handler is not None else "/tmp/gym/"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Logs will be saved in log_dir/monitor.csv
+        env = Monitor(env, log_dir)
+    
+    base_env = env.unwrapped if hasattr(env, 'unwrapped') else env
+    
+    try:
+        agent.get_env_info(base_env)
+        base_env.on_training_start()
+        
+        # Train with callback if provided
+        if monitor_callback is not None:
+            agent.learn(env, total_timesteps=train_timesteps, verbose=1, callback=monitor_callback)
+        else:
+            agent.learn(env, total_timesteps=train_timesteps, verbose=1)
+        
+        base_env.on_training_end()
+    except KeyboardInterrupt:
+        print("\n⚠️  Training interrupted by user")
+        pass
+    
+    env.close()
+    
+    if save_handler is not None:
+        save_handler.save_agent()
+    
+    if train_logging == TrainLogging.PLOT:
+        from environment.agent import plot_results
+        plot_results(log_dir)
+    
     debug_log("training_loop", "Training loop completed")
-    return result
 
 
 # --------------------------------------------------------------------------------
@@ -2259,41 +2397,6 @@ def run_live_eval(
 # --------------------------------------------------------------------------------
 # Assemble the pieces above and kick off training when the script is executed.
 
-def enable_test_debugging(
-    reward_manager: RewardManager,
-    log_dir: str,
-    eval_interval: int = 2500,
-    eval_episodes: int = 3
-) -> Tuple[Optional[RewardDebugger], Optional[BehaviorMetrics], Optional[QuickEvaluator], Optional[SanityChecker]]:
-    """
-    Enable all debugging features for test runs.
-    
-    Args:
-        reward_manager: RewardManager instance
-        log_dir: Directory for debug logs
-        eval_interval: Steps between evaluations
-        eval_episodes: Number of eval matches per evaluation
-        
-    Returns:
-        Tuple of (reward_debugger, behavior_metrics, quick_evaluator, sanity_checker)
-    """
-    print("\n" + "🔬 " + "="*68)
-    print("DEBUG MODE ENABLED - Enhanced tracking active")
-    print("="*70)
-    print(f"  • Reward breakdown logging: {os.path.join(log_dir, 'reward_breakdown.csv')}")
-    print(f"  • Behavior metrics logging: {os.path.join(log_dir, 'behavior_metrics.csv')}")
-    print(f"  • Evaluation every {eval_interval} steps ({eval_episodes} matches each)")
-    print(f"  • Sanity checks active (alerts for broken configs)")
-    print("="*70 + "\n")
-    
-    reward_debugger = RewardDebugger(reward_manager, log_dir, alert_interval=500)
-    behavior_metrics = BehaviorMetrics(log_dir)
-    quick_evaluator = QuickEvaluator(log_dir, eval_interval, eval_episodes)
-    sanity_checker = SanityChecker(check_interval=1000, early_stop_threshold=5000)
-    
-    return reward_debugger, behavior_metrics, quick_evaluator, sanity_checker
-
-
 def main() -> None:
     """Default experiment setup driven by TRAIN_CONFIG."""
     
@@ -2301,13 +2404,13 @@ def main() -> None:
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
     
-    # Check if test mode is enabled
+    # Check if monitoring is enabled
     training_cfg = TRAIN_CONFIG.get("training", {})
-    is_test_mode = training_cfg.get("enable_debug", False)
-    if is_test_mode:
-        print(f"📝 MODE: TEST (Quick iteration with enhanced debugging)")
+    enable_monitoring = training_cfg.get("enable_debug", True)  # Default to True (always monitor)
+    if enable_monitoring:
+        print(f"📝 MODE: MONITORED TRAINING (Hierarchical logging active)")
     else:
-        print(f"📝 MODE: FULL TRAINING")
+        print(f"📝 MODE: MINIMAL LOGGING")
     print("=" * 70)
 
     agent_cfg = TRAIN_CONFIG.get("agent", {})
@@ -2360,18 +2463,33 @@ def main() -> None:
         f"Training config: timesteps={train_timesteps}, resolution={train_resolution.name}, logging={train_logging.name}",
     )
     
-    # Enable debug features if in test mode
-    debug_tools = None
-    if is_test_mode:
+    # Create monitoring callback if enabled
+    monitor_callback = None
+    if enable_monitoring:
         log_dir = f"{save_handler._experiment_path()}/" if save_handler is not None else f"{CHECKPOINT_BASE_PATH}/tmp/"
-        eval_interval = training_cfg.get("eval_freq", 2500)
-        eval_episodes = training_cfg.get("eval_episodes", 3)
+        light_log_freq = training_cfg.get("light_log_freq", 500)  # Every 500 steps
+        eval_freq = training_cfg.get("eval_freq", 5000)  # Every 5000 steps
+        eval_matches = training_cfg.get("eval_episodes", 3)  # 3 matches per eval
         
-        debug_tools = enable_test_debugging(
+        print("\n" + "🔬 " + "="*68)
+        print("OPTIMIZED MONITORING SYSTEM ACTIVE")
+        print("="*70)
+        print(f"  • Light logging every {light_log_freq} steps (reward breakdown, transformer health, PPO metrics)")
+        print(f"  • Quick evaluation every {eval_freq} steps ({eval_matches} matches)")
+        print(f"  • Full benchmarks at each checkpoint save (~{self_play_save_freq} steps)")
+        print(f"  • Frame-level alerts: Console only (gradient explosions, NaN, reward spikes)")
+        print(f"  • Log directory: {log_dir}")
+        print("="*70 + "\n")
+        
+        monitor_callback = TrainingMonitorCallback(
+            agent=learning_agent,
             reward_manager=reward_manager,
+            save_handler=save_handler,
             log_dir=log_dir,
-            eval_interval=eval_interval,
-            eval_episodes=eval_episodes
+            light_log_freq=light_log_freq,
+            eval_freq=eval_freq,
+            eval_matches=eval_matches,
+            verbose=1
     )
 
     run_training_loop(
@@ -2382,34 +2500,29 @@ def main() -> None:
         resolution=train_resolution,
         train_timesteps=train_timesteps,
         train_logging=train_logging,
+        monitor_callback=monitor_callback,
     )
     
-    # Print debug summaries if in test mode
-    if is_test_mode and debug_tools is not None:
-        reward_debugger, behavior_metrics, quick_evaluator, sanity_checker = debug_tools
-        
+    # Print final summary if monitoring was enabled
+    if enable_monitoring and monitor_callback is not None:
         print("\n" + "="*70)
-        print("📋 TRAINING COMPLETE - GENERATING DEBUG REPORTS")
-        print("="*70 + "\n")
-        
-        if reward_debugger:
-            reward_debugger.print_summary()
-        
-        if behavior_metrics:
-            behavior_metrics.print_summary(last_n=20)
-        
-        if sanity_checker:
-            if sanity_checker.is_healthy():
-                print("\n✅ SANITY CHECK: Training appears healthy!\n")
-            else:
-                print("\n⚠️  SANITY CHECK: Issues detected during training\n")
-                print(f"     Detected issues: {len(sanity_checker.issues_detected)}")
-                for issue in sanity_checker.issues_detected:
-                    print(f"     - {issue}")
-                print()
-        
+        print("✅ TRAINING COMPLETE - MONITORING SUMMARY")
         print("="*70)
-        print("✓ All debug logs saved to:", log_dir)
+        print(f"  • Total steps tracked: {monitor_callback.total_steps}")
+        print(f"  • Reward breakdown CSV: {monitor_callback.reward_tracker.csv_path}")
+        print(f"  • Episode summary CSV: {monitor_callback.episode_csv_path}")
+        print(f"  • Checkpoint benchmarks CSV: {monitor_callback.benchmark.csv_path}")
+        
+        # Check for any issues
+        if monitor_callback.reward_stuck_warning_issued or monitor_callback.loss_explosion_warning_issued:
+            print(f"\n  ⚠️  Warnings issued during training:")
+            if monitor_callback.reward_stuck_warning_issued:
+                print(f"      - Reward appeared stuck at some point")
+            if monitor_callback.loss_explosion_warning_issued:
+                print(f"      - Gradient explosion detected")
+            else:
+            print(f"\n  ✓ No critical issues detected during training")
+        
         print("="*70 + "\n")
 
 

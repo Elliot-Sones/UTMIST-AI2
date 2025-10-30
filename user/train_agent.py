@@ -1,4 +1,5 @@
 """
+Version: new
 --------------------------------------------------------
 Logic overview
 --------------------------------------------------------
@@ -309,19 +310,19 @@ def attach_opponent_debug(opponent_cfg: OpponentsCfg) -> OpponentsCfg:
 # ------------ SHARED HYPERPARAMETERS (DO NOT MODIFY INDIVIDUALLY) ------------
 # These hyperparameters are identical across all configs to ensure scaling laws hold
 _SHARED_AGENT_CONFIG = {
-    "type": "transformer_strategy",  # Transformer-based strategy understanding
-    "load_path": None,
-    
+        "type": "transformer_strategy",  # Transformer-based strategy understanding
+        "load_path": None,
+        
     # Transformer hyperparameters (optimized for T4 GPU - 16GB VRAM)
-    "latent_dim": 256,           # Dimensionality of strategy latent space
+        "latent_dim": 256,           # Dimensionality of strategy latent space
     "num_heads": 8,              # Number of attention heads (divisor of latent_dim)
     "num_layers": 6,             # Depth of transformer encoder
-    "sequence_length": 90,       # Frames to analyze (3 seconds at 30 FPS)
+        "sequence_length": 90,       # Frames to analyze (3 seconds at 30 FPS)
     "opponent_obs_dim": None,    # Auto-detected from observation space
-    
+        
     # RecurrentPPO hyperparameters (optimized for T4 GPU)
-    "policy_kwargs": {
-        "activation_fn": nn.ReLU,
+        "policy_kwargs": {
+            "activation_fn": nn.ReLU,
         "lstm_hidden_size": 512,              # LSTM hidden state size
         "net_arch": dict(pi=[96, 96], vf=[96, 96]),  # Actor/Critic network sizes
         "shared_lstm": True,                  # Share LSTM between actor and critic
@@ -2119,7 +2120,7 @@ def build_self_play_components(
 ) -> Tuple[SelfPlayHandler, SaveHandler, OpponentsCfg]:
     """
     Configure snapshot saving and opponent sampling for self-play.
-    
+
     If opponent_mix contains 'self_play' with None as handler, it will be
     automatically replaced with the created selfplay_handler.
     """

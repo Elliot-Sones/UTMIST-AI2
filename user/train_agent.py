@@ -16,6 +16,12 @@ Key improvements:
 # ----------------------------- IMPORTS -----------------------------
 # -------------------------------------------------------------------
 
+from enum import Enum
+from typing import Optional, Tuple
+from functools import partial
+from stable_baselines3.common.callbacks import BaseCallback
+
+
 import torch 
 import gymnasium as gym
 from torch.nn import functional as F
@@ -40,16 +46,14 @@ from datetime import datetime
 # -------------------------------------------------------------------------
 
 class SB3Agent(Agent):
-    '''
-    SB3Agent:
-    - Defines an AI Agent that takes an SB3 class input for specific SB3 algorithm (e.g. PPO, SAC)
-    '''
     def __init__(
             self,
             sb3_class: Optional[Type[BaseAlgorithm]] = PPO,
-            file_path: Optional[str] = None
+            file_path: Optional[str] = None,
+            device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     ):
         self.sb3_class = sb3_class
+        self.device = device
         super().__init__(file_path)
 
     def _initialize(self) -> None:
@@ -57,17 +61,21 @@ class SB3Agent(Agent):
             self.model = self.sb3_class(
                 "MlpPolicy", 
                 self.env, 
-                verbose=0, 
-                n_steps=30*90*3, 
-                batch_size=128, 
+                verbose=0,
+                device=self.device,  # Use stored device
+                n_steps=30*90*5,     # Increased for GPU efficiency
+                batch_size=256,       # Larger batches for GPU
+                n_epochs=10,          # Multiple epochs per update
                 ent_coef=0.01,
                 learning_rate=3e-4,
-                max_grad_norm=0.5,  # Prevent exploding gradients
-                normalize_advantage=True,  # Normalize advantages for stability
+                max_grad_norm=0.5,
+                normalize_advantage=True,
             )
+            print(f"✓ Model initialized on {self.device}")
             del self.env
         else:
-            self.model = self.sb3_class.load(self.file_path)
+            self.model = self.sb3_class.load(self.file_path, device=self.device)
+            print(f"✓ Model loaded on {self.device}")
 
     def _gdown(self) -> str:
         return
@@ -1390,69 +1398,63 @@ def attack_commitment_reward(env: WarehouseBrawl) -> float:
 
 def gen_reward_manager():
     """
-    Tournament-optimized reward configuration
-    WITH ATTACK BOUNDARY SAFETY
+    AGGRESSIVE ATTACK-FOCUSED configuration
+    Prioritize combat engagement over survival
     """
     reward_functions = {
-        # === SURVIVAL & SAFETY (HIGHEST PRIORITY) ===
-        'survive_reward': RewTerm(func=survive_reward, weight=2.0),
-        'self_preservation_reward': RewTerm(func=self_preservation_reward, weight=2.5),
-        'ledge_safety_reward': RewTerm(func=ledge_safety_reward, weight=1.8),
-        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=-2.0),
-        
-        # === ATTACK SAFETY ===
-        'safe_attack_reward': RewTerm(func=safe_attack_reward, weight=2.0),
-        'momentum_awareness_reward': RewTerm(func=momentum_awareness_reward, weight=1.5),
-        'recovery_priority_reward': RewTerm(func=recovery_priority_reward, weight=2.2),
-        'attack_commitment_reward': RewTerm(func=attack_commitment_reward, weight=0.6),
-        
-        # === PLATFORM AWARENESS ===
-        'platform_awareness_reward': RewTerm(func=platform_awareness_reward, weight=1.5),
-        
-        # === SITUATIONAL AWARENESS ===
-        'respect_knockout_reward': RewTerm(func=respect_knockout_reward, weight=1.2),
-        'opportunistic_positioning_reward': RewTerm(func=opportunistic_positioning_reward, weight=0.8),
-        
-        # === SMART COMBAT ===
+        # === CORE COMBAT (MAXIMUM PRIORITY) ===
         'damage_interaction_reward': RewTerm(
             func=lambda env: damage_interaction_reward(env, mode=RewardMode.SYMMETRIC),
-            weight=1.8  # Slightly reduced since we added safe_attack_reward
+            weight=5.0  # MASSIVE INCREASE - Primary reward source
         ),
-        'situational_aggression_reward': RewTerm(func=situational_aggression_reward, weight=1.0),
+        'combo_extension_reward': RewTerm(func=combo_extension_reward, weight=2.5),  # HUGE INCREASE
+        'hit_confirm_reward': RewTerm(func=hit_confirm_reward, weight=2.0),  # HUGE INCREASE
+        'attack_commitment_reward': RewTerm(func=attack_commitment_reward, weight=2.5),  # MASSIVE - Reward aggression
         
-        # === COMBO & SKILL ===
-        'combo_extension_reward': RewTerm(func=combo_extension_reward, weight=0.8),
-        'hit_confirm_reward': RewTerm(func=hit_confirm_reward, weight=0.5),
-        'neutral_win_reward': RewTerm(func=neutral_win_reward, weight=0.6),
+        # === SMART AGGRESSION ===
+        'situational_aggression_reward': RewTerm(func=situational_aggression_reward, weight=1.8),
+        'neutral_win_reward': RewTerm(func=neutral_win_reward, weight=1.5),
+        'first_hit_reward': RewTerm(func=first_hit_reward, weight=2.0),  # BIG reward for engaging
         
-        # === POSITIONING ===
-        'optimal_distance_reward': RewTerm(func=optimal_distance_reward, weight=0.4),
-        'stage_control_reward': RewTerm(func=stage_control_reward, weight=0.3),
-        'edge_guard_reward': RewTerm(func=edge_guard_reward, weight=0.4),
+        # === ATTACK SAFETY (MINIMAL) ===
+        'safe_attack_reward': RewTerm(func=safe_attack_reward, weight=1.0),  # Keep but reduce
+        'momentum_awareness_reward': RewTerm(func=momentum_awareness_reward, weight=0.3),  # MINIMAL
+        'recovery_priority_reward': RewTerm(func=recovery_priority_reward, weight=0.2),  # REDUCED
         
-        # === DEFENSIVE INTELLIGENCE ===
-        'defensive_spacing_reward': RewTerm(func=defensive_spacing_reward, weight=0.4),
+        # === SURVIVAL (MINIMAL - ONLY CRITICAL SITUATIONS) ===
+        'survive_reward': RewTerm(func=survive_reward, weight=0.3),  # DRASTICALLY REDUCED or REMOVE
+        'self_preservation_reward': RewTerm(func=self_preservation_reward, weight=0.4),  # MINIMAL
+        'ledge_safety_reward': RewTerm(func=ledge_safety_reward, weight=0.2),  # MINIMAL or REMOVE
+        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=-0.3),  # TINY penalty
+        
+        # === POSITIONING (COMBAT-FOCUSED) ===
+        'platform_awareness_reward': RewTerm(func=platform_awareness_reward, weight=0.5),
+        'optimal_distance_reward': RewTerm(func=optimal_distance_reward, weight=0.8),  # For attack range
+        'stage_control_reward': RewTerm(func=stage_control_reward, weight=0.6),
+        'edge_guard_reward': RewTerm(func=edge_guard_reward, weight=1.0),  # Offensive edge play
+        'opportunistic_positioning_reward': RewTerm(func=opportunistic_positioning_reward, weight=0.8),
+        
+        # === AWARENESS ===
+        'respect_knockout_reward': RewTerm(func=respect_knockout_reward, weight=0.8),
+        'defensive_spacing_reward': RewTerm(func=defensive_spacing_reward, weight=0.2),  # MINIMAL
         
         # === MOBILITY & WEAPON ===
-        'dash_usage_reward': RewTerm(func=dash_usage_reward, weight=0.6),
-        'smart_movement_reward': RewTerm(func=smart_movement_reward, weight=0.4),
-        'weapon_management_reward': RewTerm(func=weapon_management_reward, weight=0.5),
+        'dash_usage_reward': RewTerm(func=dash_usage_reward, weight=1.0),  # For approach
+        'smart_movement_reward': RewTerm(func=smart_movement_reward, weight=0.7),
+        'weapon_management_reward': RewTerm(func=weapon_management_reward, weight=0.8),
         
-        # === ANTI-SPAM ===
-        'penalize_attack_spam': RewTerm(func=penalize_attack_spam, weight=1.0),
-        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=1.0),
-        'punish_predictable_patterns': RewTerm(func=punish_predictable_patterns, weight=1.0),
-        
-        # === FIRST BLOOD ===
-        'first_hit_reward': RewTerm(func=first_hit_reward, weight=0.8),
+        # === ANTI-SPAM (VERY MINIMAL) ===
+        'penalize_attack_spam': RewTerm(func=penalize_attack_spam, weight=0.15),  # Almost nothing
+        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=0.1),  # Almost nothing
+        'punish_predictable_patterns': RewTerm(func=punish_predictable_patterns, weight=0.15),  # Almost nothing
     }
 
     signal_subscriptions = {
-        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=250)),
-        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=-50)),
-        'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=12)),
-        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=10)),
-        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=-6)),
+        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=500)),  # HUGE win bonus
+        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=-15)),  # TINY penalty - dying is OK while learning
+        'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=25)),  # MASSIVE combo reward
+        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=15)),
+        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=-2)),  # Barely penalize
     }
 
     return RewardManager(reward_functions, signal_subscriptions)
@@ -1529,90 +1531,6 @@ class CurriculumManager:
         }
         return messages[self.current_phase]
 
-
-# -------------------------------------------------------------------------
-# --------------------------- HELPER FUNCTIONS ----------------------------
-# -------------------------------------------------------------------------
-
-def create_tournament_agent(
-    agent_type: str = "simple",
-    load_path: Optional[str] = None
-) -> Agent:
-    """
-    Factory function to create tournament-ready agents
-    
-    Args:
-        agent_type: "simple", "custom", "recurrent", or "standard"
-        load_path: Path to checkpoint to resume training
-    
-    Returns:
-        Configured agent instance
-    """
-    if agent_type == "simple":
-        # Simple standard agent - most stable option
-        return SB3Agent(sb3_class=PPO, file_path=load_path)
-    elif agent_type == "custom":
-        return CustomAgent(
-            sb3_class=PPO, 
-            extractor=MLPExtractor,
-            file_path=load_path
-        )
-    elif agent_type == "recurrent":
-        return RecurrentPPOAgent(file_path=load_path)
-    elif agent_type == "standard":
-        return SB3Agent(sb3_class=PPO, file_path=load_path)
-    else:
-        raise ValueError(f"Unknown agent type: {agent_type}. Choose from: simple, custom, recurrent, standard")
-
-
-def setup_training_configuration(
-    agent: Agent,
-    curriculum_enabled: bool = True,
-    run_name: str = "tournament_run",
-    save_freq: int = 100_000,
-    max_checkpoints: int = 500
-) -> tuple:
-    """
-    Sets up complete training configuration
-    
-    Returns:
-        (reward_manager, selfplay_handler, save_handler, opponent_cfg, curriculum)
-    """
-    # Reward manager
-    reward_manager = gen_reward_manager()
-    
-    # Curriculum manager
-    curriculum = CurriculumManager() if curriculum_enabled else None
-    
-    # Self-play handler - just pass the agent class
-    selfplay_handler = SelfPlayRandom(
-        partial(type(agent))  # Just the agent class, no extra kwargs
-    )
-    
-    # Save handler
-    save_handler = SaveHandler(
-        agent=agent,
-        save_freq=save_freq,
-        max_saved=max_checkpoints,
-        save_path='checkpoints',
-        run_name=run_name,
-        mode=SaveHandlerMode.FORCE
-    )
-    
-    # Opponent configuration
-    if curriculum_enabled:
-        opponent_spec = curriculum.get_opponent_config()
-        opponent_spec['self_play'] = (opponent_spec['self_play'][0], selfplay_handler)
-    else:
-        opponent_spec = {
-            'self_play': (12, selfplay_handler),
-            'constant_agent': (0.5, partial(ConstantAgent)),
-            'based_agent': (1.0, partial(BasedAgent)),
-        }
-    
-    opponent_cfg = OpponentsCfg(opponents=opponent_spec)
-    
-    return reward_manager, selfplay_handler, save_handler, opponent_cfg, curriculum
 
 # --------------------------------------------------------------------------------
 # --------------------------- REWARD TARGET SYSTEM -------------------------------
@@ -1773,10 +1691,7 @@ class RewardMonitor:
         print(f"K/D Ratio:             {stats['kd_ratio']:>8.2f}")
         print("="*70)
         
-        try:
-            performance = RewardTargets.get_performance_level(stats['avg_reward'])
-        except NameError:
-            performance = "N/A"
+        performance = RewardTargets.get_performance_level(stats['avg_reward'])
         
         print(f"Performance Level: {performance}")
         print("="*70 + "\n")
@@ -1785,15 +1700,168 @@ class RewardMonitor:
         self._save_statistics(stats, performance)
 
 
-def create_monitored_reward_manager(monitor: RewardMonitor):
+# --------------------------------------------------------------------------------
+# ------------------------- REWARD MONITORING CALLBACK ---------------------------
+# --------------------------------------------------------------------------------
+
+class RewardMonitorCallback(BaseCallback):
     """
-    Create reward manager with monitoring capabilities
+    Callback to log episode statistics to RewardMonitor during training
     """
-    base_manager = gen_reward_manager()
+    def __init__(self, reward_monitor: RewardMonitor, print_freq: int = 10000, verbose=0):
+        super().__init__(verbose)
+        self.reward_monitor = reward_monitor
+        self.print_freq = print_freq
+        self.last_print = 0
+        
+        # Track current episode stats
+        self.current_episode_reward = 0
+        self.current_episode_length = 0
+        self.current_damage_dealt = 0
+        self.current_damage_taken = 0
+        
+    def _on_step(self) -> bool:
+        """Called at each step of training"""
+        
+        # Accumulate reward and length
+        self.current_episode_reward += self.locals.get("rewards", [0])[0]
+        self.current_episode_length += 1
+        
+        # Try to get damage info from the info dict
+        infos = self.locals.get("infos", [{}])
+        if len(infos) > 0:
+            info = infos[0]
+            self.current_damage_dealt += info.get("damage_dealt_step", 0)
+            self.current_damage_taken += info.get("damage_taken_step", 0)
+        
+        # Check if episode is done
+        dones = self.locals.get("dones", [False])
+        if len(dones) > 0 and dones[0]:
+            # Episode completed - extract final info
+            info = infos[0] if len(infos) > 0 else {}
+            
+            # Determine if won (you may need to adjust these keys based on your environment)
+            won = info.get("winner", False) or info.get("won", False)
+            died = info.get("died", False) or info.get("ko", False)
+            
+            # If damage wasn't tracked per-step, try to get totals from final info
+            damage_dealt = self.current_damage_dealt if self.current_damage_dealt > 0 else info.get("total_damage_dealt", 0)
+            damage_taken = self.current_damage_taken if self.current_damage_taken > 0 else info.get("total_damage_taken", 0)
+            
+            # Log to monitor
+            self.reward_monitor.log_episode(
+                total_reward=self.current_episode_reward,
+                episode_length=self.current_episode_length,
+                won=won,
+                damage_dealt=damage_dealt,
+                damage_taken=damage_taken,
+                died=died
+            )
+            
+            # Reset episode tracking
+            self.current_episode_reward = 0
+            self.current_episode_length = 0
+            self.current_damage_dealt = 0
+            self.current_damage_taken = 0
+        
+        # Print statistics periodically
+        if self.num_timesteps - self.last_print >= self.print_freq:
+            self.reward_monitor.print_statistics()
+            self.last_print = self.num_timesteps
+        
+        return True
+
+
+# -------------------------------------------------------------------------
+# --------------------------- HELPER FUNCTIONS ----------------------------
+# -------------------------------------------------------------------------
+
+def create_tournament_agent(
+    agent_type: str = "simple",
+    load_path: Optional[str] = None
+) -> Agent:
+    """
+    Factory function to create tournament-ready agents
     
-    # You can wrap reward functions to track them if needed
-    # For now, just return the base manager
-    return base_manager
+    Args:
+        agent_type: "simple", "custom", "recurrent", or "standard"
+        load_path: Path to checkpoint to resume training
+    
+    Returns:
+        Configured agent instance
+    """
+    if agent_type == "simple":
+        # Simple standard agent - most stable option
+        return SB3Agent(sb3_class=PPO, file_path=load_path)
+    elif agent_type == "custom":
+        return CustomAgent(
+            sb3_class=PPO, 
+            extractor=MLPExtractor,
+            file_path=load_path
+        )
+    elif agent_type == "recurrent":
+        return RecurrentPPOAgent(file_path=load_path)
+    elif agent_type == "standard":
+        return SB3Agent(sb3_class=PPO, file_path=load_path)
+    else:
+        raise ValueError(f"Unknown agent type: {agent_type}. Choose from: simple, custom, recurrent, standard")
+
+
+def setup_training_configuration(
+    agent: Agent,
+    reward_monitor: Optional[RewardMonitor] = None,
+    curriculum_enabled: bool = True,
+    run_name: str = "tournament_run",
+    save_freq: int = 100_000,
+    max_checkpoints: int = 500,
+    monitor_print_freq: int = 10000
+) -> tuple:
+    """
+    Sets up complete training configuration
+    
+    Returns:
+        (reward_manager, selfplay_handler, save_handler, opponent_cfg, curriculum, callbacks)
+    """
+    # Reward manager
+    reward_manager = gen_reward_manager()
+    
+    # Curriculum manager
+    curriculum = CurriculumManager() if curriculum_enabled else None
+    
+    # Self-play handler - just pass the agent class
+    selfplay_handler = SelfPlayRandom(
+        partial(type(agent))  # Just the agent class, no extra kwargs
+    )
+    
+    # Save handler
+    save_handler = SaveHandler(
+        agent=agent,
+        save_freq=save_freq,
+        max_saved=max_checkpoints,
+        save_path='checkpoints',
+        run_name=run_name,
+        mode=SaveHandlerMode.FORCE
+    )
+    
+    # Opponent configuration
+    if curriculum_enabled:
+        opponent_spec = curriculum.get_opponent_config()
+        opponent_spec['self_play'] = (opponent_spec['self_play'][0], selfplay_handler)
+    else:
+        opponent_spec = {
+            'self_play': (12, selfplay_handler),
+            'constant_agent': (0.5, partial(ConstantAgent)),
+            'based_agent': (1.0, partial(BasedAgent)),
+        }
+    
+    opponent_cfg = OpponentsCfg(opponents=opponent_spec)
+    
+    # Setup callbacks
+    callbacks = []
+    if reward_monitor:
+        callbacks.append(RewardMonitorCallback(reward_monitor, print_freq=monitor_print_freq))
+    
+    return reward_manager, selfplay_handler, save_handler, opponent_cfg, curriculum, callbacks
 
 
 # -------------------------------------------------------------------------
@@ -1841,18 +1909,18 @@ if __name__ == '__main__':
     reward_monitor = RewardMonitor(window_size=100) if ENABLE_MONITORING else None
     if reward_monitor:
         print("✓ Reward monitoring enabled")
+        print(f"✓ Statistics will be saved to: {reward_monitor.log_file}")
     
     print("\n[3/6] Setting up training configuration...")
-    reward_manager, selfplay_handler, save_handler, opponent_cfg, curriculum = setup_training_configuration(
+    reward_manager, selfplay_handler, save_handler, opponent_cfg, curriculum, callbacks = setup_training_configuration(
         agent=my_agent,
+        reward_monitor=reward_monitor,
         curriculum_enabled=CURRICULUM_ENABLED,
         run_name=RUN_NAME,
-        save_freq=SAVE_FREQUENCY,
-        max_checkpoints=MAX_CHECKPOINTS
+                save_freq=SAVE_FREQUENCY,
+        max_checkpoints=MAX_CHECKPOINTS,
+        monitor_print_freq=MONITOR_INTERVAL
     )
-    
-    # Use the new reward manager with attack safety
-    reward_manager = gen_reward_manager()
     
     print("✓ Reward manager configured with attack boundary safety")
     print("✓ Self-play handler initialized")
@@ -1863,6 +1931,9 @@ if __name__ == '__main__':
         print(f"✓ Curriculum learning enabled")
         print(f"  {curriculum.get_phase_message()}")
     
+    if callbacks:
+        print(f"✓ Monitoring callbacks configured")
+    
     # ==================== TRAINING LOOP ====================
     
     print("\n[4/6] Starting training...")
@@ -1870,7 +1941,6 @@ if __name__ == '__main__':
     
     if CURRICULUM_ENABLED:
         timesteps_trained = 0
-        last_monitor_check = 0
         
         while timesteps_trained < TOTAL_TRAINING_TIMESTEPS:
             remaining = TOTAL_TRAINING_TIMESTEPS - timesteps_trained
@@ -1880,22 +1950,32 @@ if __name__ == '__main__':
             print(f"Current Phase: {curriculum.get_phase_message()}")
             
             # Train for this batch
-            train(
-                my_agent,
-                reward_manager,
-                save_handler,
-                opponent_cfg,
-                CameraResolution.LOW,
-                train_timesteps=batch_size,
-                train_logging=TrainLogging.PLOT
-            )
+            try:
+                # Try to pass callbacks if train() supports it
+                train(
+                    my_agent,
+                    reward_manager,
+                    save_handler,
+                    opponent_cfg,
+                    CameraResolution.LOW,
+                    train_timesteps=batch_size,
+                    train_logging=TrainLogging.PLOT,
+                    callbacks=callbacks  # Pass callbacks here
+                )
+            except TypeError:
+                # If train() doesn't support callbacks parameter, try without it
+                print("Note: train() doesn't support callbacks parameter, using alternative approach")
+                train(
+                    my_agent,
+                    reward_manager,
+                    save_handler,
+                    opponent_cfg,
+                    CameraResolution.LOW,
+                    train_timesteps=batch_size,
+                    train_logging=TrainLogging.PLOT
+                )
             
             timesteps_trained += batch_size
-            
-            # Print monitoring statistics
-            if ENABLE_MONITORING and (timesteps_trained - last_monitor_check) >= MONITOR_INTERVAL:
-                reward_monitor.print_statistics()
-                last_monitor_check = timesteps_trained
             
             # Update curriculum
             phase_changed = curriculum.update(batch_size)
@@ -1913,15 +1993,28 @@ if __name__ == '__main__':
     
     else:
         # Standard training without curriculum
-        train(
-            my_agent,
-            reward_manager,
-            save_handler,
-            opponent_cfg,
-            CameraResolution.LOW,
-            train_timesteps=TOTAL_TRAINING_TIMESTEPS,
-            train_logging=TrainLogging.PLOT
-        )
+        try:
+            train(
+                my_agent,
+                reward_manager,
+                save_handler,
+                opponent_cfg,
+                CameraResolution.LOW,
+                train_timesteps=TOTAL_TRAINING_TIMESTEPS,
+                train_logging=TrainLogging.PLOT,
+                callbacks=callbacks
+            )
+        except TypeError:
+            print("Note: train() doesn't support callbacks parameter, using alternative approach")
+            train(
+                my_agent,
+                reward_manager,
+                save_handler,
+                opponent_cfg,
+                CameraResolution.LOW,
+                train_timesteps=TOTAL_TRAINING_TIMESTEPS,
+                train_logging=TrainLogging.PLOT
+            )
     
     # ==================== TRAINING COMPLETE ====================
     
@@ -1961,6 +2054,7 @@ if __name__ == '__main__':
             print(f"  Win Rate: {stats['win_rate']:.1f}%")
             print(f"  K/D Ratio: {stats['kd_ratio']:.2f}")
             print(f"  Performance: {RewardTargets.get_performance_level(stats['avg_reward'])}")
+            print(f"\nDetailed logs saved to: {reward_monitor.log_file}")
     
     print("\n" + "="*70)
     print("Training complete! Your agent is ready for tournament play.")

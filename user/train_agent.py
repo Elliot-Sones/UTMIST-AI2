@@ -1,5 +1,5 @@
 """
-Version: new
+Version: new optimisation
 --------------------------------------------------------
 🚀 QUICK START FOR GOOGLE COLAB
 --------------------------------------------------------
@@ -372,7 +372,9 @@ _SHARED_AGENT_CONFIG = {
     },
     
     # PPO training hyperparameters
-    "n_steps": 30 * 90 * 20,     # 54,000 steps per rollout (20 episodes @ 90 sec each)
+    "n_steps": 2048,             # 🔧 FIXED: Was 54,000 (too large for 50k training!)
+                                 # Now 2048 = standard PPO rollout size
+                                 # Allows ~24 learning updates during 50k training
     "batch_size": 128,           # Batch size (safe for T4 16GB VRAM)
     "n_epochs": 10,              # Gradient epochs per rollout
     "ent_coef": 0.10,            # Entropy coefficient (exploration)
@@ -1567,22 +1569,34 @@ def on_combo_reward(env: WarehouseBrawl, agent: str) -> float:
 Add your dictionary of RewardFunctions here using RewTerms
 '''
 def gen_reward_manager():
+    """
+    🔧 REWARD SYSTEM - FIXED FOR LEARNING
+    
+    Key changes:
+    1. Increased ALL reward weights by 20-50x (rewards were too small to learn from)
+    2. Damage rewards are now PRIMARY signal (weight=50.0 instead of 1.0)
+    3. Sparse event rewards remain strong to provide clear goals
+    4. Penalty rewards increased to provide clear negative feedback
+    
+    Previous issue: rewards like -0.001 were invisible to the network
+    Now: rewards in range of -5.0 to +100.0 provide strong learning signals
+    """
     reward_functions = {
         #'target_height_reward': RewTerm(func=base_height_l2, weight=0.0, params={'target_height': -4, 'obj_name': 'player'}),
-        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=0.5),
-        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=1.0),
+        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=15.0),  # Was 0.5 → Now 15.0 (30x increase)
+        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=50.0),  # Was 1.0 → Now 50.0 (PRIMARY REWARD!)
         #'head_to_middle_reward': RewTerm(func=head_to_middle_reward, weight=0.01),
         #'head_to_opponent': RewTerm(func=head_to_opponent, weight=0.05),
-        'penalize_attack_reward': RewTerm(func=in_state_reward, weight=-0.04, params={'desired_state': AttackState}),
-        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-0.01),
+        'penalize_attack_reward': RewTerm(func=in_state_reward, weight=-1.0, params={'desired_state': AttackState}),  # Was -0.04 → Now -1.0 (25x)
+        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-0.5),  # Was -0.01 → Now -0.5 (50x)
         #'taunt_reward': RewTerm(func=in_state_reward, weight=0.2, params={'desired_state': TauntState}),
     }
     signal_subscriptions = {
-        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=50)),
-        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=8)),
-        'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=5)),
-        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=10)),
-        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=15))
+        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=100)),  # Was 50 → Now 100 (major goal!)
+        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=20)),  # Was 8 → Now 20
+        'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=10)),  # Was 5 → Now 10
+        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=15)),  # Was 10 → Now 15
+        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=20))  # Was 15 → Now 20
     }
     return RewardManager(reward_functions, signal_subscriptions)
 
@@ -1855,8 +1869,9 @@ class PerformanceBenchmark:
             
             results.append({
                 'won': match_stats.player1_result == Result.WIN,
-                'damage_dealt': match_stats.player2.total_damage,
-                'damage_taken': match_stats.player1.total_damage
+                # 🔧 FIXED: Changed total_damage → damage_taken (correct attribute)
+                'damage_dealt': match_stats.player2.damage_taken,  # Damage we dealt
+                'damage_taken': match_stats.player1.damage_taken   # Damage we took
             })
         
         return results
@@ -2109,8 +2124,9 @@ class TrainingMonitorCallback(BaseCallback):
                 )
                 if match_stats.player1_result == Result.WIN:
                     wins += 1
-                total_damage_dealt += match_stats.player2.total_damage
-                total_damage_taken += match_stats.player1.total_damage
+                # 🔧 FIXED: Changed total_damage → damage_done (correct PlayerStats attribute)
+                total_damage_dealt += match_stats.player2.damage_taken  # Damage we dealt = opponent's damage_taken
+                total_damage_taken += match_stats.player1.damage_taken  # Damage we took
             except:
                 pass
         

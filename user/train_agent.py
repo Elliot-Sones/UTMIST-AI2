@@ -1734,7 +1734,7 @@ class RewardBreakdownTracker:
             writer = csv.writer(f)
             for step, breakdown in self.accumulated_data:
                 row = [step]
-        if self.reward_manager.reward_functions:
+                if self.reward_manager.reward_functions:
                     row.extend([f"{breakdown.get(name, 0.0):.6f}" 
                                for name in self.reward_manager.reward_functions.keys()])
                 row.append(f"{breakdown.get('total_reward', 0.0):.6f}")
@@ -2520,7 +2520,7 @@ def main() -> None:
                 print(f"      - Reward appeared stuck at some point")
             if monitor_callback.loss_explosion_warning_issued:
                 print(f"      - Gradient explosion detected")
-            else:
+        else:
             print(f"\n  ✓ No critical issues detected during training")
         
         print("="*70 + "\n")

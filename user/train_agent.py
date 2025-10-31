@@ -1800,8 +1800,14 @@ def on_attack_button_press(env: WarehouseBrawl) -> float:
             player.body.position.y - opponent.body.position.y,
         )
 
-        # Tight range to avoid incentivizing blind spamming
-        max_effective_range = 3.5
+        # Anneal effective range: start generous, tighten over time
+        # Allows early exploration to get signal, then focuses on true range
+        steps = getattr(env, 'steps', 0)
+        warmup_steps = 10_000
+        start_range = 14.0
+        end_range = 3.5
+        frac = min(max(steps / warmup_steps, 0.0), 1.0)
+        max_effective_range = end_range + (start_range - end_range) * (1.0 - frac)
         if distance > max_effective_range:
             return 0.0
 
@@ -2177,7 +2183,8 @@ def gen_reward_manager(training_step: int = 0):
         # 🎯 NEW: Encourage decisive distance closing (annealed over training)
         'closing_distance_reward': RewTerm(
             func=closing_distance_reward,
-            weight=close_weight
+            weight=close_weight,
+            params={'engage_range': 12.0}
         ),
 
         # 💥 NEW: Reward pushing opponent toward blast zones
@@ -3582,7 +3589,7 @@ def main() -> None:
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
     print("📝 MODE: LIVE STEP PRINTS (no training CSV logging)")
-    print("ELLIOT TESTING 1")
+    print("ELLIOT TESTING 3")
     print("=" * 70)
 
     agent_cfg = TRAIN_CONFIG.get("agent", {})

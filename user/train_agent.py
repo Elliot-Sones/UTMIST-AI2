@@ -3062,7 +3062,7 @@ def run_training_loop(
     base_env = env.unwrapped if hasattr(env, 'unwrapped') else env
     
     try:
-        agent.get_env_info(base_env)
+        agent.get_env_info(env)
         base_env.on_training_start()
         
         # Train with callback if provided

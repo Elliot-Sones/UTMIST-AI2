@@ -105,7 +105,6 @@ def setup_colab_environment():
         IN_COLAB = True
         print("=" * 70)
         print("🔍 Google Colab detected!")
-        print("New version of code")
         print("=" * 70)
     except ImportError:
         IN_COLAB = False
@@ -2528,6 +2527,7 @@ def main() -> None:
     # Display device information at start
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
+    print("New version of code")
     
     # Check if monitoring is enabled
     training_cfg = TRAIN_CONFIG.get("training", {})

@@ -344,6 +344,49 @@ def attach_opponent_debug(opponent_cfg: OpponentsCfg) -> OpponentsCfg:
 # Centralised knobs for experiments; update these values to change training behaviour.
 
 
+# ------------ ENTROPY ANNEALING SCHEDULE ------------
+def linear_entropy_schedule(initial_value: float, final_value: float, end_fraction: float = 1.0):
+    """
+    Create entropy coefficient schedule that decays from high to low.
+
+    Philosophy: "Explore widely early, consolidate later"
+    - High entropy (0.5) early: Agent tries diverse strategies
+    - Decay to low (0.05): Agent refines and exploits best strategies
+
+    Args:
+        initial_value: Starting entropy (e.g., 0.5 for aggressive exploration)
+        final_value: Ending entropy (e.g., 0.05 for exploitation)
+        end_fraction: Fraction of training when decay finishes (1.0 = full training)
+
+    Returns:
+        Callable schedule function for RecurrentPPO
+
+    Example:
+        For 50k training with end_fraction=0.8:
+        - Steps 0-40k: Linear decay 0.5 → 0.05
+        - Steps 40k-50k: Fixed at 0.05
+    """
+    def schedule(progress_remaining: float) -> float:
+        """
+        RecurrentPPO calls this with progress_remaining ∈ [1.0, 0.0]
+        progress_remaining=1.0 → training start
+        progress_remaining=0.0 → training end
+        """
+        # Convert to progress_done ∈ [0.0, 1.0]
+        progress_done = 1.0 - progress_remaining
+
+        # Scale by end_fraction
+        if progress_done >= end_fraction:
+            # After decay period, stay at final value
+            return final_value
+
+        # Linear interpolation during decay period
+        decay_progress = progress_done / end_fraction
+        current_value = initial_value + (final_value - initial_value) * decay_progress
+        return current_value
+
+    return schedule
+
 
 # ------------ SHARED HYPERPARAMETERS (DO NOT MODIFY INDIVIDUALLY) ------------
 # These hyperparameters are identical across all configs to ensure scaling laws hold
@@ -385,7 +428,11 @@ _SHARED_AGENT_CONFIG = {
     "batch_size": 64,            # Mini-batch size for gradient updates
                                  # n_steps / batch_size = 512/64 = 8 batches per update
     "n_epochs": 10,              # Gradient epochs per rollout (standard PPO)
-    "ent_coef": 0.25,            # 🔥 BOOSTED: 0.15→0.25 for aggressive exploration (debug run 2)
+    "ent_coef": linear_entropy_schedule(0.5, 0.05, end_fraction=0.8),  # 🔥 EXPLORATION SCHEDULE
+                                 # Starts at 0.5 (high exploration) → decays to 0.05 (exploitation)
+                                 # Decay completes at 80% of training (gives more time to reinforce strategies)
+                                 # Extended from 0.7 → 0.8 to ensure discovered strategies get reinforced
+                                 # Agent needs time to: discover → try multiple times → reinforce
     "learning_rate": 2.5e-4,     # Learning rate (standard PPO, works well with Adam)
     "clip_range": 0.2,           # PPO clip range (prevent large policy changes)
     "gamma": 0.99,               # Discount factor (value long-term rewards)
@@ -393,7 +440,8 @@ _SHARED_AGENT_CONFIG = {
 }
 
 _SHARED_REWARD_CONFIG = {
-    "factory": None,  # Uses gen_reward_manager() by default
+    "factory": "gen_reward_manager_SPARSE",  # 🎯 SPARSE: Let exploration find best strategies!
+    # "factory": None,  # Uses gen_reward_manager() by default (COMPLEX - use for hand-crafted strategies)
 }
 
 # ============ 10M CONFIGURATION (FULL TRAINING ON T4 GPU) ============
@@ -430,35 +478,85 @@ TRAIN_CONFIG_10M: Dict[str, dict] = {
     },
 }
 
-# ============ DEBUG RUN: RAPID VALIDATION (5K STEPS) ============
-# Goal: Verify agent ATTACKS and DEALS DAMAGE (not passive)
-# Success criteria: damage_dealt > 0 after 5k steps
-# Run this FIRST before any curriculum training!
-TRAIN_CONFIG_DEBUG: Dict[str, dict] = {
+# ============ EXPLORATION MODE: SPARSE REWARDS + DIVERSE OPPONENTS ============
+# 🎯 Goal: Let agent discover BEST strategies through exploration, not shaping
+#
+# Philosophy: "Don't tell agent HOW to win, just THAT it should win"
+#
+# Success criteria:
+#   - damage_dealt > 0 after 10k steps (discovered attacking through exploration)
+#   - damage_dealt > 50 after 100k steps (consistent attacking + positioning)
+#   - win rate > 70% vs ConstantAgent AND > 40% vs BasedAgent (generalizes!)
+#   - Strategy diversity score > 0.4 (multiple strategies emerged)
+#
+# Strategy:
+#   - SPARSE rewards: damage ± and wins ONLY (no tactical/strategic shaping)
+#   - Entropy schedule: 0.5 → 0.05 (explore widely early, refine later)
+#   - Progressive opponents: ConstantAgent → BasedAgent → RandomAgent
+#   - Ignition safety: tiny attack hint (weight=1.0) for first 10k steps only
+#
+# Why this works:
+#   1. High exploration discovers diverse attack patterns/timings/positions
+#   2. Opponent diversity forces generalization (not overfitting to one tactic)
+#   3. Sparse rewards avoid biasing toward hand-crafted strategies
+#   4. Agent learns: "damage + win = good" and figures out HOW organically
+#
+# Run this FIRST to let agent find its own strategies!
+TRAIN_CONFIG_EXPLORATION: Dict[str, dict] = {
     "agent": _SHARED_AGENT_CONFIG.copy(),
-    "reward": _SHARED_REWARD_CONFIG.copy(),
+    "reward": _SHARED_REWARD_CONFIG.copy(),  # Uses gen_reward_manager_SPARSE
     "self_play": {
-        "run_name": "debug_5k_attack_test",  # Debug checkpoint folder
-        "save_freq": 2500,                    # Save at 2.5k and 5k
-        "max_saved": 2,                       # Keep only last 2
+        "run_name": "exploration_sparse_rewards",
+        "save_freq": 20_000,                   # Save every 20k steps (5 checkpoints)
+        "max_saved": 5,
         "mode": SaveHandlerMode.FORCE,
 
-        # 100% ConstantAgent - simplest opponent to validate attacking
+        # Progressive opponent mix (increases diversity over time)
+        # ConstantAgent: Stationary, easiest to discover attacks
+        # BasedAgent: Moves + attacks, forces positioning strategy
+        # RandomAgent: Unpredictable, forces robust strategies
         "opponent_mix": {
-            "constant_agent": (1.0, partial(ConstantAgent)),
+            "constant_agent": (0.4, partial(ConstantAgent)),  # 40% easy
+            "based_agent": (0.4, partial(BasedAgent)),        # 40% moderate
+            "random_agent": (0.2, partial(RandomAgent)),      # 20% chaos
         },
         "handler": SelfPlayRandom,
     },
     "training": {
         "resolution": CameraResolution.LOW,
-        "timesteps": 5_000,        # FAST: 5k steps (~2-3 minutes on T4)
+        "timesteps": 100_000,      # 100k steps (~30 minutes on T4) - more time for exploration
         "logging": TrainLogging.PLOT,
 
-        # AGGRESSIVE monitoring for debug
+        # Monitoring optimized for strategy discovery
         "enable_debug": True,
-        "eval_freq": 2_500,        # Evaluate at 2.5k and 5k
+        "eval_freq": 10_000,       # Evaluate every 10k steps (10 times total)
+        "eval_episodes": 5,        # 5 matches per eval (better statistics)
+        "light_log_freq": 1000,    # Log every 1k steps (balanced overhead)
+    },
+}
+
+# Simplified debug config for quick validation (50k steps, ConstantAgent only)
+TRAIN_CONFIG_DEBUG: Dict[str, dict] = {
+    "agent": _SHARED_AGENT_CONFIG.copy(),
+    "reward": _SHARED_REWARD_CONFIG.copy(),
+    "self_play": {
+        "run_name": "debug_quick_validation",
+        "save_freq": 10_000,
+        "max_saved": 5,
+        "mode": SaveHandlerMode.FORCE,
+        "opponent_mix": {
+            "constant_agent": (1.0, partial(ConstantAgent)),  # 100% easy
+        },
+        "handler": SelfPlayRandom,
+    },
+    "training": {
+        "resolution": CameraResolution.LOW,
+        "timesteps": 50_000,       # Quick validation (15 min on T4)
+        "logging": TrainLogging.PLOT,
+        "enable_debug": True,
+        "eval_freq": 5_000,
         "eval_episodes": 3,
-        "light_log_freq": 100,     # Log every 100 steps (high frequency)
+        "light_log_freq": 500,
     },
 }
 
@@ -586,11 +684,14 @@ TRAIN_CONFIG_TEST: Dict[str, dict] = {
 #    TRAIN_CONFIG_10M → Full 10M adversarial self-play
 #    Goal: Create agent that beats ANY opponent strategy
 
-# ⚠️ START HERE: Run DEBUG first to validate all fixes!
-# TRAIN_CONFIG = TRAIN_CONFIG_DEBUG  # ✅ COMPLETED: Debug run 1 & 2 (exploration boosted)
+# ⚠️ START HERE: Run EXPLORATION mode with sparse rewards + diverse opponents!
+TRAIN_CONFIG = TRAIN_CONFIG_EXPLORATION  # 🚨 ACTIVE: Sparse rewards, let exploration find best strategies
 
-# After debug success (damage > 0), uncomment curriculum:
-TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # 🚨 ACTIVE: 50k curriculum (give agent time to learn)
+# For quick validation only (50k, ConstantAgent only):
+# TRAIN_CONFIG = TRAIN_CONFIG_DEBUG
+
+# For hand-crafted strategy shaping (use AFTER exploration proves agent can attack):
+# TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # Dense shaping rewards
 
 # After Stage 1, uncomment Stage 2:
 # TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM_STAGE2  # Stage 2: Beat BasedAgent (60%+ win)
@@ -1931,6 +2032,80 @@ class CurriculumRewardScheduler:
 
 # Global curriculum scheduler (initialized on first call to gen_reward_manager)
 _CURRICULUM_SCHEDULER = None
+
+def gen_reward_manager_SPARSE(training_step: int = 0):
+    """
+    🎯 SPARSE REWARD FUNCTION - MAXIMUM EXPLORATION & STRATEGY DISCOVERY
+
+    Philosophy: "Don't tell the agent HOW to win, just THAT it should win"
+
+    Problem: Dense shaping rewards bias agent toward ONE hand-crafted strategy
+    Solution: Only reward OUTCOMES (damage, wins), let exploration find strategy
+
+    Design Philosophy:
+    - Sparse extrinsic rewards: damage ± and win/loss ONLY
+    - NO tactical shaping (movement, button presses, positioning)
+    - NO strategic shaping (weapons, combos, edge pressure)
+    - High exploration early (see entropy schedule) finds diverse strategies
+    - Opponent diversity (self-play + scripted) forces generalization
+
+    This allows agent to discover:
+    - WHEN to attack (not forced to spam)
+    - WHERE to position (not forced to chase)
+    - WHAT combos work (not hand-crafted)
+    - HOW to counter each opponent (strategy emerges from experience)
+
+    Ignition Safety (first 10k steps only):
+    - Tiny attack button hint (weight=1.0) if exploration hasn't found buttons
+    - Automatically removed after 10k steps
+    - Lets pure exploration take over once buttons discovered
+    """
+
+    # Ignition safety: tiny hint for first 10k steps only
+    use_attack_ignition = training_step < 10_000
+
+    reward_functions = {
+        # PRIMARY REWARD: Damage dealt vs damage taken (core outcome signal)
+        'damage_interaction_reward': RewTerm(
+            func=damage_interaction_reward,
+            weight=300.0,  # High weight - this is what matters
+            params={'mode': RewardMode.SYMMETRIC}  # +damage dealt, -damage taken
+        ),
+    }
+
+    # Optional ignition for first 10k steps (safety fallback)
+    if use_attack_ignition:
+        reward_functions['on_attack_button_press'] = RewTerm(
+            func=on_attack_button_press,
+            weight=1.0  # Tiny hint to discover buttons exist, then remove
+        )
+        print(f"🔥 Ignition mode: attack_button hint active (step {training_step}/10000)")
+
+    signal_subscriptions = {
+        # WIN: Primary sparse outcome signal
+        'on_win_reward': ('win_signal', RewTerm(
+            func=on_win_reward,
+            weight=500.0  # High - winning is ultimate goal
+        )),
+
+        # KNOCKOUT: Secondary outcome signal (taking stocks matters)
+        'on_knockout_reward': ('knockout_signal', RewTerm(
+            func=on_knockout_reward,
+            weight=50.0  # Moderate - stocks lead to wins
+        )),
+
+        # ❌ REMOVED: All tactical shaping (head_to_opponent, closing_distance, edge_pressure)
+        # ❌ REMOVED: All strategic shaping (weapons, combos, key spam penalties)
+        # ❌ REMOVED: All micro-management (button press tracking)
+        #
+        # Agent discovers optimal tactics through:
+        # 1. High exploration (entropy schedule)
+        # 2. Opponent diversity (self-play + scripted)
+        # 3. Sparse outcome rewards (damage + wins)
+    }
+
+    return RewardManager(reward_functions, signal_subscriptions)
+
 
 def gen_reward_manager(training_step: int = 0):
     """

@@ -590,7 +590,7 @@ TRAIN_CONFIG_TEST: Dict[str, dict] = {
 # TRAIN_CONFIG = TRAIN_CONFIG_DEBUG  # ✅ COMPLETED: Debug run 1 & 2 (exploration boosted)
 
 # After debug success (damage > 0), uncomment curriculum:
-TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # 🚨 ACTIVE: 50k curriculum (give agent time to learn)
+TRAIN_CONFIG = TRAIN_CONFIG_DEBUG  # 🚨 ACTIVE: 50k curriculum (give agent time to learn)
 
 # After Stage 1, uncomment Stage 2:
 # TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM_STAGE2  # Stage 2: Beat BasedAgent (60%+ win)
@@ -1182,6 +1182,11 @@ class TransformerStrategyAgent(Agent):
             episode_start=self.episode_starts,
             deterministic=True,
         )
+
+        if isinstance(action, np.ndarray) and action.ndim > 1:
+            action = np.squeeze(action, axis=0)
+        elif isinstance(action, torch.Tensor) and action.ndim > 1:
+            action = action.squeeze(0).cpu().numpy()
         
         self.episode_starts = np.zeros_like(self.episode_starts, dtype=bool)
         return action

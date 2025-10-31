@@ -2561,7 +2561,7 @@ def main() -> None:
     # Display device information at start
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
-    print("ELLIOT TESTING")
+    print("ELLIOT TESTING1")
     
     # Check if monitoring is enabled
     training_cfg = TRAIN_CONFIG.get("training", {})

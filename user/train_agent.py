@@ -85,49 +85,60 @@ def make_env(env_class, rank: int, seed: int = 0, **env_kwargs):
     return _init
 
 
-def create_vectorized_env_from_instance(base_env, n_envs: int, seed: int = 0):
+def create_vectorized_env_from_instance(base_env, n_envs: int, seed: int = 0, force_subprocess: bool = False):
     """
     Create a vectorized environment from an existing environment instance.
     
     :param base_env: existing environment instance
     :param n_envs: number of parallel environments
     :param seed: base seed for RNG
+    :param force_subprocess: if True, always use SubprocVecEnv (for GPU training)
     :return: vectorized environment
     """
-    if n_envs == 1:
-        # Use DummyVecEnv for single environment (no multiprocessing overhead)
+    if n_envs == 1 and not force_subprocess:
+        # Single environment, no vectorization needed
         return DummyVecEnv([lambda: base_env])
-    else:
-        # For multiple environments, try to recreate similar envs
-        try:
-            # Try to get environment creation info
-            if hasattr(base_env, 'spec') and base_env.spec is not None:
-                env_id = base_env.spec.id
-                return SubprocVecEnv([make_env(lambda: gym.make(env_id), i, seed) 
-                                     for i in range(n_envs)])
-            else:
-                # Fallback: use single env with DummyVecEnv
-                print(f"⚠️  Cannot create multiple environments, using single env")
-                return DummyVecEnv([lambda: base_env])
-        except Exception as e:
-            print(f"⚠️  Error creating vectorized env: {e}, using single env")
+    
+    # For multiple environments or forced subprocess
+    try:
+        # Get environment creation info
+        if hasattr(base_env, 'spec') and base_env.spec is not None:
+            env_id = base_env.spec.id
+            print(f"   Creating {n_envs} environments from spec: {env_id}")
+            return SubprocVecEnv([make_env(lambda: gym.make(env_id), i, seed) 
+                                 for i in range(n_envs)])
+        
+        # Try to recreate environment from class
+        elif hasattr(base_env, '__class__'):
+            env_class = base_env.__class__
+            print(f"   Creating {n_envs} environments from class: {env_class.__name__}")
+            
+            # Try to extract constructor kwargs if available
+            env_kwargs = {}
+            if hasattr(base_env, '_init_kwargs'):
+                env_kwargs = base_env._init_kwargs
+            
+            return SubprocVecEnv([make_env(env_class, i, seed, **env_kwargs) 
+                                 for i in range(n_envs)])
+        else:
+            # Fallback: cannot parallelize, use single env
+            print(f"⚠️  Cannot create multiple environments, using DummyVecEnv")
             return DummyVecEnv([lambda: base_env])
+            
+    except Exception as e:
+        print(f"⚠️  Error creating SubprocVecEnv: {e}")
+        print(f"   Falling back to DummyVecEnv")
+        return DummyVecEnv([lambda: base_env])
 
-
-# -------------------------------------------------------------------------
-# ----------------------------- AGENT CLASSES -----------------------------
-# -------------------------------------------------------------------------
 
 class OptimizedSB3Agent(Agent):
     """
-    Optimized SB3 Agent with multi-core CPU and GPU support.
-    Compatible with existing training framework.
+    Optimized SB3 Agent with GPU + multi-core CPU support.
     
-    Key optimizations:
-    - Vectorized environments for parallel rollouts (when possible)
-    - GPU-optimized hyperparameters
-    - Efficient data transfer
-    - Optional mixed precision training
+    Architecture:
+    - GPU: Neural network inference and training
+    - Multiple CPU cores: Parallel environment simulation via SubprocVecEnv
+    - Result: GPU stays busy while CPU cores generate training data
     """
     
     def __init__(
@@ -136,21 +147,10 @@ class OptimizedSB3Agent(Agent):
         file_path: Optional[str] = None,
         device: str = 'auto',
         n_envs: Optional[int] = None,
-        use_vectorized: bool = False,  # Set to True to enable multi-env (may not work with all frameworks)
+        use_vectorized: bool = True,  # Now True by default for GPU
         use_mixed_precision: bool = False,
         **model_kwargs
     ):
-        """
-        Initialize the optimized agent.
-        
-        :param sb3_class: SB3 algorithm class
-        :param file_path: path to load existing model
-        :param device: 'cuda', 'cpu', or 'auto'
-        :param n_envs: number of parallel environments (only used if use_vectorized=True)
-        :param use_vectorized: enable multi-process environments (experimental with some frameworks)
-        :param use_mixed_precision: enable mixed precision training (faster on modern GPUs)
-        :param model_kwargs: additional arguments for the model
-        """
         self.sb3_class = sb3_class
         self.use_mixed_precision = use_mixed_precision
         self.use_vectorized = use_vectorized
@@ -163,128 +163,154 @@ class OptimizedSB3Agent(Agent):
         else:
             self.device = device
             
-        # Auto-detect CPU cores for parallel environments
+        # Auto-detect optimal number of parallel environments
         if n_envs is None:
             cpu_count = mp.cpu_count()
-            # Use CPU count - 1 to leave one core free, min 1, max 16 for stability
-            self.n_envs = min(max(1, cpu_count - 1), 16) if use_vectorized else 1
+            if self.device == 'cuda' and use_vectorized:
+                # GPU: Use more environments to keep GPU fed
+                # Rule of thumb: 4-16 environments depending on CPU cores
+                self.n_envs = min(max(4, cpu_count // 4), 16)
+            elif use_vectorized:
+                # CPU-only: Use most cores but leave some free
+                self.n_envs = min(max(1, cpu_count - 2), 8)
+            else:
+                self.n_envs = 1
         else:
             self.n_envs = n_envs if use_vectorized else 1
             
         print(f"🚀 Agent Initialization:")
         print(f"   Device: {self.device}")
-        if self.device == 'cpu':
-            print(f"   ⚠️  Training on CPU - consider using GPU for 3-5x speedup")
-            print(f"   💡 To use GPU: Ensure CUDA is installed and torch.cuda.is_available() returns True")
-        if use_vectorized:
-            print(f"   Vectorized Envs: {self.n_envs} (experimental)")
-        else:
-            print(f"   Single Environment Mode (stable, recommended)")
-        print(f"   CPU Cores Available: {mp.cpu_count()}")
+        print(f"   CPU Cores: {mp.cpu_count()}")
+        
         if self.device == 'cuda':
             print(f"   GPU: {torch.cuda.get_device_name(0)}")
             print(f"   CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        
+            if use_vectorized:
+                print(f"   🚀 Parallel Environments: {self.n_envs}")
+                print(f"   💡 Architecture: {self.n_envs} CPU workers → GPU training")
+                print(f"   Expected speedup: {self.n_envs}x data collection")
+            else:
+                print(f"   ⚠️  Single environment mode (not recommended for GPU)")
+                print(f"   💡 Set use_vectorized=True for {min(mp.cpu_count()//4, 16)}x speedup")
+        else:
+            print(f"   ⚠️  Training on CPU - GPU recommended for 3-5x speedup")
+            if use_vectorized:
+                print(f"   Parallel Environments: {self.n_envs}")
+            
         super().__init__(file_path)
 
     def _initialize(self) -> None:
-        """
-        Initialize method called by parent Agent class.
-        For framework compatibility, actual initialization happens in get_env_info().
-        """
         if self.file_path is not None:
-            # Load existing model
             self.model = self.sb3_class.load(self.file_path, device=self.device)
             self._model_initialized = True
             print(f"✓ Model loaded from {self.file_path}\n")
-        # For new models, wait for get_env_info() to be called by framework
-
-    def _gdown(self) -> str:
-        return
 
     def get_env_info(self, env):
-        """
-        Called by training framework to set up environment.
-        This is where we actually initialize the model.
-        """
-        # Store the environment
         self.env = env
-        
-        # Call parent's method if it exists
         try:
             super().get_env_info(env)
         except AttributeError:
-            pass  # Parent doesn't have this method
+            pass
         
-        # Initialize model if not already done
         if not self._model_initialized:
             self._initialize_model()
 
     def _initialize_model(self):
-        """
-        Actually initialize the model with the environment.
-        """
         if not hasattr(self, 'env') or self.env is None:
             print("⚠️  No environment set yet, deferring model initialization")
             return
         
         base_env = self.env
         
-        # Decide on vectorization
+        # === VECTORIZATION WITH SUBPROCVECENV ===
         if self.use_vectorized and self.n_envs > 1:
             try:
-                print(f"   Attempting to create {self.n_envs} parallel environments...")
-                vec_env = create_vectorized_env_from_instance(base_env, self.n_envs)
+                print(f"\n   Creating {self.n_envs} parallel environments with SubprocVecEnv...")
                 
-                # Check if we actually got multiple environments
+                # Force SubprocVecEnv for true multiprocessing
+                vec_env = create_vectorized_env_from_instance(
+                    base_env, 
+                    self.n_envs,
+                    force_subprocess=True
+                )
+                
                 if isinstance(vec_env, SubprocVecEnv):
                     actual_n_envs = self.n_envs
-                    print(f"✓ Successfully created {actual_n_envs} parallel environments")
-                    print(f"   🚀 This will speed up data collection by ~{actual_n_envs}x")
+                    print(f"   ✓ SubprocVecEnv created with {actual_n_envs} worker processes")
+                    print(f"   ✓ Each worker runs on separate CPU core")
+                    if self.device == 'cuda':
+                        print(f"   ✓ GPU will process {actual_n_envs}x batches simultaneously")
+                elif isinstance(vec_env, DummyVecEnv):
+                    actual_n_envs = 1
+                    print(f"   ⚠️  Fell back to DummyVecEnv (single-threaded)")
+                    print(f"   This happens if environment cannot be pickled/copied")
                 else:
                     actual_n_envs = 1
-                    print(f"⚠️  Vectorization not available for this environment")
-                    print(f"   Using single environment (still optimized!)")
+                    
             except Exception as e:
-                print(f"⚠️  Could not create parallel environments: {e}")
-                print(f"   Using single environment (still optimized!)")
+                print(f"   ⚠️  SubprocVecEnv creation failed: {e}")
+                print(f"   Falling back to DummyVecEnv")
                 vec_env = DummyVecEnv([lambda: base_env])
                 actual_n_envs = 1
         else:
-            # Standard single environment wrapped for compatibility
+            # Single environment
             vec_env = DummyVecEnv([lambda: base_env])
             actual_n_envs = 1
-            if self.device == 'cpu':
-                print(f"   💡 Tip: For multi-core CPU training, set use_vectorized=True")
+            print(f"   Single environment mode")
         
-        # Update actual number of environments
         self.n_envs = actual_n_envs
         
+        # === OPTIMIZED HYPERPARAMETERS ===
         if self.device == 'cuda':
-            # 64-core CPU + A2000 GPU
-            actual_n_envs = 64  # 1 env per CPU core
-            n_steps = 2048      # stable large rollout buffer
-            batch_size = 2048   # keeps GPU busy but fits 6GB VRAM
-            n_epochs = 8        # good tradeoff for PPO stability
+            # GPU Configuration - Optimized for SubprocVecEnv
+            # With SubprocVecEnv, we can use larger buffers since data collection is parallelized
+            n_steps = 2048  # Steps per environment per update
+            batch_size = 512  # Batch size for GPU
+            n_epochs = 10  # Training epochs per update
             learning_rate = 2.5e-4
-            ent_coef = 0.015
-
-            print(f"✓ Optimized for 64-core CPU + A2000 GPU")
+            ent_coef = 0.02  # Balanced exploration
+            gamma = 0.995
+            gae_lambda = 0.95
+            clip_range = 0.2
+            
+            # Calculate effective buffer size
+            total_buffer = n_steps * actual_n_envs
+            updates_per_buffer = (total_buffer // batch_size) * n_epochs
+            
+            print(f"\n   🎮 GPU Training Configuration:")
+            print(f"   • Environments: {actual_n_envs}")
+            print(f"   • Steps per env: {n_steps}")
+            print(f"   • Total buffer: {total_buffer:,} transitions")
+            print(f"   • Mini-batch size: {batch_size}")
+            print(f"   • Training epochs: {n_epochs}")
+            print(f"   • Updates per rollout: {updates_per_buffer}")
+            print(f"   • Learning rate: {learning_rate}")
+            print(f"   • Entropy coef: {ent_coef}")
+            
+            if actual_n_envs > 1:
+                print(f"\n   ⚡ Performance Estimate:")
+                print(f"   • Data collection: {actual_n_envs}x faster (parallel)")
+                print(f"   • GPU utilization: ~{min(100, (batch_size * n_epochs / 10))}%")
+                print(f"   • Overall speedup: ~{actual_n_envs * 0.7:.1f}x (accounting for overhead)")
+            
         else:
-            # CPU-only fallback
-            actual_n_envs = 16
+            # CPU Configuration
             n_steps = 1024
             batch_size = 256
             n_epochs = 4
             learning_rate = 3e-4
-            ent_coef = 0.05
-            print(f"✓ CPU-only configuration")
-
-        total_buffer_size = n_steps * actual_n_envs
-        print(f"   Steps per update: {n_steps}")
-        print(f"   Batch size: {batch_size}")
-        print(f"   Training epochs: {n_epochs}")
-        print(f"   Buffer size: {total_buffer_size}")
+            ent_coef = 0.02
+            gamma = 0.99
+            gae_lambda = 0.95
+            clip_range = 0.2
+            
+            total_buffer = n_steps * actual_n_envs
+            
+            print(f"\n   💻 CPU Training Configuration:")
+            print(f"   • Environments: {actual_n_envs}")
+            print(f"   • Steps per env: {n_steps}")
+            print(f"   • Total buffer: {total_buffer:,}")
+            print(f"   • Batch size: {batch_size}")
 
         default_config = {
             "policy": "MlpPolicy",
@@ -295,49 +321,48 @@ class OptimizedSB3Agent(Agent):
             "batch_size": batch_size,
             "n_epochs": n_epochs,
             "learning_rate": learning_rate,
+            "gamma": gamma,
+            "gae_lambda": gae_lambda,
+            "clip_range": clip_range,
             "ent_coef": ent_coef,
-            "max_grad_norm": 0.5,
+            "max_grad_norm": 0.15,
             "normalize_advantage": True,
+            "use_sde": False,
+            "sde_sample_freq": -1,
+            "target_kl": None,
         }
-
         
-        # Merge with user-provided kwargs
+        # Merge with user kwargs
         default_config.update(self.model_kwargs)
         
-        # Create model
         try:
+            print(f"\n   Initializing {self.sb3_class.__name__} model...")
             self.model = self.sb3_class(**default_config)
             self._model_initialized = True
             
-            # Enable mixed precision if requested
+            # Mixed precision for modern GPUs
             if self.use_mixed_precision and self.device == 'cuda':
                 try:
                     from torch.cuda.amp import autocast, GradScaler
                     self.model.policy.use_amp = True
-                    print("   Mixed Precision: ENABLED")
+                    print("   ✓ Mixed Precision Training: ENABLED")
                 except ImportError:
-                    print("   Mixed Precision: NOT AVAILABLE (requires PyTorch 1.6+)")
+                    pass
             
-            print(f"✓ Model initialized successfully")
-            
-            # Store vectorized env
+            print(f"\n✅ Model initialized successfully\n")
             self.vec_env = vec_env
             
         except Exception as e:
-            print(f"❌ Error initializing model: {e}")
+            print(f"\n❌ Error initializing model: {e}")
             raise
 
     def predict(self, obs, deterministic: bool = True):
-        """
-        Predict action for single observation.
-        """
         if not hasattr(self, 'model') or self.model is None:
             raise RuntimeError("Model not initialized. Call get_env_info() first.")
         action, _ = self.model.predict(obs, deterministic=deterministic)
         return action
 
     def save(self, file_path: str) -> None:
-        """Save model to file."""
         if not hasattr(self, 'model') or self.model is None:
             raise RuntimeError("Model not initialized. Nothing to save.")
         self.model.save(file_path)
@@ -351,24 +376,21 @@ class OptimizedSB3Agent(Agent):
         callback: Optional[BaseCallback] = None,
         log_interval: int = 10,
         tb_log_name: str = "run",
-        reset_num_timesteps: bool = True,
+        reset_num_timesteps: bool = False,
         progress_bar: bool = False
     ):
-        """
-        Train the agent with optimized settings.
-        Compatible with framework's train() function signature.
-        """
         if not hasattr(self, 'model') or self.model is None:
             raise RuntimeError("Model not initialized. Call get_env_info() first.")
         
-        # Set the environment
         self.model.set_env(env)
-        
-        # Set verbosity
         self.model.verbose = verbose
         
         if verbose > 0:
-            print(f"\n🎓 Training for {total_timesteps:,} timesteps...")
+            current_timesteps = self.model.num_timesteps
+            print(f"\n🎓 Training from {current_timesteps:,} to {current_timesteps + total_timesteps:,} timesteps")
+            if self.n_envs > 1:
+                wall_clock_steps = total_timesteps / self.n_envs
+                print(f"   (≈{wall_clock_steps:,.0f} simulation steps with {self.n_envs} parallel envs)")
         
         self.model.learn(
             total_timesteps=total_timesteps,
@@ -380,45 +402,51 @@ class OptimizedSB3Agent(Agent):
         )
         
         if verbose > 0:
-            print(f"✓ Training batch complete")
+            print(f"✓ Training batch complete - Total: {self.model.num_timesteps:,} timesteps")
+    
+    def close(self):
+        """Clean up vectorized environments"""
+        if hasattr(self, 'vec_env') and self.vec_env is not None:
+            self.vec_env.close()
+            print("✓ Vectorized environments closed")
 
 
-# Backward compatibility: keep original class name
 class SB3Agent(OptimizedSB3Agent):
     """
-    Drop-in replacement for original SB3Agent with optimizations.
-    - GPU: Automatic GPU acceleration with optimized hyperparameters
-    - CPU: Larger batch sizes and better training configuration
-    - Optional: Multi-core parallelism (set ENABLE_MULTICORE=True in environment)
+    Drop-in replacement with intelligent defaults:
+    - GPU + SubprocVecEnv: Automatically enabled for maximum performance
+    - CPU: Uses moderate parallelization to avoid overhead
     """
     def __init__(
         self,
         sb3_class: Optional[Type[BaseAlgorithm]] = PPO,
         file_path: Optional[str] = None,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device: str = 'auto'
     ):
-        # Check for environment variable to enable multi-core
-        enable_multicore = os.environ.get('ENABLE_MULTICORE', 'False').lower() == 'true'
+        # Auto-detect optimal settings
+        detected_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if device == 'auto':
+            device = detected_device
         
-        is_cpu = device == 'cpu' or (device == 'cuda' and not torch.cuda.is_available())
+        # GPU: Always use SubprocVecEnv for performance
+        # CPU: Only if explicitly enabled via environment variable
+        is_gpu = device == 'cuda' and torch.cuda.is_available()
+        enable_multicore_cpu = os.environ.get('ENABLE_MULTICORE', 'False').lower() == 'true'
         
-        # Call parent with optimized defaults
+        use_vectorized = is_gpu or enable_multicore_cpu
+        
         super().__init__(
             sb3_class=sb3_class,
             file_path=file_path,
             device=device,
-            use_vectorized=enable_multicore and is_cpu,  # Only if explicitly enabled
-            n_envs=None if (enable_multicore and is_cpu) else 1,
-            use_mixed_precision=False,  # Conservative default
+            use_vectorized=use_vectorized,
+            n_envs=None,  # Auto-detect
+            use_mixed_precision=False,
         )
         
-        if is_cpu:
-            if enable_multicore and self.n_envs > 1:
-                print(f"   🚀 Multi-core mode: Using {self.n_envs} parallel environments")
-                print(f"   💡 Expected speedup: ~{self.n_envs}x for data collection")
-            else:
-                print(f"   💡 To enable multi-core: set environment variable ENABLE_MULTICORE=true")
-                print(f"   💡 Or use OptimizedSB3Agent(use_vectorized=True) directly")
+        if is_gpu and use_vectorized:
+            print(f"   🚀 GPU + SubprocVecEnv mode: ENABLED")
+            print(f"   This is the optimal configuration for training speed!")
 
 
 # -------------------------------------------------------------------------
@@ -2111,7 +2139,221 @@ def platform_prediction_reward(env: 'WarehouseBrawl') -> float:
             return 0.6
     
     return 0.0
+def fall_prevention_reward(env):
+    """
+    Strongly reward staying on stage, especially when off-stage or low
+    """
+    player = env.players[0]
+    
+    y_pos = player.body.position.y
+    x_pos = player.body.position.x
+    is_airborne = not player.is_on_floor()
+    
+    # Calculate distance to nearest safe area (ground/platforms)
+    min_distance = float('inf')
+    
+    for obj_name, obj in env.objects.items():
+        if isinstance(obj, (Ground, Stage)):
+            obj_y = obj.body.position.y
+            distance = abs(y_pos - obj_y)
+            min_distance = min(min_distance, distance)
+    
+    # Detect if falling (positive y velocity = falling down)
+    y_velocity = player.body.velocity.y
+    is_falling = y_velocity > 2.0 and is_airborne
+    
+    # Strong penalty for falling when far from stage
+    if is_falling and min_distance > 5.0:
+        return -0.8
+    
+    # Reward being close to platforms when airborne
+    if is_airborne and min_distance < 3.0:
+        return 0.3
+    
+    # Strong reward for being safely on stage
+    stage_x_limit = env.stage_width_tiles / 2
+    stage_y_limit = env.stage_height_tiles / 2
+    
+    if not is_airborne and abs(x_pos) < stage_x_limit and abs(y_pos) < stage_y_limit:
+        return 0.2
+    
+    return 0.0
 
+
+def recovery_execution_reward(env):
+    """
+    Reward proper recovery attempts and directional input toward stage
+    """
+    player = env.players[0]
+    
+    is_airborne = not player.is_on_floor()
+    distance_to_stage_center = abs(player.body.position.x)
+    
+    # Check if recovery move was used
+    recovery_move_used = (
+        isinstance(player.state, AttackState) and 
+        hasattr(player.state, 'move_type') and
+        player.state.move_type == MoveType.RECOVERY
+    )
+    
+    # Reward using recovery when off-stage
+    if recovery_move_used and is_airborne and distance_to_stage_center > 3.0:
+        return 1.5
+    
+    # Reward moving toward stage when off-stage
+    x_input = player.input.raw_horizontal
+    x_input_toward_stage = (
+        (player.body.position.x > 0 and x_input < 0) or
+        (player.body.position.x < 0 and x_input > 0)
+    )
+    
+    if is_airborne and distance_to_stage_center > 3.0 and x_input_toward_stage:
+        return 0.5
+    
+    return 0.0
+
+
+def moving_platform_sync_reward(env):
+    """
+    Reward landing on and staying on moving platforms
+    """
+    player = env.players[0]
+    
+    is_on_platform = player.on_platform is not None
+    
+    if not is_on_platform:
+        # Small reward for being near a moving platform
+        for obj_name, obj in env.objects.items():
+            if isinstance(obj, Stage):
+                if hasattr(obj, 'waypoint1') and hasattr(obj, 'waypoint2'):
+                    if obj.waypoint1 != obj.waypoint2:
+                        platform_pos = obj.body.position
+                        player_pos = player.body.position
+                        distance = ((platform_pos.x - player_pos.x)**2 + 
+                                   (platform_pos.y - player_pos.y)**2)**0.5
+                        if distance < 2.0:
+                            return 0.2
+        return 0.0
+    
+    # Check if on a moving platform
+    for obj_name, obj in env.objects.items():
+        if isinstance(obj, Stage) and obj.body == player.on_platform:
+            if hasattr(obj, 'waypoint1') and hasattr(obj, 'waypoint2'):
+                if obj.waypoint1 != obj.waypoint2:
+                    return 0.8
+    
+    return 0.0
+
+
+def platform_drop_through_reward(env):
+    """
+    Reward intentional platform drop-through for mixups/escapes
+    """
+    player = env.players[0]
+    opponent = env.players[1]
+    
+    pressing_down = player.input.key_status["S"].held
+    opponent_above = opponent.body.position.y < player.body.position.y
+    
+    if pressing_down and opponent_above and player.is_on_floor():
+        return 0.6
+    
+    return 0.0
+
+
+def punish_unnecessary_risks(env):
+    """
+    Penalize jumping off stage for no reason or following opponent off-stage when winning
+    """
+    player = env.players[0]
+    opponent = env.players[1]
+    
+    player_y = player.body.position.y
+    player_x = player.body.position.x
+    opponent_y = opponent.body.position.y
+    opponent_x = opponent.body.position.x
+    player_stocks = player.stocks
+    opponent_stocks = opponent.stocks
+    
+    stage_x_limit = env.stage_width_tiles / 2
+    stage_y_limit = env.stage_height_tiles / 2
+    
+    # If player is winning on stocks, heavily penalize going off-stage
+    if player_stocks > opponent_stocks:
+        player_off_stage = abs(player_x) > stage_x_limit * 0.8 or abs(player_y) > stage_y_limit * 0.8
+        opponent_off_stage = abs(opponent_x) > stage_x_limit * 0.8 or abs(opponent_y) > stage_y_limit * 0.8
+        
+        # Both off-stage
+        if player_off_stage and opponent_off_stage:
+            return -1.2
+    
+    # Penalize being off-stage when opponent is safely on stage
+    player_off_stage = abs(player_x) > stage_x_limit * 0.6 or abs(player_y) > stage_y_limit * 0.6
+    opponent_safe = abs(opponent_x) < stage_x_limit * 0.3 and abs(opponent_y) < stage_y_limit * 0.3
+    
+    if player_off_stage and opponent_safe:
+        return -0.5
+    
+    return 0.0
+
+
+def successful_recovery_reward(env):
+    """
+    Reward returning to stage after being off-stage
+    """
+    player = env.players[0]
+    
+    stage_x_limit = env.stage_width_tiles / 2
+    stage_y_limit = env.stage_height_tiles / 2
+    
+    # Check if currently safe on stage
+    is_safe = player.is_on_floor() and abs(player.body.position.x) < stage_x_limit * 0.8
+    
+    # Check if was recently off-stage (based on low y velocity after being airborne)
+    was_recovering = (
+        is_safe and 
+        abs(player.body.velocity.y) < 1.0 and  # Just landed
+        hasattr(player.state, 'jumps_left') and 
+        player.state.jumps_left <= 1  # Used jumps (was airborne)
+    )
+    
+    if was_recovering:
+        return 1.0
+    
+    return 0.0
+
+
+def self_destruct_penalty_reward(env):
+    """
+    Penalize being very far off stage and falling
+    """
+    player = env.players[0]
+    opponent = env.players[1]
+    
+    stage_x_limit = env.stage_width_tiles / 2
+    stage_y_limit = env.stage_height_tiles / 2
+    
+    # Very far off stage
+    very_off_stage = (
+        abs(player.body.position.x) > stage_x_limit * 1.2 or 
+        abs(player.body.position.y) > stage_y_limit * 1.2
+    )
+    
+    # Falling fast
+    falling_fast = player.body.velocity.y > 5.0
+    
+    # Far from opponent (not in combat)
+    distance_to_opponent = ((player.body.position.x - opponent.body.position.x)**2 + 
+                            (player.body.position.y - opponent.body.position.y)**2)**0.5
+    far_from_opponent = distance_to_opponent > 8.0
+    
+    # Not recently hit
+    not_stunned = not isinstance(player.state, StunState)
+    
+    if very_off_stage and falling_fast and far_from_opponent and not_stunned:
+        return -1.0
+    
+    return 0.0
 # -------------------------------------------------------------------------
 # ----------------------------- REWARD MANAGER -----------------------------
 # -------------------------------------------------------------------------
@@ -2188,81 +2430,98 @@ def platform_prediction_reward(env: 'WarehouseBrawl') -> float:
 
 def gen_reward_manager():
     """
-    INTELLIGENT AGGRESSION + PLATFORM MASTERY configuration
-    Reward calculated combat, platform control, and smart positioning
+    BALANCED AGGRESSION + PLATFORM MASTERY + SURVIVAL
+    Fixes reward scaling and adds proper fall penalties
     """
     reward_functions = {
-        # === CORE COMBAT (HIGH BUT BALANCED) ===
+        # === CORE COMBAT (Balanced) ===
         'damage_interaction_reward': RewTerm(
             func=lambda env: damage_interaction_reward(env, mode=RewardMode.SYMMETRIC),
-            weight=3.5
+            weight=3.0  # Reduced from 3.5 for better balance
         ),
-        'combo_extension_reward': RewTerm(func=combo_extension_reward, weight=1.8),
-        'hit_confirm_reward': RewTerm(func=hit_confirm_reward, weight=1.5),
-        'attack_commitment_reward': RewTerm(func=attack_commitment_reward, weight=1.0),
+        'combo_extension_reward': RewTerm(func=combo_extension_reward, weight=1.5),
+        'hit_confirm_reward': RewTerm(func=hit_confirm_reward, weight=1.2),
+        'attack_commitment_reward': RewTerm(func=attack_commitment_reward, weight=0.8),
         
         # === SMART AGGRESSION ===
-        'situational_aggression_reward': RewTerm(func=situational_aggression_reward, weight=2.0),
-        'neutral_win_reward': RewTerm(func=neutral_win_reward, weight=1.5),
-        'first_hit_reward': RewTerm(func=first_hit_reward, weight=1.2),
+        'situational_aggression_reward': RewTerm(func=situational_aggression_reward, weight=1.8),
+        'neutral_win_reward': RewTerm(func=neutral_win_reward, weight=1.3),
+        'first_hit_reward': RewTerm(func=first_hit_reward, weight=1.0),
         
-        # === GROUNDED PLAY ===
-        'grounded_combat_reward': RewTerm(func=grounded_combat_reward, weight=1.5),
-        'aerial_attack_penalty': RewTerm(func=aerial_attack_penalty, weight=1.0),
-        'excessive_aerial_penalty': RewTerm(func=excessive_aerial_penalty, weight=1.2),
+        # === GROUNDED PLAY (Softened) ===
+        'grounded_combat_reward': RewTerm(func=grounded_combat_reward, weight=1.0),  # Reduced
+        'aerial_attack_penalty': RewTerm(func=aerial_attack_penalty, weight=0.5),  # Much softer
+        'excessive_aerial_penalty': RewTerm(func=excessive_aerial_penalty, weight=0.6),  # Reduced
         
         # === ATTACK SAFETY ===
-        'safe_attack_reward': RewTerm(func=safe_attack_reward, weight=1.5),
-        'momentum_awareness_reward': RewTerm(func=momentum_awareness_reward, weight=0.8),
-        'recovery_priority_reward': RewTerm(func=recovery_priority_reward, weight=1.2),
+        'safe_attack_reward': RewTerm(func=safe_attack_reward, weight=1.3),
+        'momentum_awareness_reward': RewTerm(func=momentum_awareness_reward, weight=0.7),
+        'recovery_priority_reward': RewTerm(func=recovery_priority_reward, weight=1.5),  # Increased
         
-        # === SURVIVAL (CRITICAL!) ===
-        'survive_reward': RewTerm(func=survive_reward, weight=2.0),
-        'self_preservation_reward': RewTerm(func=self_preservation_reward, weight=2.0),
-        'ledge_safety_reward': RewTerm(func=ledge_safety_reward, weight=1.5),
-        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=1.2),
-        'stock_awareness_reward': RewTerm(func=stock_awareness_reward, weight=1.2),
+        # === SURVIVAL (CRITICAL - REBALANCED) ===
+        'survive_reward': RewTerm(func=survive_reward, weight=1.5),  # Reduced from 2.0
+        'self_preservation_reward': RewTerm(func=self_preservation_reward, weight=1.8),
+        'ledge_safety_reward': RewTerm(func=ledge_safety_reward, weight=1.8),  # Increased
+        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=1.5),
+        'stock_awareness_reward': RewTerm(func=stock_awareness_reward, weight=1.0),
         
-        # === PLATFORM CONTROL (NEW CATEGORY!) ===
-        'platform_positioning_reward': RewTerm(func=platform_positioning_reward, weight=1.8),  # High priority
-        'platform_timing_reward': RewTerm(func=platform_timing_reward, weight=1.3),  # Momentum attacks
-        'platform_contest_reward': RewTerm(func=platform_contest_reward, weight=1.0),  # Fight for control
-        'platform_escape_reward': RewTerm(func=platform_escape_reward, weight=1.2),  # Defensive use
-        'platform_approach_reward': RewTerm(func=platform_approach_reward, weight=0.9),  # Contest opponent's control
-        'platform_prediction_reward': RewTerm(func=platform_prediction_reward, weight=0.8),  # Advanced play
+        # NEW: Critical fall prevention
+        'fall_prevention_reward': RewTerm(func=fall_prevention_reward, weight=2.5),  # NEW!
+        'recovery_execution_reward': RewTerm(func=recovery_execution_reward, weight=2.0),  # NEW!
+        
+        # === PLATFORM CONTROL (ACTIVE, NOT PASSIVE) ===
+        'platform_positioning_reward': RewTerm(func=platform_positioning_reward, weight=2.0),
+        'platform_timing_reward': RewTerm(func=platform_timing_reward, weight=1.6),
+        'platform_contest_reward': RewTerm(func=platform_contest_reward, weight=1.2),
+        'platform_escape_reward': RewTerm(func=platform_escape_reward, weight=1.4),
+        'platform_approach_reward': RewTerm(func=platform_approach_reward, weight=1.0),
+        'platform_prediction_reward': RewTerm(func=platform_prediction_reward, weight=0.9),
+
+        # NEW: Teach platform interaction
+        'moving_platform_sync_reward': RewTerm(func=moving_platform_sync_reward, weight=2.2),  # ↑ +0.7
+        'platform_drop_through_reward': RewTerm(func=platform_drop_through_reward, weight=1.2),  # ↑ +0.4
+
         
         # === POSITIONING ===
         'platform_awareness_reward': RewTerm(func=platform_awareness_reward, weight=1.2),
-        'optimal_distance_reward': RewTerm(func=optimal_distance_reward, weight=1.0),
-        'stage_control_reward': RewTerm(func=stage_control_reward, weight=1.3),  # Slightly increased
-        'edge_guard_reward': RewTerm(func=edge_guard_reward, weight=0.6),
-        'opportunistic_positioning_reward': RewTerm(func=opportunistic_positioning_reward, weight=1.0),
+        'optimal_distance_reward': RewTerm(func=optimal_distance_reward, weight=0.9),
+        'stage_control_reward': RewTerm(func=stage_control_reward, weight=1.2),
+        'edge_guard_reward': RewTerm(func=edge_guard_reward, weight=0.7),  # Increased slightly
+        'opportunistic_positioning_reward': RewTerm(func=opportunistic_positioning_reward, weight=0.9),
         
         # === AWARENESS ===
-        'respect_knockout_reward': RewTerm(func=respect_knockout_reward, weight=2.0),
-        'defensive_spacing_reward': RewTerm(func=defensive_spacing_reward, weight=0.8),
+        'respect_knockout_reward': RewTerm(func=respect_knockout_reward, weight=1.8),
+        'defensive_spacing_reward': RewTerm(func=defensive_spacing_reward, weight=0.7),
         
         # === MOBILITY & WEAPON ===
-        'dash_usage_reward': RewTerm(func=dash_usage_reward, weight=0.8),
-        'smart_movement_reward': RewTerm(func=smart_movement_reward, weight=1.2),
-        'weapon_management_reward': RewTerm(func=weapon_management_reward, weight=1.0),
+        'dash_usage_reward': RewTerm(func=dash_usage_reward, weight=0.7),
+        'smart_movement_reward': RewTerm(func=smart_movement_reward, weight=1.0),
+        'weapon_management_reward': RewTerm(func=weapon_management_reward, weight=0.9),
         
         # === ANTI-SPAM & BAD HABITS ===
-        'penalize_attack_spam': RewTerm(func=penalize_attack_spam, weight=0.8),
-        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=0.5),
-        'punish_predictable_patterns': RewTerm(func=punish_predictable_patterns, weight=0.8),
+        'penalize_attack_spam': RewTerm(func=penalize_attack_spam, weight=0.7),
+        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=0.4),
+        'punish_predictable_patterns': RewTerm(func=punish_predictable_patterns, weight=0.7),
+        
+        # NEW: Fix suicidal behavior
+        'punish_unnecessary_risks': RewTerm(func=punish_unnecessary_risks, weight=1.0),  # NEW!
+
+        'successful_recovery': RewTerm(func=successful_recovery_reward, weight=40.0),
+        'self_destruct_penalty': RewTerm(func=self_destruct_penalty_reward, weight=150.0),
     }
 
     signal_subscriptions = {
         'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=500)),
-        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=-100)),
-        'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=25)),  # Increased for combo importance
-        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=12)),
-        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=-15)),
+        
+        # CRITICAL FIX: Rebalanced knockout penalty
+        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=-50)),  # Was -100
+        
+        'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=20)),
+        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=10)),
+        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=-10)),
     }
 
     return RewardManager(reward_functions, signal_subscriptions)
-
 
 
 # -------------------------------------------------------------------------
@@ -2685,8 +2944,8 @@ if __name__ == '__main__':
     TRAINING_BATCH_SIZE = 100_000
     CURRICULUM_ENABLED = True
     RESUME_FROM = "rl-model.zip"
-    # RESUME_FROM = None
-    RUN_NAME = "tournament_safe_attack_v1"
+    RESUME_FROM = None
+    RUN_NAME = "tournament_safe_attack_v3"
     SAVE_FREQUENCY = 100_000
     MAX_CHECKPOINTS = 500
     

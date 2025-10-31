@@ -1652,7 +1652,8 @@ def gen_reward_manager():
         # ENGAGEMENT: Encourage moving toward opponent (overcome passivity)
         'head_to_opponent': RewTerm(
             func=head_to_opponent, 
-            weight=0.1  # Small positive for approaching (builds momentum)
+            weight=5.0  # 🔥 50x increase: FORCE agent to engage! (was 0.1)
+                         # Agent MUST get close to opponent to learn that attacking works
         ),
         
         # CLEANUP: Discourage button mashing (but keep light)

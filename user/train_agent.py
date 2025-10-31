@@ -1575,34 +1575,46 @@ def damage_interaction_reward(
     mode: RewardMode = RewardMode.SYMMETRIC,
 ) -> float:
     """
-    Computes the reward based on damage interactions between players.
+    Computes per-step damage reward using robust deltas.
+
+    Uses totals and computes deltas since the last call to avoid frame-order
+    sensitivity where instantaneous frame values could be missed.
 
     Modes:
-    - ASYMMETRIC_OFFENSIVE (0): Reward is based only on damage dealt to the opponent
-    - SYMMETRIC (1): Reward is based on both dealing damage to the opponent and avoiding damage
-    - ASYMMETRIC_DEFENSIVE (2): Reward is based only on avoiding damage
-
-    Args:
-        env (WarehouseBrawl): The game environment
-        mode (DamageRewardMode): Reward mode, one of DamageRewardMode
-
-    Returns:
-        float: The computed reward.
+    - ASYMMETRIC_OFFENSIVE: +damage dealt to opponent only
+    - SYMMETRIC: +damage dealt, -damage taken
+    - ASYMMETRIC_DEFENSIVE: -damage taken only
     """
-    # Getting player and opponent from the enviornment
     player: Player = env.objects["player"]
     opponent: Player = env.objects["opponent"]
 
-    # Reward dependent on the mode
-    damage_taken = player.damage_taken_this_frame
-    damage_dealt = opponent.damage_taken_this_frame
+    # Initialize running totals on first call (or after reset)
+    if not hasattr(env, "_last_damage_totals") or env.steps <= 1:
+        env._last_damage_totals = {
+            "player": player.damage_taken_total,
+            "opponent": opponent.damage_taken_total,
+        }
+        return 0.0
+
+    prev_p = env._last_damage_totals.get("player", 0.0)
+    prev_o = env._last_damage_totals.get("opponent", 0.0)
+    cur_p = player.damage_taken_total
+    cur_o = opponent.damage_taken_total
+
+    # Robust non-negative deltas for this step
+    delta_taken = max(0.0, cur_p - prev_p)
+    delta_dealt = max(0.0, cur_o - prev_o)
+
+    # Update stored totals
+    env._last_damage_totals["player"] = cur_p
+    env._last_damage_totals["opponent"] = cur_o
 
     if mode == RewardMode.ASYMMETRIC_OFFENSIVE:
-        reward = damage_dealt
+        reward = delta_dealt
     elif mode == RewardMode.SYMMETRIC:
-        reward = damage_dealt - damage_taken
+        reward = delta_dealt - delta_taken
     elif mode == RewardMode.ASYMMETRIC_DEFENSIVE:
-        reward = -damage_taken
+        reward = -delta_taken
     else:
         raise ValueError(f"Invalid mode: {mode}")
 
@@ -1778,22 +1790,28 @@ def on_attack_button_press(env: WarehouseBrawl) -> float:
     light_attack = action[7] > 0.5 if len(action) > 7 else False
     heavy_attack = action[8] > 0.5 if len(action) > 8 else False
     
-    # Reward any attack button press
+    # Reward attack button press only when within effective range
     if light_attack or heavy_attack:
         opponent: Player = env.objects["opponent"]
 
-        # Distance-based shaping to discourage blind spamming
+        # Compute distance to opponent
         distance = math.hypot(
             player.body.position.x - opponent.body.position.x,
             player.body.position.y - opponent.body.position.y,
         )
-        max_effective_range = 8.0
-        proximity_scale = max(0.0, 1.0 - min(distance, max_effective_range) / max_effective_range)
 
-        vertical_alignment = 1.0 - min(abs(player.body.position.y - opponent.body.position.y), 5.0) / 5.0
+        # Tight range to avoid incentivizing blind spamming
+        max_effective_range = 3.5
+        if distance > max_effective_range:
+            return 0.0
+
+        # Within range: shape on proximity and vertical alignment
+        proximity_scale = max(0.0, 1.0 - min(distance, max_effective_range) / max_effective_range)
+        vertical_alignment = 1.0 - min(abs(player.body.position.y - opponent.body.position.y), 3.0) / 3.0
         vertical_alignment = max(0.0, vertical_alignment)
 
-        reward = 0.15 + 0.65 * proximity_scale + 0.2 * vertical_alignment
+        # Lower base reward; stronger emphasis on proximity
+        reward = 0.05 + 0.75 * proximity_scale + 0.2 * vertical_alignment
 
         # Penalize whiffed attacks slightly so hits become more valuable
         if opponent.damage_taken_this_frame == 0:
@@ -2440,6 +2458,26 @@ class LiveRewardLossPrinter(BaseCallback):
             raw_env = self._get_raw_env()
             if raw_env is not None:
                 self._print_breakdown(raw_env)
+                # Damage per-frame diagnostics
+                try:
+                    p = raw_env.objects.get("player")
+                    o = raw_env.objects.get("opponent")
+                    if p is not None and o is not None:
+                        print(
+                            f"  damage_frame: player={getattr(p, 'damage_taken_this_frame', 0.0):.6f} "
+                            f"opponent={getattr(o, 'damage_taken_this_frame', 0.0):.6f}"
+                        )
+                        # Context when attacking
+                        a = getattr(p, 'cur_action', None)
+                        if isinstance(a, (list, np.ndarray)) and len(a) > 8 and (a[7] > 0.5 or a[8] > 0.5):
+                            try:
+                                dist = math.hypot(p.body.position.x - o.body.position.x, p.body.position.y - o.body.position.y)
+                                facing = getattr(p.facing, 'name', str(p.facing))
+                                print(f"  press_ctx: dist={dist:.2f} facing={facing}")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
         return True
 
 
@@ -3680,99 +3718,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
-
-"""
-================================================================================
-T4 GPU OPTIMIZATION & SCALING LAW TRAINING SUMMARY
-================================================================================
-
-This training script has been optimized for NVIDIA T4 GPU (16GB VRAM) with 
-proper scaling laws for efficient hyperparameter tuning.
-
-1. AUTOMATIC DEVICE DETECTION
-   - Automatically detects CUDA (NVIDIA), MPS (Apple Silicon), or CPU
-   - Priority: CUDA > MPS > CPU
-   - Device info displayed at training start (VRAM, CUDA version)
-
-2. T4 GPU OPTIMIZATIONS
-   - Transformer encoder runs entirely on CUDA
-   - RecurrentPPO (LSTM policy) accelerated on GPU
-   - cuDNN autotuner enabled for optimal performance
-   - Batch size: 128 (safe for 16GB VRAM, can be increased to 256 if needed)
-   - All tensor operations use GPU (no CPU bottlenecks)
-
-3. TRANSFORMER + LSTM ARCHITECTURE
-   - TransformerStrategyEncoder: 6 layers, 8 heads, 256-dim latent space
-   - Tracks opponent behavior sequences (65 frames = 2.17 seconds)
-   - Discovers patterns via self-attention (like AlphaGo)
-   - LSTM policy (512 hidden) conditions on transformer latent
-   - Total params: ~2.5M (transformer) + ~1.5M (policy) = ~4M params
-
-4. SELF-ADVERSARIAL TRAINING LOOP
-   - Self-play: Trains vs snapshots of past versions (80%)
-   - Scripted opponents: BasedAgent (15%), ConstantAgent (5%)
-   - Curriculum learning via opponent mix
-   - Checkpoints saved every 100k steps (10M) or 5k steps (50k test)
-
-5. SCALING LAW CONFIGURATION
-   - Test Config: 50k timesteps (1:200 ratio, ~15 min on T4)
-   - Full Config: 10M timesteps (200x scaling, ~10-12 hours on T4)
-   - IDENTICAL hyperparameters (learning rate, batch size, architecture)
-   - If test config works well, 10M will behave identically (just longer)
-
-6. MEMORY MANAGEMENT (T4 16GB VRAM)
-   - Transformer encoder: ~500MB VRAM
-   - LSTM policy: ~300MB VRAM
-   - PPO rollout buffer (54k steps): ~2-3GB VRAM
-   - Gradient computation: ~1-2GB VRAM
-   - Total usage: ~4-6GB VRAM (safe margin for 16GB)
-
-7. REWARD SHAPING
-   - Damage interaction: +1.0 weight (damage dealt - damage taken)
-   - Danger zone penalty: -0.5 weight (discourages being knocked off)
-   - Attack spam penalty: -0.04 weight (encourages strategic attacks)
-   - Signal rewards: Win (+50), Knockout (+8), Combo (+5), Weapon pickup (+10)
-
-ESTIMATED TRAINING TIMES (T4 GPU):
-- 50k test run: ~15 minutes (validate configuration)
-- 10M full training: ~10-12 hours (complete training)
-- Per 1M timesteps: ~60-75 minutes
-
-EXPECTED PERFORMANCE IMPROVEMENTS (vs CPU):
-- T4 GPU: ~8-10x speedup for transformer operations
-- T4 GPU: ~5-7x speedup for LSTM operations
-- Overall speedup: ~6-8x vs CPU-only training
-
-MEMORY OPTIMIZATION TIPS:
-- If OOM error: Reduce batch_size from 128 to 64
-- If OOM error: Reduce n_steps from 54,000 to 27,000
-- If OOM error: Reduce transformer num_layers from 6 to 4
-- Monitor VRAM: nvidia-smi in terminal during training
-
-SCALING LAW WORKFLOW:
-1. Run 50k test config first (TRAIN_CONFIG_TEST) - 15 minutes
-2. Check reward curves, win rate, behavior metrics
-3. Tweak hyperparameters if needed (reward weights, learning rate, etc.)
-4. Re-run 50k test to validate changes
-5. Once satisfied, switch to TRAIN_CONFIG_10M for full training
-6. 10M training will exhibit same behavior, just scaled up
-
-TO SWITCH CONFIGURATIONS:
-  Line 373: Change TRAIN_CONFIG = TRAIN_CONFIG_TEST
-         to TRAIN_CONFIG = TRAIN_CONFIG_10M
-
-TROUBLESHOOTING:
-- "CUDA out of memory": Reduce batch_size or n_steps (see above)
-- Training slow: Check nvidia-smi for GPU utilization (should be ~90%)
-- Reward stuck: Check reward_breakdown.csv in test mode
-- Agent not improving: Check behavior_metrics.csv for damage ratio trends
-
-MONITORING TRAINING:
-- Watch checkpoints/test_50k_t4/monitor.csv for episode rewards
-- Check reward_breakdown.csv for per-term reward contributions
-- Check behavior_metrics.csv for damage dealt/taken ratios
-- Check evaluation_results.csv for win rates over time
-
-================================================================================
-"""

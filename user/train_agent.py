@@ -1,5 +1,6 @@
 """
-Version: claude test 3--------------------------------
+Version: new optimisation
+--------------------------------------------------------
 🚀 QUICK START FOR GOOGLE COLAB
 --------------------------------------------------------
 
@@ -104,6 +105,7 @@ def setup_colab_environment():
         IN_COLAB = True
         print("=" * 70)
         print("🔍 Google Colab detected!")
+        print("New version of code")
         print("=" * 70)
     except ImportError:
         IN_COLAB = False
@@ -115,6 +117,7 @@ def setup_colab_environment():
         
         if use_quick_mode and not force_drive:
             # Quick experiment mode - use local storage
+
             print("⚡ QUICK EXPERIMENT MODE")
             print("  ℹ️  Using local storage (fast, no Drive needed)")
             print("  ℹ️  Perfect for experiments < 2 hours")
@@ -952,8 +955,8 @@ class TransformerStrategyAgent(Agent):
                 "agent_init",
                 (
                     "Creating new RecurrentPPO "
-                    f"(n_steps={self.default_n_steps or 30*90*20}, "
-                    f"batch_size={self.default_batch_size or 32}, "
+                    f"(n_steps={self.default_n_steps or 2048}, "
+                    f"batch_size={self.default_batch_size or 128}, "
                     f"ent_coef={self.default_ent_coef or 0.10})"
                 ),
             )
@@ -1610,7 +1613,7 @@ def gen_reward_manager():
         # SAFETY: Discourage getting knocked off (but don't over-penalize)
         'danger_zone_reward': RewTerm(
             func=danger_zone_reward, 
-            weight=-2.0,  # Reduced from -15.0 (was too punishing)
+            weight=2.0,  # ✅ FIXED: Positive weight (function returns negative value)
             params={'zone_penalty': 1, 'zone_height': 4.2}
         ),
         

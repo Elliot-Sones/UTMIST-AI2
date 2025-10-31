@@ -220,6 +220,11 @@ DEBUG_FLAGS: Dict[str, bool] = {
     "training_loop": True,
 }
 
+# Minimal switch to disable the transformer encoder without refactoring.
+# Set to True to train a plain recurrent baseline (LSTM policy) using only
+# the base observations; the encoder and attention fusion are bypassed.
+DISABLE_STRATEGY_ENCODER: bool = True
+
 
 def debug_log(flag: str, message: str) -> None:
     if DEBUG_FLAGS.get(flag, False):
@@ -656,7 +661,10 @@ TRAIN_CONFIG_TEST: Dict[str, dict] = {
 #    Goal: Create agent that beats ANY opponent strategy
 
 # ⚠️ START HERE: Curriculum Stage 1 to reliably learn attacking vs ConstantAgent
-TRAIN_CONFIG = TRAIN_CONFIG_TEST # Stage 1: Beat ConstantAgent (dense shaping enabled)
+# Default to curriculum stage 1 (dense shaping vs ConstantAgent).
+# This avoids clearing an existing self-play test run directory and aligns with the
+# recommended first step before self-play.
+TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # Stage 1: Beat ConstantAgent (dense shaping enabled)
 
 # For quick validation only (50k, ConstantAgent only):
 # TRAIN_CONFIG = TRAIN_CONFIG_DEBUG
@@ -949,6 +957,7 @@ class TransformerConditionedExtractor(BaseFeaturesExtractor):
         num_heads: int = 8,
         num_layers: int = 6,
         device: Optional[torch.device] = None,
+        use_strategy_encoder: bool = True,
     ) -> None:
         super().__init__(observation_space, features_dim)
 
@@ -958,6 +967,16 @@ class TransformerConditionedExtractor(BaseFeaturesExtractor):
         self.latent_dim = latent_dim
         self.device = device if device is not None else TORCH_DEVICE
         self.history_dim = opponent_obs_dim * sequence_length
+        # Final switch: allow global override to disable encoder cleanly
+        self.use_strategy_encoder = bool(use_strategy_encoder and not DISABLE_STRATEGY_ENCODER)
+        # Explicit runtime notice for clarity during training runs
+        debug_log(
+            "config",
+            (
+                f"Features extractor: use_strategy_encoder={self.use_strategy_encoder} "
+                f"(global DISABLE_STRATEGY_ENCODER={DISABLE_STRATEGY_ENCODER})"
+            ),
+        )
 
         self.obs_encoder = nn.Sequential(
             nn.Linear(base_obs_dim, 512),
@@ -968,6 +987,8 @@ class TransformerConditionedExtractor(BaseFeaturesExtractor):
             nn.ReLU(),
         )
 
+        # Always construct modules to keep checkpoint compatibility.
+        # Forward() will bypass them when encoder is disabled.
         self.strategy_encoder = TransformerStrategyEncoder(
             opponent_obs_dim=opponent_obs_dim,
             latent_dim=latent_dim,
@@ -1006,7 +1027,14 @@ class TransformerConditionedExtractor(BaseFeaturesExtractor):
             )
         history = history_flat.view(batch_size, self.sequence_length, self.opponent_obs_dim)
 
-        strategy_latent, attention_info = self.strategy_encoder(
+        # If encoder is disabled, return plain MLP features (recurrent baseline)
+        if not self.use_strategy_encoder:
+            self.last_strategy_latent = None
+            self.last_attention = None
+            return self.obs_encoder(base_obs)
+
+        # Encoder path
+        strategy_latent, attention_info = self.strategy_encoder(  # type: ignore[operator]
             history, return_attention=True
         )
         self.last_strategy_latent = strategy_latent.detach()
@@ -1015,7 +1043,7 @@ class TransformerConditionedExtractor(BaseFeaturesExtractor):
         obs_features = self.obs_encoder(base_obs)
         obs_features_unsqueezed = obs_features.unsqueeze(1)
         strategy_unsqueezed = strategy_latent.unsqueeze(1)
-        attended_obs, _ = self.cross_attention(
+        attended_obs, _ = self.cross_attention(  # type: ignore[operator]
             query=obs_features_unsqueezed,
             key=strategy_unsqueezed,
             value=strategy_unsqueezed,
@@ -1023,7 +1051,7 @@ class TransformerConditionedExtractor(BaseFeaturesExtractor):
         attended_obs = attended_obs.squeeze(1)
 
         combined = torch.cat([attended_obs, strategy_latent], dim=-1)
-        features = self.fusion(combined)
+        features = self.fusion(combined)  # type: ignore[operator]
         return features
 
 
@@ -3598,8 +3626,7 @@ def main() -> None:
     # Display device information at start
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
-    print("📝 MODE: LIVE STEP PRINTS (no training CSV logging)")
-    print("ELLIOT TESTING 4")
+    print("📝 MODE: Live step prints optional (see LIVE_STEP_PRINTS)")
     print("=" * 70)
 
     agent_cfg = TRAIN_CONFIG.get("agent", {})
@@ -3663,8 +3690,8 @@ def main() -> None:
     training_cfg = TRAIN_CONFIG.get("training", {})
     train_resolution = training_cfg.get("resolution", CameraResolution.LOW)
     train_timesteps = training_cfg.get("timesteps", 50_000)
-    # Disable SB3 Monitor/CSV logging during training; we print live instead
-    train_logging = TrainLogging.NONE
+    # Respect the logging mode from the selected TRAIN_CONFIG
+    train_logging = training_cfg.get("logging", TrainLogging.PLOT)
 
     # ---- RUN SUMMARY (configuration snapshot) ----
     print("\n" + "📋" + "="*68)
@@ -3678,7 +3705,12 @@ def main() -> None:
     print(f"Checkpoints: base='{CHECKPOINT_BASE_PATH}', run='{exp_path}'")
     print(f"Self-play: run_name='{self_play_run_name}', save_freq={self_play_save_freq}, max_saved={self_play_max_saved}, mode={self_play_mode.name}")
     print(f"Training: timesteps={train_timesteps:,}, resolution={train_resolution.name}, logging={train_logging.name}")
-    print("Algorithm: RecurrentPPO + MlpLstmPolicy (Transformer-conditioned features)")
+    algo_desc = (
+        "RecurrentPPO + MlpLstmPolicy (Transformer-conditioned features)"
+        if not DISABLE_STRATEGY_ENCODER
+        else "RecurrentPPO + MlpLstmPolicy (recurrent baseline; encoder OFF)"
+    )
+    print(f"Algorithm: {algo_desc}")
     # PPO core
     print("PPO Hyperparams:")
     print(f"  n_steps={_SHARED_AGENT_CONFIG.get('n_steps')} batch_size={_SHARED_AGENT_CONFIG.get('batch_size')} n_epochs={_SHARED_AGENT_CONFIG.get('n_epochs')}")
@@ -3686,6 +3718,8 @@ def main() -> None:
     # Transformer
     print("Transformer:")
     print(f"  latent_dim={_SHARED_AGENT_CONFIG.get('latent_dim')} heads={_SHARED_AGENT_CONFIG.get('num_heads')} layers={_SHARED_AGENT_CONFIG.get('num_layers')} seq_len={_SHARED_AGENT_CONFIG.get('sequence_length')}")
+    print(f"  encoder={'ON' if not DISABLE_STRATEGY_ENCODER else 'OFF (bypassed)'}")
+    print(f"  toggle=DISABLE_STRATEGY_ENCODER={DISABLE_STRATEGY_ENCODER}")
     # Policy kwargs (LSTM size etc.)
     pk = _SHARED_AGENT_CONFIG.get('policy_kwargs', {})
     print("Policy:")
@@ -3716,8 +3750,9 @@ def main() -> None:
         f"Training config: timesteps={train_timesteps}, resolution={train_resolution.name}, logging={train_logging.name}",
     )
     
-    # Replace hierarchical monitor with live per-step reward printer
-    monitor_callback = LiveRewardLossPrinter(reward_manager, print_breakdown=True)
+    # Optional lightweight live printer (opt-in via env var)
+    enable_live_prints = os.environ.get("LIVE_STEP_PRINTS", "0") == "1"
+    monitor_callback = LiveRewardLossPrinter(reward_manager, print_breakdown=True) if enable_live_prints else None
 
     run_training_loop(
         agent=learning_agent,

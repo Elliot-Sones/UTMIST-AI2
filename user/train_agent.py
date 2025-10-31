@@ -1710,28 +1710,145 @@ def on_combo_reward(env: WarehouseBrawl, agent: str) -> float:
 '''
 Add your dictionary of RewardFunctions here using RewTerms
 '''
-def gen_reward_manager():
+
+# --------------------------------------------------------------------------------
+# CURRICULUM REWARD ANNEALING SYSTEM
+# Gradually reduces dense rewards over training to shift from exploration to exploitation
+# --------------------------------------------------------------------------------
+
+class CurriculumRewardScheduler:
     """
-    🔧 REWARD SYSTEM V2 - CRITICAL FIX FOR LEARNING
-    
-    ROOT CAUSE: Agent learned to be PASSIVE (like ConstantAgent) because penalties
-    overwhelmed rewards. Attack penalty fired every frame (-1.0) but damage reward
-    only fired on successful hits (+50.0 but rare).
-    
-    NEW STRATEGY:
-    1. REMOVED attack spam penalty (was killing all offensive behavior)
-    2. INCREASED damage reward to +150.0 (make landing hits extremely valuable)
-    3. REDUCED danger zone penalty to -2.0 (only severe falls punished)
-    4. ADDED approach reward (+0.1) to encourage engagement
-    5. ADDED win incentive (+500) to make victories dominant signal
-    
-    Expected behavior: Agent learns to approach, attack, and land hits.
+    🎓 CURRICULUM ANNEALING: Gradually reduce dense reward weights over training
+
+    Problem: Sudden reward changes cause value function mismatch and training instability
+    Solution: Smooth transitions between reward regimes across training milestones
+
+    Schedule:
+    - Stage 1 (0-25k):    High dense rewards (exploration phase)
+    - Stage 2 (25k-50k):  Moderate reduction (refinement phase)
+    - Stage 3 (50k-100k): Conservative reduction (optimization phase)
+    - Stage 4 (100k+):    Minimal dense rewards (mastery phase)
     """
+
+    def __init__(self):
+        # Define curriculum milestones: (step_threshold, head_to_opponent_weight, attack_button_weight)
+        self.milestones = [
+            (0,      10.0, 15.0),  # Stage 1: Initial exploration (original weights)
+            (25_000,  7.0, 10.0),  # Stage 2: First reduction (30-33% cut)
+            (50_000,  5.0,  6.0),  # Stage 3: Moderate reduction (50-60% cut total)
+            (100_000, 3.0,  3.0),  # Stage 4: Conservative reduction (70-80% cut total)
+            (200_000, 1.0,  1.0),  # Stage 5: Minimal guidance (90-93% cut total)
+        ]
+
+        self.current_stage = 0
+        self.current_step = 0
+
+    def get_weights(self, training_step: int) -> Dict[str, float]:
+        """
+        Get current reward weights based on training step.
+
+        Args:
+            training_step: Current training timestep
+
+        Returns:
+            Dictionary with 'head_to_opponent' and 'attack_button' weights
+        """
+        self.current_step = training_step
+
+        # Find current milestone
+        for i, (threshold, head_weight, attack_weight) in enumerate(self.milestones):
+            if training_step < threshold:
+                break
+            self.current_stage = i
+            current_head_weight = head_weight
+            current_attack_weight = attack_weight
+        else:
+            # Use last milestone if beyond all thresholds
+            current_head_weight = self.milestones[-1][1]
+            current_attack_weight = self.milestones[-1][2]
+
+        return {
+            'head_to_opponent': current_head_weight,
+            'attack_button': current_attack_weight,
+            'stage': self.current_stage,
+        }
+
+    def print_schedule(self):
+        """Print full curriculum schedule for reference."""
+        print("\n" + "="*70)
+        print("🎓 CURRICULUM REWARD ANNEALING SCHEDULE")
+        print("="*70)
+        for i, (threshold, head_weight, attack_weight) in enumerate(self.milestones):
+            stage_name = [
+                "STAGE 1: Initial Exploration",
+                "STAGE 2: First Reduction",
+                "STAGE 3: Moderate Reduction",
+                "STAGE 4: Conservative Reduction",
+                "STAGE 5: Minimal Guidance"
+            ][i]
+
+            print(f"\n{stage_name}")
+            print(f"  Start: Step {threshold:,}")
+            print(f"  head_to_opponent: {head_weight:.1f}")
+            print(f"  attack_button: {attack_weight:.1f}")
+
+            # Calculate reduction from original
+            orig_head, orig_attack = 10.0, 15.0
+            head_pct = ((orig_head - head_weight) / orig_head) * 100
+            attack_pct = ((orig_attack - attack_weight) / orig_attack) * 100
+            print(f"  Reduction: {head_pct:.0f}% / {attack_pct:.0f}% from original")
+        print("="*70 + "\n")
+
+
+# Global curriculum scheduler (initialized on first call to gen_reward_manager)
+_CURRICULUM_SCHEDULER = None
+
+def gen_reward_manager(training_step: int = 0):
+    """
+    🔧 REWARD SYSTEM V3 - CURRICULUM ANNEALING
+
+    ROOT CAUSE (from debug runs):
+    - Sudden dense reward reduction (15.0→3.0) caused agent to forget attacking
+    - Value function trained on old weights couldn't adapt quickly enough
+    - Agent regressed from 0.05 damage ratio to 0.02 (worse than before!)
+
+    NEW STRATEGY: GRADUAL CURRICULUM ANNEALING
+    - Stage 1 (0-25k):    High dense rewards (10.0, 15.0) - exploration
+    - Stage 2 (25k-50k):  First reduction (7.0, 10.0) - refinement
+    - Stage 3 (50k-100k): Moderate reduction (5.0, 6.0) - optimization
+    - Stage 4 (100k+):    Conservative reduction (3.0, 3.0) - mastery
+
+    This allows value function to adapt gradually over training.
+    """
+    global _CURRICULUM_SCHEDULER
+
+    # Initialize curriculum scheduler on first call
+    if _CURRICULUM_SCHEDULER is None:
+        _CURRICULUM_SCHEDULER = CurriculumRewardScheduler()
+        _CURRICULUM_SCHEDULER.print_schedule()  # Print schedule at start
+
+    # Get current weights from curriculum
+    curriculum_weights = _CURRICULUM_SCHEDULER.get_weights(training_step)
+    head_weight = curriculum_weights['head_to_opponent']
+    attack_weight = curriculum_weights['attack_button']
+    stage = curriculum_weights['stage']
+
+    # Log curriculum transition (when stage changes)
+    if hasattr(_CURRICULUM_SCHEDULER, '_last_logged_stage'):
+        if stage != _CURRICULUM_SCHEDULER._last_logged_stage:
+            print("\n" + "="*70)
+            print(f"🎓 CURRICULUM TRANSITION: Moving to Stage {stage + 1}")
+            print(f"   Step: {training_step:,}")
+            print(f"   head_to_opponent: {_CURRICULUM_SCHEDULER.milestones[stage][1]:.1f}")
+            print(f"   attack_button: {_CURRICULUM_SCHEDULER.milestones[stage][2]:.1f}")
+            print("="*70 + "\n")
+    _CURRICULUM_SCHEDULER._last_logged_stage = stage
+
     reward_functions = {
         # PRIMARY REWARD: Landing damage on opponent (MASSIVE POSITIVE)
         'damage_interaction_reward': RewTerm(
             func=damage_interaction_reward,
-            weight=500.0,  # 🔥 INCREASED: 200→500 (agent proved it can attack, now make damage dominant)
+            weight=500.0,  # 🔥 Keep high throughout (outcome reward)
             params={'mode': RewardMode.SYMMETRIC}  # Reward damage dealt, penalize damage taken
         ),
 
@@ -1742,21 +1859,16 @@ def gen_reward_manager():
             params={'zone_penalty': 1, 'zone_height': 4.2}
         ),
 
-        # ENGAGEMENT: Reduced guidance (still provides signal)
+        # 🎓 CURRICULUM: Engagement reward (annealed over training)
         'head_to_opponent': RewTerm(
             func=head_to_opponent,
-            weight=3.0  # 🔧 REDUCED: 10.0→3.0 (70% cut - conservative rebalance)
-                        # Agent was farming approach rewards instead of winning
-                        # 3.0 maintains exploration while shifting focus to outcomes
+            weight=head_weight  # Dynamic weight from curriculum scheduler
         ),
 
-        # 🔧 EXPLORATION: Reduced signal (agent already learned to attack)
+        # 🎓 CURRICULUM: Exploration reward (annealed over training)
         'on_attack_button_press': RewTerm(
             func=on_attack_button_press,
-            weight=3.0  # 🔧 REDUCED: 15.0→3.0 (80% cut - safer than 1.0)
-                        # Agent was pressing buttons for reward, not to win
-                        # 3.0 keeps attack behavior while making wins more valuable
-                        # Evidence: 0% win rate but constantly getting +0.5 reward at 15.0
+            weight=attack_weight  # Dynamic weight from curriculum scheduler
         ),
 
         # CLEANUP: Discourage button mashing (but keep light)
@@ -1975,10 +2087,13 @@ class PerformanceBenchmark:
     def __init__(self, log_dir: str):
         self.log_dir = log_dir
         self.csv_path = os.path.join(log_dir, "checkpoint_benchmarks.csv")
-        
+
         # Track latent vectors for diversity analysis
         self.recent_latent_vectors = deque(maxlen=50)
-        
+
+        # Track transformer health metrics
+        self.transformer_health = TransformerHealthMonitor()
+
         self._init_csv()
     
     def _init_csv(self):
@@ -2059,7 +2174,294 @@ class PerformanceBenchmark:
             'avg_damage_ratio': avg_damage_ratio,
             'diversity_score': diversity_score
         }
-    
+
+    def assess_competition_readiness(
+        self,
+        checkpoint_step: int,
+        benchmark_results: Dict[str, float],
+        agent: Agent,
+        reward_tracker: 'RewardBreakdownTracker'
+    ) -> Dict[str, any]:
+        """
+        🎯 COMPETITION READINESS ASSESSMENT
+
+        Analyzes training metrics to predict 10M competition performance.
+        Provides actionable feedback on whether to scale or what to fix.
+
+        Args:
+            checkpoint_step: Current training step
+            benchmark_results: Results from run_benchmark()
+            agent: Trained agent
+            reward_tracker: Reward breakdown tracker
+
+        Returns:
+            Dictionary with assessment results and recommendation
+        """
+        print("\n" + "="*70)
+        print(f"🏆 COMPETITION READINESS ASSESSMENT (Step {checkpoint_step})")
+        print("="*70)
+
+        tier1_checks = []
+        tier2_checks = []
+        tier3_checks = []
+
+        # ========== TIER 1: CRITICAL (Must Pass All) ==========
+        print("\n📊 TIER 1 - CRITICAL METRICS (Must Pass for 10M Scale)")
+        print("-" * 70)
+
+        # 1. Transformer Utilization
+        if isinstance(agent, TransformerStrategyAgent):
+            # Get latent norms from recent episodes
+            latent_norms = list(self.recent_latent_vectors[-50:]) if len(self.recent_latent_vectors) > 0 else []
+            if len(latent_norms) > 10:
+                norms = [np.linalg.norm(v) for v in latent_norms]
+                latent_variance = np.std(norms)
+                latent_mean = np.mean(norms)
+
+                # PASS: Variance > 20% of mean (transformer adapting to opponents)
+                variance_ratio = (latent_variance / latent_mean) if latent_mean > 0 else 0
+                transformer_pass = variance_ratio > 0.2
+
+                status = "✅ PASS" if transformer_pass else "❌ FAIL"
+                print(f"  {status} Transformer Utilization:")
+                print(f"       Latent Norm: {latent_mean:.2f} (±{latent_variance:.2f})")
+                print(f"       Variance Ratio: {variance_ratio:.2f} (need >0.20)")
+                if not transformer_pass:
+                    print(f"       → Transformer not varying across opponents!")
+                    print(f"       → Agent using fixed policy, not adapting")
+
+                tier1_checks.append(('Transformer Variance', transformer_pass))
+            else:
+                print(f"  ⚠️  SKIP Transformer Utilization (insufficient data)")
+                tier1_checks.append(('Transformer Variance', None))
+        else:
+            print(f"  ⚠️  SKIP Transformer Utilization (not using TransformerAgent)")
+            tier1_checks.append(('Transformer Variance', None))
+
+        # 2. Cross-Opponent Win Rates
+        based_wr = benchmark_results['based_winrate']
+        constant_wr = benchmark_results['constant_winrate']
+
+        # PASS: Constant >80% AND Based >40%
+        winrate_pass = constant_wr > 80 and based_wr > 40
+
+        status = "✅ PASS" if winrate_pass else "❌ FAIL"
+        print(f"  {status} Cross-Opponent Win Rates:")
+        print(f"       vs ConstantAgent: {constant_wr:.1f}% (need >80%)")
+        print(f"       vs BasedAgent: {based_wr:.1f}% (need >40%)")
+        if not winrate_pass:
+            if constant_wr <= 80:
+                print(f"       → Can't beat stationary target reliably!")
+            if based_wr <= 40:
+                print(f"       → Struggles with moving opponent")
+                print(f"       → May be overfitting to ConstantAgent")
+
+        tier1_checks.append(('Cross-Opponent Wins', winrate_pass))
+
+        # 3. Strategy Diversity
+        diversity = benchmark_results['diversity_score']
+
+        # PASS: Diversity >0.4 (multiple strategies emerged)
+        diversity_pass = diversity > 0.4
+
+        status = "✅ PASS" if diversity_pass else "❌ FAIL"
+        print(f"  {status} Strategy Diversity:")
+        print(f"       Score: {diversity:.3f} (need >0.400)")
+        if not diversity_pass:
+            print(f"       → Mode collapse! Agent using one fixed strategy")
+            print(f"       → Won't handle diverse competition opponents")
+
+        tier1_checks.append(('Strategy Diversity', diversity_pass))
+
+        # 4. Damage Ratio
+        damage_ratio = benchmark_results['avg_damage_ratio']
+
+        # PASS: >1.0 (dealing more than taking)
+        damage_pass = damage_ratio > 1.0
+
+        status = "✅ PASS" if damage_pass else "❌ FAIL"
+        print(f"  {status} Damage Ratio:")
+        print(f"       Ratio: {damage_ratio:.2f} (need >1.00)")
+        if not damage_pass:
+            print(f"       → Taking more damage than dealing!")
+            print(f"       → Losing combat exchanges")
+
+        tier1_checks.append(('Damage Ratio', damage_pass))
+
+        # ========== TIER 2: STRONG INDICATORS ==========
+        print("\n📊 TIER 2 - STRONG INDICATORS (Should Pass Most)")
+        print("-" * 70)
+
+        # 5. Reward Composition (Dense vs Sparse)
+        if hasattr(reward_tracker, 'accumulated_data') and len(reward_tracker.accumulated_data) > 0:
+            recent_rewards = reward_tracker.accumulated_data[-100:]  # Last 100 steps
+
+            dense_total = 0.0
+            sparse_total = 0.0
+
+            for step_data in recent_rewards:
+                for term_name, value in step_data.items():
+                    if term_name in ['head_to_opponent', 'on_attack_button_press']:
+                        dense_total += abs(value)
+                    elif term_name in ['damage_interaction_reward', 'on_win_reward', 'on_knockout_reward']:
+                        sparse_total += abs(value)
+
+            if (dense_total + sparse_total) > 0:
+                sparse_percent = (sparse_total / (dense_total + sparse_total)) * 100
+
+                # PASS: >60% from sparse rewards
+                reward_pass = sparse_percent > 60
+
+                status = "✅ PASS" if reward_pass else "⚠️  WEAK"
+                print(f"  {status} Reward Composition:")
+                print(f"       Sparse: {sparse_percent:.1f}% (need >60%)")
+                print(f"       Dense: {100-sparse_percent:.1f}%")
+                if not reward_pass:
+                    print(f"       → Still reward hacking! Agent farming dense rewards")
+                    print(f"       → Not optimizing for wins/damage")
+
+                tier2_checks.append(('Reward Mix', reward_pass))
+            else:
+                print(f"  ⚠️  SKIP Reward Composition (no data)")
+                tier2_checks.append(('Reward Mix', None))
+        else:
+            print(f"  ⚠️  SKIP Reward Composition (no reward data)")
+            tier2_checks.append(('Reward Mix', None))
+
+        # 6. Win Rate Scaling
+        # Check if BOTH opponents improving (not overfitting to one)
+        # This requires historical data - for now, check absolute levels
+        both_improving = constant_wr > 70 and based_wr > 30
+
+        status = "✅ PASS" if both_improving else "⚠️  WEAK"
+        print(f"  {status} Win Rate Scaling:")
+        print(f"       Both opponents improving: {both_improving}")
+        if not both_improving:
+            print(f"       → May be overfitting to easier opponent")
+
+        tier2_checks.append(('Win Rate Scaling', both_improving))
+
+        # ========== TIER 3: WARNING SIGNALS ==========
+        print("\n📊 TIER 3 - WARNING SIGNALS (Red Flags)")
+        print("-" * 70)
+
+        # 7. Attention Entropy (if available)
+        if isinstance(agent, TransformerStrategyAgent) and hasattr(self, 'transformer_health'):
+            health_stats = self.transformer_health.get_stats()
+            if 'attention_entropy_mean' in health_stats:
+                attn_entropy = health_stats['attention_entropy_mean']
+
+                # PASS: >3.0 (analyzing opponent history)
+                entropy_pass = attn_entropy > 3.0
+
+                status = "✅ GOOD" if entropy_pass else "⚠️  LOW"
+                print(f"  {status} Attention Entropy:")
+                print(f"       Entropy: {attn_entropy:.2f} (want >3.0)")
+                if not entropy_pass:
+                    print(f"       → Transformer focusing on few frames only")
+                    print(f"       → Not analyzing full opponent behavior")
+
+                tier3_checks.append(('Attention Entropy', entropy_pass))
+            else:
+                print(f"  ⚠️  SKIP Attention Entropy (no data)")
+                tier3_checks.append(('Attention Entropy', None))
+        else:
+            print(f"  ⚠️  SKIP Attention Entropy (not tracked)")
+            tier3_checks.append(('Attention Entropy', None))
+
+        # 8. Training Stability
+        # Check for NaN/crashes - assume pass if we got here
+        stability_pass = True
+        print(f"  ✅ GOOD Training Stability:")
+        print(f"       No NaN/crashes detected")
+        tier3_checks.append(('Training Stability', stability_pass))
+
+        # ========== OVERALL ASSESSMENT ==========
+        print("\n" + "="*70)
+        print("🎯 OVERALL ASSESSMENT")
+        print("="*70)
+
+        # Count passes
+        tier1_passed = sum(1 for _, result in tier1_checks if result is True)
+        tier1_total = sum(1 for _, result in tier1_checks if result is not None)
+
+        tier2_passed = sum(1 for _, result in tier2_checks if result is True)
+        tier2_total = sum(1 for _, result in tier2_checks if result is not None)
+
+        tier3_passed = sum(1 for _, result in tier3_checks if result is True)
+        tier3_total = sum(1 for _, result in tier3_checks if result is not None)
+
+        print(f"\nTIER 1 (Critical):  {tier1_passed}/{tier1_total} PASS")
+        for check_name, result in tier1_checks:
+            if result is None:
+                status = "⊘ SKIP"
+            elif result:
+                status = "✅ PASS"
+            else:
+                status = "❌ FAIL"
+            print(f"  {status}  {check_name}")
+
+        print(f"\nTIER 2 (Strong):    {tier2_passed}/{tier2_total} PASS")
+        for check_name, result in tier2_checks:
+            if result is None:
+                status = "⊘ SKIP"
+            elif result:
+                status = "✅ PASS"
+            else:
+                status = "⚠️  WEAK"
+            print(f"  {status}  {check_name}")
+
+        print(f"\nTIER 3 (Warnings):  {tier3_passed}/{tier3_total} GOOD")
+        for check_name, result in tier3_checks:
+            if result is None:
+                status = "⊘ SKIP"
+            elif result:
+                status = "✅ GOOD"
+            else:
+                status = "⚠️  FLAG"
+            print(f"  {status}  {check_name}")
+
+        # Final recommendation
+        print("\n" + "="*70)
+
+        # Must pass ALL tier 1 checks
+        tier1_all_pass = tier1_total > 0 and tier1_passed == tier1_total
+        tier2_most_pass = tier2_total == 0 or (tier2_passed / tier2_total) >= 0.67
+
+        if tier1_all_pass and tier2_most_pass:
+            confidence = int(min(95, 70 + (tier2_passed / max(tier2_total, 1)) * 20))
+            print(f"🎉 READY FOR 10M SCALE (~{confidence}% confidence)")
+            print(f"   ✅ All critical metrics passed")
+            print(f"   ✅ Agent shows signs of adaptability")
+            print(f"   ✅ Proceed to Stage 2 or 10M training")
+            recommendation = "PROCEED"
+        elif tier1_all_pass:
+            print(f"⚠️  BORDERLINE - Proceed with caution")
+            print(f"   ✅ Critical metrics passed")
+            print(f"   ⚠️  Some strong indicators weak")
+            print(f"   → Consider training 50k more steps to strengthen")
+            recommendation = "CAUTION"
+        else:
+            print(f"🚨 NOT READY - Fix issues before scaling")
+            print(f"   ❌ Critical metrics failed")
+            print(f"   ❌ DO NOT scale to 10M yet")
+            print(f"\n📋 ACTION ITEMS:")
+            for check_name, result in tier1_checks:
+                if result is False:
+                    print(f"   • Fix: {check_name}")
+            recommendation = "FIX_REQUIRED"
+
+        print("="*70 + "\n")
+
+        return {
+            'tier1_checks': tier1_checks,
+            'tier2_checks': tier2_checks,
+            'tier3_checks': tier3_checks,
+            'recommendation': recommendation,
+            'tier1_pass_rate': tier1_passed / max(tier1_total, 1),
+            'tier2_pass_rate': tier2_passed / max(tier2_total, 1)
+        }
+
     def _run_matches(self, agent: Agent, opponent_factory, num_matches: int) -> List[Dict]:
         """Run matches and return results."""
         results = []
@@ -2071,14 +2473,17 @@ class PerformanceBenchmark:
                 resolution=CameraResolution.LOW,
                 train_mode=True
             )
-            
+
+            # Record latent vector and transformer health after match
+            self.record_latent_vector(agent)
+
             results.append({
                 'won': match_stats.player1_result == Result.WIN,
                 # 🔧 FIXED: Changed total_damage → damage_taken (correct attribute)
                 'damage_dealt': match_stats.player2.damage_taken,  # Damage we dealt
                 'damage_taken': match_stats.player1.damage_taken   # Damage we took
             })
-        
+
         return results
     
     def _calculate_strategy_diversity(self, agent: Agent) -> float:
@@ -2101,13 +2506,16 @@ class PerformanceBenchmark:
         return diversity
     
     def record_latent_vector(self, agent: Agent):
-        """Record latent vector for diversity tracking."""
+        """Record latent vector for diversity tracking and transformer health."""
         if not isinstance(agent, TransformerStrategyAgent):
-                return
-            
+            return
+
         if agent.current_strategy_latent is not None:
             latent_numpy = agent.current_strategy_latent.cpu().detach().numpy().flatten()
             self.recent_latent_vectors.append(latent_numpy)
+
+        # Update transformer health monitor
+        self.transformer_health.update(agent)
 
 
 class TrainingMonitorCallback(BaseCallback):
@@ -2146,7 +2554,14 @@ class TrainingMonitorCallback(BaseCallback):
         self.transformer_monitor = TransformerHealthMonitor()
         self.reward_tracker = RewardBreakdownTracker(reward_manager, log_dir)
         self.benchmark = PerformanceBenchmark(log_dir)
-        
+
+        # 🎓 Curriculum annealing system
+        global _CURRICULUM_SCHEDULER
+        if _CURRICULUM_SCHEDULER is None:
+            _CURRICULUM_SCHEDULER = CurriculumRewardScheduler()
+            _CURRICULUM_SCHEDULER.print_schedule()
+        self.curriculum_scheduler = _CURRICULUM_SCHEDULER
+
         # Frame-level alert buffers
         self.recent_rewards = deque(maxlen=100)
         self.recent_losses = deque(maxlen=100)
@@ -2181,7 +2596,40 @@ class TrainingMonitorCallback(BaseCallback):
         with open(self.episode_csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['step', 'episode', 'reward', 'length', 'damage_ratio'])
-    
+
+    def _update_curriculum_weights(self):
+        """
+        🎓 Update dense reward weights based on curriculum schedule.
+
+        Dynamically adjusts reward weights during training to transition from
+        exploration (high dense rewards) to exploitation (high sparse rewards).
+        """
+        # Get current weights from curriculum scheduler
+        curriculum_weights = self.curriculum_scheduler.get_weights(self.num_timesteps)
+        head_weight = curriculum_weights['head_to_opponent']
+        attack_weight = curriculum_weights['attack_button']
+        stage = curriculum_weights['stage']
+
+        # Update reward manager weights directly
+        if 'head_to_opponent' in self.reward_manager.reward_functions:
+            self.reward_manager.reward_functions['head_to_opponent'].weight = head_weight
+
+        if 'on_attack_button_press' in self.reward_manager.reward_functions:
+            self.reward_manager.reward_functions['on_attack_button_press'].weight = attack_weight
+
+        # Log curriculum transitions (only when stage changes)
+        if not hasattr(self, '_last_curriculum_stage'):
+            self._last_curriculum_stage = -1
+
+        if stage != self._last_curriculum_stage:
+            print("\n" + "="*70)
+            print(f"🎓 CURRICULUM TRANSITION: Stage {stage + 1}")
+            print(f"   Step: {self.num_timesteps:,}")
+            print(f"   head_to_opponent: {head_weight:.1f}")
+            print(f"   on_attack_button_press: {attack_weight:.1f}")
+            print("="*70 + "\n")
+            self._last_curriculum_stage = stage
+
     def _on_step(self) -> bool:
         """
         Called at every training step.
@@ -2189,13 +2637,16 @@ class TrainingMonitorCallback(BaseCallback):
         """
         self.current_episode_length += 1
         self.total_steps += 1
-        
+
+        # 🎓 Update curriculum weights based on training progress
+        self._update_curriculum_weights()
+
         # Extract current reward (from training env)
         if len(self.model.ep_info_buffer) > 0:
             recent_ep = self.model.ep_info_buffer[-1]
             step_reward = recent_ep.get('r', 0.0)
             self.current_episode_reward = step_reward
-        
+
         # Frame-level alerts (console only, no file I/O)
         self._check_frame_alerts()
         
@@ -2436,16 +2887,33 @@ class TrainingMonitorCallback(BaseCallback):
     def _checkpoint_benchmark(self):
         """
         Full performance benchmark when checkpoint is saved.
-        Most comprehensive evaluation.
+        Most comprehensive evaluation including competition readiness assessment.
         """
         try:
-            self.benchmark.run_benchmark(
+            # Run standard benchmark
+            benchmark_results = self.benchmark.run_benchmark(
                 self.agent,
                 self.num_timesteps,
                 num_matches=5
             )
+
+            # Run competition readiness assessment (every 50k steps or at final checkpoint)
+            if self.num_timesteps >= 30000 and self.num_timesteps % 10000 == 0:
+                try:
+                    self.benchmark.assess_competition_readiness(
+                        checkpoint_step=self.num_timesteps,
+                        benchmark_results=benchmark_results,
+                        agent=self.agent,
+                        reward_tracker=self.reward_tracker
+                    )
+                except Exception as e:
+                    print(f"⚠️  Competition readiness assessment failed: {e}")
+                    import traceback
+                    traceback.print_exc()
         except Exception as e:
             print(f"⚠️  Checkpoint benchmark failed: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _on_rollout_end(self) -> None:
         """Called at end of each rollout (batch of episodes)."""

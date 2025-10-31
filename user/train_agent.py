@@ -398,7 +398,7 @@ _SHARED_AGENT_CONFIG = {
         "latent_dim": 256,           # Dimensionality of strategy latent space
     "num_heads": 8,              # Number of attention heads (divisor of latent_dim)
     "num_layers": 6,             # Depth of transformer encoder
-        "sequence_length": 90,       # Frames to analyze (3 seconds at 30 FPS)
+        "sequence_length": 65,       # Frames to analyze (2.17 seconds at 30 FPS)
     "opponent_obs_dim": None,    # Auto-detected from observation space
         
     # RecurrentPPO hyperparameters (optimized for T4 GPU)
@@ -564,7 +564,8 @@ TRAIN_CONFIG_DEBUG: Dict[str, dict] = {
 # This validates reward function before proceeding to harder opponents
 TRAIN_CONFIG_CURRICULUM: Dict[str, dict] = {
     "agent": _SHARED_AGENT_CONFIG.copy(),
-    "reward": _SHARED_REWARD_CONFIG.copy(),
+    # Use dense + curriculum-annealed rewards for Stage 1
+    "reward": {"factory": "gen_reward_manager"},
     "self_play": {
         "run_name": "curriculum_basic_combat",  # Stage 1 checkpoint folder
         "save_freq": 10_000,                    # Save every 10k steps (more time to learn)
@@ -599,7 +600,8 @@ TRAIN_CONFIG_CURRICULUM_STAGE2: Dict[str, dict] = {
         **_SHARED_AGENT_CONFIG.copy(),
         "load_path": None,  # Set this to Stage 1 checkpoint path when running
     },
-    "reward": _SHARED_REWARD_CONFIG.copy(),
+    # Keep curriculum/dense rewards for Stage 2 as well
+    "reward": {"factory": "gen_reward_manager"},
     "self_play": {
         "run_name": "curriculum_scripted",
         "save_freq": 5_000,
@@ -682,8 +684,8 @@ TRAIN_CONFIG_TEST: Dict[str, dict] = {
 #    TRAIN_CONFIG_10M → Full 10M adversarial self-play
 #    Goal: Create agent that beats ANY opponent strategy
 
-# ⚠️ START HERE: Run EXPLORATION mode with sparse rewards + diverse opponents!
-TRAIN_CONFIG = TRAIN_CONFIG_EXPLORATION  # 🚨 ACTIVE: Sparse rewards, let exploration find best strategies
+# ⚠️ START HERE: Curriculum Stage 1 to reliably learn attacking vs ConstantAgent
+TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # Stage 1: Beat ConstantAgent (dense shaping enabled)
 
 # For quick validation only (50k, ConstantAgent only):
 # TRAIN_CONFIG = TRAIN_CONFIG_DEBUG
@@ -853,7 +855,7 @@ class TransformerStrategyEncoder(nn.Module):
         num_heads: int = 8,
         num_layers: int = 6,
         dropout: float = 0.1,
-        max_sequence_length: int = 90,  # 3 seconds at 30 FPS
+        max_sequence_length: int = 65,  # 2.17 seconds at 30 FPS
         device: torch.device = None
     ):
         super().__init__()
@@ -1078,7 +1080,7 @@ class TransformerStrategyAgent(Agent):
         latent_dim: int = 256,
         num_heads: int = 8,
         num_layers: int = 6,
-        sequence_length: int = 90,
+        sequence_length: int = 65,
         opponent_obs_dim: Optional[int] = None
     ):
         super().__init__(file_path)
@@ -1523,7 +1525,7 @@ def create_learning_agent(agent_cfg: Dict[str, object]) -> Agent:
             latent_dim=agent_cfg.get("latent_dim", 256),
             num_heads=agent_cfg.get("num_heads", 8),
             num_layers=agent_cfg.get("num_layers", 6),
-            sequence_length=agent_cfg.get("sequence_length", 90),
+            sequence_length=agent_cfg.get("sequence_length", 65),
             opponent_obs_dim=agent_cfg.get("opponent_obs_dim", None)
         )
         # Set all default hyperparameters from config
@@ -3087,13 +3089,18 @@ class TrainingMonitorCallback(BaseCallback):
         eval_damage_dealt = 0  # Damage in this evaluation
         eval_damage_taken = 0  # Damage taken in this evaluation
         
+        # Choose an opponent appropriate for current training stage
+        # - Before 50k steps: evaluate against ConstantAgent (easy baseline)
+        # - After 50k steps: evaluate against BasedAgent (harder scripted)
+        eval_opponent = partial(ConstantAgent) if self.num_timesteps < 50_000 else partial(BasedAgent)
+
         for i in range(self.eval_matches):
             try:
                 if hasattr(self.agent, "reset"):
                     self.agent.reset()
                 match_stats = env_run_match(
                     self.agent,
-                    partial(BasedAgent),
+                    eval_opponent,
                     max_timesteps=30*60,
                     resolution=CameraResolution.LOW,
                     train_mode=True
@@ -3616,7 +3623,7 @@ proper scaling laws for efficient hyperparameter tuning.
 
 3. TRANSFORMER + LSTM ARCHITECTURE
    - TransformerStrategyEncoder: 6 layers, 8 heads, 256-dim latent space
-   - Tracks opponent behavior sequences (90 frames = 3 seconds)
+   - Tracks opponent behavior sequences (65 frames = 2.17 seconds)
    - Discovers patterns via self-attention (like AlphaGo)
    - LSTM policy (512 hidden) conditions on transformer latent
    - Total params: ~2.5M (transformer) + ~1.5M (policy) = ~4M params

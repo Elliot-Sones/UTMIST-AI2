@@ -587,10 +587,10 @@ TRAIN_CONFIG_TEST: Dict[str, dict] = {
 #    Goal: Create agent that beats ANY opponent strategy
 
 # ⚠️ START HERE: Run DEBUG first to validate all fixes!
-TRAIN_CONFIG = TRAIN_CONFIG_DEBUG  # 🚨 ACTIVE: 5k debug run (verify attacking)
+# TRAIN_CONFIG = TRAIN_CONFIG_DEBUG  # ✅ COMPLETED: Debug run 1 & 2 (exploration boosted)
 
 # After debug success (damage > 0), uncomment curriculum:
-# TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # Stage 1: Beat ConstantAgent (90%+ win)
+TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # 🚨 ACTIVE: 50k curriculum (give agent time to learn)
 
 # After Stage 1, uncomment Stage 2:
 # TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM_STAGE2  # Stage 2: Beat BasedAgent (60%+ win)
@@ -2663,7 +2663,7 @@ def main() -> None:
     # Display device information at start
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
-    print("ELLIOT TESTING4")
+    print("ELLIOT TESTING6")
     
     # Check if monitoring is enabled
     training_cfg = TRAIN_CONFIG.get("training", {})

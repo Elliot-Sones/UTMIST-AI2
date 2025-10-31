@@ -604,6 +604,67 @@ TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # 🚨 ACTIVE: 50k curriculum (give agen
 
 
 # --------------------------------------------------------------------------------
+# Opponent observation history wrapper
+# --------------------------------------------------------------------------------
+
+class OpponentHistoryWrapper(gym.ObservationWrapper):
+    """
+    Extends observations with a rolling window of opponent features so the
+    transformer can operate on sequence data during training and evaluation.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        opponent_obs_dim: int,
+        sequence_length: int,
+    ):
+        super().__init__(env)
+        self.opponent_obs_dim = opponent_obs_dim
+        self.sequence_length = sequence_length
+
+        base_low = env.observation_space.low
+        base_high = env.observation_space.high
+        self.base_obs_dim = base_low.shape[0]
+
+        opponent_low = base_low[-opponent_obs_dim:]
+        opponent_high = base_high[-opponent_obs_dim:]
+
+        history_low = np.tile(opponent_low, sequence_length)
+        history_high = np.tile(opponent_high, sequence_length)
+
+        augmented_low = np.concatenate([base_low, history_low], dtype=base_low.dtype)
+        augmented_high = np.concatenate([base_high, history_high], dtype=base_high.dtype)
+
+        self.observation_space = gym.spaces.Box(
+            low=augmented_low,
+            high=augmented_high,
+            dtype=env.observation_space.dtype,
+        )
+
+        self._history = None
+
+    def observation(self, obs: np.ndarray) -> np.ndarray:
+        assert self._history is not None, "History not initialized; call reset() first."
+        history_flat = np.concatenate(self._history, axis=0).astype(obs.dtype, copy=False)
+        return np.concatenate([obs, history_flat], axis=0)
+
+    def reset(self, *args, **kwargs):
+        obs, info = self.env.reset(*args, **kwargs)
+        opponent_frame = obs[-self.opponent_obs_dim:]
+        self._history = [opponent_frame.copy() for _ in range(self.sequence_length)]
+        return self.observation(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        opponent_frame = obs[-self.opponent_obs_dim:]
+        self._history.append(opponent_frame.copy())
+        if len(self._history) > self.sequence_length:
+            self._history.pop(0)
+        return self.observation(obs), reward, terminated, truncated, info
+
+
+# --------------------------------------------------------------------------------
 # ----------------------------- 3. Encoder-Based Strategy Recognition -----------------------------
 # --------------------------------------------------------------------------------
 # Pure latent space learning with self-attention for infinite strategy understanding.
@@ -798,112 +859,97 @@ class TransformerConditionedExtractor(BaseFeaturesExtractor):
     """
     Features extractor that conditions policy on transformer-learned strategy latent.
     
-    Process:
-    1. Encode raw game observations
-    2. Receive strategy latent from transformer encoder
-    3. Fuse observations with strategy context
-    4. Output strategy-conditioned features for policy
-    
-    This allows the policy to adapt based on understood opponent patterns.
+    Observation layout: [base_obs | flattened_history]. History contains
+    `sequence_length` opponent frames stacked sequentially.
     """
     def __init__(
         self,
         observation_space: gym.Space,
         features_dim: int = 256,
         latent_dim: int = 256,
-        device: torch.device = None
-    ):
+        base_obs_dim: int = 256,
+        opponent_obs_dim: int = 32,
+        sequence_length: int = 10,
+        num_heads: int = 8,
+        num_layers: int = 6,
+        device: Optional[torch.device] = None,
+    ) -> None:
         super().__init__(observation_space, features_dim)
-        
+
+        self.base_obs_dim = base_obs_dim
+        self.sequence_length = sequence_length
+        self.opponent_obs_dim = opponent_obs_dim
         self.latent_dim = latent_dim
-        # Use provided device or fall back to global TORCH_DEVICE
         self.device = device if device is not None else TORCH_DEVICE
-        obs_dim = observation_space.shape[0]
-        
-        # Encode raw observations
+        self.history_dim = opponent_obs_dim * sequence_length
+
         self.obs_encoder = nn.Sequential(
-            nn.Linear(obs_dim, 512),
+            nn.Linear(base_obs_dim, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.LayerNorm(256),
-            nn.ReLU()
+            nn.ReLU(),
         )
-        
-        # Cross-attention: observations attend to strategy latent
-        # "Given opponent strategy, what should I focus on in current state?"
+
+        self.strategy_encoder = TransformerStrategyEncoder(
+            opponent_obs_dim=opponent_obs_dim,
+            latent_dim=latent_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            max_sequence_length=sequence_length,
+            device=self.device,
+        )
+
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=256,
             num_heads=8,
-            batch_first=True
+            batch_first=True,
         )
-        
-        # Fusion layer
+
         self.fusion = nn.Sequential(
             nn.Linear(256 + latent_dim, features_dim),
             nn.LayerNorm(features_dim),
-            nn.ReLU()
+            nn.ReLU(),
         )
-        
-        # Buffer for current strategy latent (set by agent)
-        # Initialize on the correct device
-        self.register_buffer('current_strategy', torch.zeros(1, latent_dim, device=self.device))
-        
-        # Move entire model to the target device (MPS/CUDA/CPU)
+
+        self.last_strategy_latent: Optional[torch.Tensor] = None
+        self.last_attention: Optional[torch.Tensor] = None
         self.to(self.device)
-    
-    def set_strategy_latent(self, strategy_latent: torch.Tensor):
-        """Update current strategy latent (called by agent before forward)."""
-        # Ensure strategy latent is on the correct device
-        if strategy_latent.device != self.device:
-            strategy_latent = strategy_latent.to(self.device)
-        self.current_strategy = strategy_latent.detach()
-    
+
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        """
-        Condition features on strategy latent.
-        
-        Args:
-            observations: [batch, obs_dim]
-        
-        Returns:
-            features: [batch, features_dim] - strategy-conditioned features
-        """
-        # Ensure observations are on the correct device (important for MPS)
         if observations.device != self.device:
             observations = observations.to(self.device)
-        
+
         batch_size = observations.shape[0]
-        
-        # Encode observations
-        obs_features = self.obs_encoder(observations)  # [batch, 256]
-        
-        # Expand strategy latent to match batch
-        strategy_latent = self.current_strategy.expand(batch_size, -1)  # [batch, latent_dim]
-        
-        # Cross-attention: let observations attend to strategy context
-        obs_features_unsqueezed = obs_features.unsqueeze(1)  # [batch, 1, 256]
-        strategy_unsqueezed = strategy_latent.unsqueeze(1)   # [batch, 1, latent_dim]
-        
-        # Query: observations, Key/Value: strategy
+        base_obs = observations[:, : self.base_obs_dim]
+        history_flat = observations[:, self.base_obs_dim :]
+        if history_flat.shape[1] != self.history_dim:
+            raise ValueError(
+                f"Expected history dimension {self.history_dim}, received {history_flat.shape[1]}"
+            )
+        history = history_flat.view(batch_size, self.sequence_length, self.opponent_obs_dim)
+
+        strategy_latent, attention_info = self.strategy_encoder(
+            history, return_attention=True
+        )
+        self.last_strategy_latent = strategy_latent.detach()
+        self.last_attention = attention_info['pooling_attention'].detach()
+
+        obs_features = self.obs_encoder(base_obs)
+        obs_features_unsqueezed = obs_features.unsqueeze(1)
+        strategy_unsqueezed = strategy_latent.unsqueeze(1)
         attended_obs, _ = self.cross_attention(
             query=obs_features_unsqueezed,
             key=strategy_unsqueezed,
-            value=strategy_unsqueezed
+            value=strategy_unsqueezed,
         )
-        attended_obs = attended_obs.squeeze(1)  # [batch, 256]
-        
-        # Fuse attended observations with strategy latent
+        attended_obs = attended_obs.squeeze(1)
+
         combined = torch.cat([attended_obs, strategy_latent], dim=-1)
         features = self.fusion(combined)
-        
         return features
 
-
-# --------------------------------------------------------------------------------
-# ----------------------------- 3. Main Agent (TransformerStrategyAgent) -----------------------------
-# --------------------------------------------------------------------------------
-# Primary sequence-based learner used for AlphaGo-style self-play training.
 
 class TransformerStrategyAgent(Agent):
     """
@@ -945,12 +991,11 @@ class TransformerStrategyAgent(Agent):
         self.lstm_states = None
         self.episode_starts = np.ones((1,), dtype=bool)
         
-        # Opponent history buffer for transformer
-        self.opponent_history = []
-        self.current_strategy_latent = None
-        
-        # Transformer strategy encoder (initialized in _initialize)
-        self.strategy_encoder = None
+        # Observation bookkeeping for evaluation-time augmentation
+        self.expected_obs_dim: Optional[int] = None
+        self.base_obs_dim: Optional[int] = None
+        self.history_obs_dim: Optional[int] = None
+        self._eval_history: deque[np.ndarray] = deque(maxlen=self.sequence_length)
         
         # Default hyperparameters (set by create_learning_agent)
         self.default_policy_kwargs: Optional[dict] = None
@@ -966,49 +1011,49 @@ class TransformerStrategyAgent(Agent):
     def _initialize(self) -> None:
         """Initialize agent with transformer-based strategy recognition."""
         
-        # Auto-detect opponent observation dimension
         total_obs_dim = self.observation_space.shape[0]
         if self.opponent_obs_dim is None:
-            # Assume equal split between player and opponent observations
             self.opponent_obs_dim = total_obs_dim // 2
+        history_dim = self.sequence_length * self.opponent_obs_dim
+
+        if total_obs_dim > history_dim:
+            self.base_obs_dim = total_obs_dim - history_dim
+        else:
+            self.base_obs_dim = total_obs_dim
+        self.history_obs_dim = history_dim
+        self.expected_obs_dim = self.base_obs_dim + history_dim
+        self._reset_eval_history()
+
         debug_log(
             "agent_init",
             (
                 "TransformerStrategyAgent _initialize "
-                f"(total_obs_dim={total_obs_dim}, opponent_dim={self.opponent_obs_dim}, "
-                f"sequence_length={self.sequence_length})"
+                f"(total_obs_dim={total_obs_dim}, base_dim={self.base_obs_dim}, "
+                f"opponent_dim={self.opponent_obs_dim}, sequence_length={self.sequence_length})"
             ),
         )
-        
+
+        policy_kwargs = self.default_policy_kwargs or {
+            'activation_fn': nn.ReLU,
+            'lstm_hidden_size': 512,
+            'net_arch': dict(pi=[96, 96], vf=[96, 96]),
+            'shared_lstm': True,
+            'enable_critic_lstm': False,
+            'share_features_extractor': True,
+        }
+        policy_kwargs['features_extractor_class'] = TransformerConditionedExtractor
+        policy_kwargs['features_extractor_kwargs'] = {
+            'features_dim': 256,
+            'latent_dim': self.latent_dim,
+            'base_obs_dim': self.base_obs_dim,
+            'opponent_obs_dim': self.opponent_obs_dim,
+            'sequence_length': self.sequence_length,
+            'num_heads': self.num_heads,
+            'num_layers': self.num_layers,
+            'device': TORCH_DEVICE,
+        }
+
         if self.file_path is None:
-            # Create transformer strategy encoder with device support (MPS/CUDA/CPU)
-            self.strategy_encoder = TransformerStrategyEncoder(
-                opponent_obs_dim=self.opponent_obs_dim,
-                latent_dim=self.latent_dim,
-                num_heads=self.num_heads,
-                num_layers=self.num_layers,
-                max_sequence_length=self.sequence_length,
-                device=TORCH_DEVICE
-            )
-            debug_log("agent_init", f"Transformer encoder initialized on device: {TORCH_DEVICE}")
-            
-            # Enhanced policy kwargs with transformer conditioning
-            policy_kwargs = self.default_policy_kwargs or {
-                'activation_fn': nn.ReLU,
-                'lstm_hidden_size': 512,
-                'net_arch': dict(pi=[96, 96], vf=[96, 96]),  # Larger for strategy
-                'shared_lstm': True,
-                'enable_critic_lstm': False,
-                'share_features_extractor': True,
-            }
-            
-            # Add transformer-conditioned features extractor with device support
-            policy_kwargs['features_extractor_class'] = TransformerConditionedExtractor
-            policy_kwargs['features_extractor_kwargs'] = {
-                'features_dim': 256,
-                'latent_dim': self.latent_dim,
-                'device': TORCH_DEVICE
-            }
             debug_log(
                 "agent_init",
                 (
@@ -1018,186 +1063,142 @@ class TransformerStrategyAgent(Agent):
                     f"ent_coef={self.default_ent_coef or 0.10})"
                 ),
             )
-            
+
             self.model = RecurrentPPO(
                 "MlpLstmPolicy",
                 self.env,
                 verbose=0,
-                # Core hyperparameters (from agent config)
                 n_steps=self.default_n_steps or 2048,
                 batch_size=self.default_batch_size or 128,
                 n_epochs=self.default_n_epochs or 10,
                 learning_rate=self.default_learning_rate or 2.5e-4,
                 ent_coef=self.default_ent_coef or 0.10,
-                # Additional PPO hyperparameters
                 clip_range=self.default_clip_range or 0.2,
                 gamma=self.default_gamma or 0.99,
                 gae_lambda=self.default_gae_lambda or 0.95,
-                # Architecture
                 policy_kwargs=policy_kwargs,
-                device=TORCH_DEVICE,  # Use MPS/CUDA/CPU device
+                device=TORCH_DEVICE,
             )
             debug_log("agent_init", f"RecurrentPPO model initialized on device: {TORCH_DEVICE}")
             del self.env
         else:
-            # Load existing model with device mapping for MPS/CUDA/CPU
             self.model = RecurrentPPO.load(self.file_path, device=TORCH_DEVICE)
             print(f"✓ Loaded RecurrentPPO model from {self.file_path} to {TORCH_DEVICE}")
             debug_log("agent_init", f"Loaded existing RecurrentPPO from {self.file_path} on {TORCH_DEVICE}")
-            
-            # Try to load transformer encoder
+
+            extractor = getattr(self.model.policy, 'features_extractor', None)
             encoder_path = self.file_path.replace('.zip', '_transformer_encoder.pth')
-            if os.path.exists(encoder_path):
-                self.strategy_encoder = TransformerStrategyEncoder(
-                    opponent_obs_dim=self.opponent_obs_dim or 32,
-                    latent_dim=self.latent_dim,
-                    num_heads=self.num_heads,
-                    num_layers=self.num_layers,
-                    device=TORCH_DEVICE
-                )
-                # Load weights with proper device mapping for MPS/CUDA/CPU
+            if extractor is not None and isinstance(extractor, TransformerConditionedExtractor) and os.path.exists(encoder_path):
                 state_dict = torch.load(encoder_path, map_location=TORCH_DEVICE)
-                self.strategy_encoder.load_state_dict(state_dict)
-                print(f"✓ Loaded transformer strategy encoder from {encoder_path} to {TORCH_DEVICE}")
-                debug_log("agent_init", f"Loaded transformer encoder weights from {encoder_path} on {TORCH_DEVICE}")
-            else:
-                # Create new encoder with device support
-                self.strategy_encoder = TransformerStrategyEncoder(
-                    opponent_obs_dim=self.opponent_obs_dim or 32,
-                    latent_dim=self.latent_dim,
-                    num_heads=self.num_heads,
-                    num_layers=self.num_layers,
-                    device=TORCH_DEVICE
-                )
-                print(f"✓ Created new transformer strategy encoder on {TORCH_DEVICE}")
-                debug_log("agent_init", f"Transformer encoder weights not found; initialized new encoder on {TORCH_DEVICE}")
+                extractor.strategy_encoder.load_state_dict(state_dict)
+                print(f"✓ Loaded legacy transformer encoder from {encoder_path} to {TORCH_DEVICE}")
+                debug_log('agent_init', f"Loaded legacy transformer encoder weights from {encoder_path}")
     
+    def _reset_eval_history(self):
+        self._eval_history.clear()
+        if self.opponent_obs_dim is None:
+            return
+        zero_frame = np.zeros((self.opponent_obs_dim,), dtype=np.float32)
+        for _ in range(self.sequence_length):
+            self._eval_history.append(zero_frame.copy())
+
+    def _update_eval_history(self, opponent_obs: np.ndarray):
+        if self.opponent_obs_dim is None:
+            return
+        if opponent_obs.shape[0] != self.opponent_obs_dim:
+            raise ValueError(
+                f"Opponent observation dimension mismatch "
+                f"(expected {self.opponent_obs_dim}, got {opponent_obs.shape[0]})"
+            )
+        self._eval_history.append(opponent_obs.astype(np.float32, copy=True))
+        while len(self._eval_history) > self.sequence_length:
+            self._eval_history.popleft()
+
     def reset(self) -> None:
-        """
-        Reset for new episode - clear opponent history.
+        self.lstm_states = None
+        self.episode_starts = np.ones((1,), dtype=bool)
+        self._reset_eval_history()
+    
+    def _split_observation(self, obs: np.ndarray, *, augmented: bool) -> Tuple[np.ndarray, np.ndarray]:
+        if self.opponent_obs_dim is None:
+            raise ValueError("Opponent observation dimension is not set.")
+        if self.base_obs_dim is None:
+            raise ValueError("Base observation dimension is not set.")
         
-        🔧 FIX: Initialize with zero latent (ensures policy has valid input from frame 1).
-        """
-        self.episode_starts = True
-        self.opponent_history = []
+        base_obs = obs[:self.base_obs_dim] if augmented else obs
+        split_idx = base_obs.shape[0] - self.opponent_obs_dim
+        if split_idx < 0:
+            raise ValueError(
+                f"Observation too small to split: base_obs_dim={self.base_obs_dim}, "
+                f"opponent_obs_dim={self.opponent_obs_dim}, obs_len={len(obs)}"
+            )
+        player_obs = base_obs[:split_idx]
+        opponent_obs = base_obs[split_idx:]
+        return player_obs, opponent_obs
+
+    def _ensure_observation_shape(self, obs_batch: np.ndarray) -> np.ndarray:
+        if self.expected_obs_dim is None or self.base_obs_dim is None:
+            raise ValueError("Agent not initialized; call _initialize before predict.")
+
+        if obs_batch.shape[0] != 1:
+            raise ValueError("Batch observations not supported for manual augmentation; expected batch size 1.")
+
+        current_dim = obs_batch.shape[1]
+        if current_dim == self.expected_obs_dim:
+            for row in obs_batch:
+                _, opponent_obs = self._split_observation(row, augmented=True)
+                self._update_eval_history(opponent_obs)
+            return obs_batch.astype(np.float32, copy=False)
         
-        # Initialize with zero latent (will be updated as opponent history grows)
-        # This ensures the policy's features extractor always has a valid latent
-        self.current_strategy_latent = torch.zeros(1, self.latent_dim, device=TORCH_DEVICE)
+        if current_dim == self.base_obs_dim:
+            augmented_rows = []
+            for row in obs_batch:
+                _, opponent_obs = self._split_observation(row, augmented=False)
+                self._update_eval_history(opponent_obs)
+                history_flat = np.concatenate(list(self._eval_history), axis=0).astype(np.float32, copy=False)
+                augmented_rows.append(
+                    np.concatenate([row.astype(np.float32, copy=False), history_flat], axis=0)
+                )
+            return np.stack(augmented_rows, axis=0)
+        
+        raise ValueError(
+            f"Unexpected observation dimension {current_dim}; "
+            f"expected {self.base_obs_dim} (base) or {self.expected_obs_dim} (augmented)."
+        )
     
     def predict(self, obs):
-        """
-        Predict action with transformer-based strategy conditioning.
+        obs_array = np.array(obs, dtype=np.float32)
+        if obs_array.ndim == 1:
+            obs_array = obs_array.reshape(1, -1)
+        obs_prepared = self._ensure_observation_shape(obs_array)
         
-        Process:
-        1. Split observation into player and opponent components
-        2. Update opponent history buffer
-        3. Extract strategy latent via transformer self-attention (ALWAYS, with padding if needed)
-        4. Update policy features extractor with strategy latent
-        5. Generate strategy-conditioned action
-        
-        🔧 FIX: Strategy encoder now works from FRAME 1 (uses zero-padding for short histories)
-        """
-        # Split observation
-        player_obs, opponent_obs = self._split_observation(obs)
-        
-        # Update opponent history (rolling window)
-        self.opponent_history.append(opponent_obs)
-        if len(self.opponent_history) > self.sequence_length:
-            self.opponent_history.pop(0)
-        
-        # 🔥 CRITICAL FIX: Extract strategy latent ALWAYS (not just after 10 frames)
-        # For short histories, we'll zero-pad to minimum sequence length
-        if len(self.opponent_history) >= 1:  # Changed from >= 10
-            self._update_strategy_latent()
-            
-            # Update policy's features extractor with strategy latent
-            if hasattr(self.model.policy, 'features_extractor'):
-                extractor = self.model.policy.features_extractor
-                if hasattr(extractor, 'set_strategy_latent') and self.current_strategy_latent is not None:
-                    extractor.set_strategy_latent(self.current_strategy_latent)
-        
-        # Generate action (now conditioned on strategy)
         action, self.lstm_states = self.model.predict(
-            obs,
+            obs_prepared,
             state=self.lstm_states,
             episode_start=self.episode_starts,
             deterministic=True,
         )
         
-        if self.episode_starts:
-            self.episode_starts = False
-        
+        self.episode_starts = np.zeros_like(self.episode_starts, dtype=bool)
         return action
-    
-    def _split_observation(self, obs):
-        """
-        Split observation into player and opponent components.
-        Assumes observation structure: [player_features, opponent_features]
-        """
-        obs_array = np.array(obs)
-        mid = len(obs_array) // 2
-        player_obs = obs_array[:mid]
-        opponent_obs = obs_array[mid:]
-        return player_obs, opponent_obs
-    
-    def _update_strategy_latent(self):
-        """
-        Extract strategy latent using transformer self-attention.
-        Discovers patterns in opponent behavior automatically.
-        
-        🔧 FIX: Now handles SHORT sequences (< 10 frames) with zero-padding.
-        This allows strategy conditioning from FRAME 1 instead of waiting for 10+ frames.
-        """
-        # Get current history
-        history_array = np.array(self.opponent_history)  # [seq_len, obs_dim]
-        current_len = len(self.opponent_history)
-        
-        # 🔥 REPEAT-PADDING for short sequences (maintains valid opponent info)
-        # For sequences < 10 frames, repeat the available history to reach min length
-        # This preserves opponent information instead of using meaningless zeros
-        min_seq_len = 10  # Increased from 5 (transformer needs meaningful context)
-        if current_len < min_seq_len:
-            # Repeat the available frames to fill the sequence
-            # E.g., [A, B, C] -> [A, B, C, A, B, C, A, B, C, A] for min_seq_len=10
-            repeats_needed = (min_seq_len + current_len - 1) // current_len
-            history_array = np.tile(history_array, (repeats_needed, 1))[:min_seq_len]
-        
-        # Convert to tensor [1, seq_len, obs_dim] on the correct device
-        history_tensor = torch.tensor(
-            history_array,
-            dtype=torch.float32,
-            device=TORCH_DEVICE
-        ).unsqueeze(0)  # Add batch dimension
-        
-        # Extract latent via transformer (already on correct device)
-        with torch.no_grad():
-            latent_tensor = self.strategy_encoder(history_tensor)
-        
-        self.current_strategy_latent = latent_tensor
-        
-        if DEBUG_FLAGS.get("strategy_latent", False):
-            latent_norm = torch.norm(latent_tensor, p=2).item()
-            debug_log(
-                "strategy_latent",
-                f"Updated latent (history_len={current_len}, padded={current_len<min_seq_len}, norm={latent_norm:.4f})",
-            )
     
     def get_strategy_latent_info(self) -> Dict[str, any]:
         """
         Get information about current strategy latent.
         Useful for debugging and analysis.
         """
-        if self.current_strategy_latent is None:
-            return {'latent': None, 'norm': 0, 'history_length': 0}
+        extractor = getattr(self.model.policy, "features_extractor", None)
+        latent_tensor = getattr(extractor, "last_strategy_latent", None) if extractor else None
+        if latent_tensor is None:
+            return {'latent': None, 'norm': 0.0, 'history_length': len(self._eval_history)}
         
-        latent_numpy = self.current_strategy_latent.cpu().numpy()
+        latent_numpy = latent_tensor.detach().cpu().numpy()
         latent_norm = np.linalg.norm(latent_numpy)
         
         return {
             'latent': latent_numpy,
             'norm': float(latent_norm),
-            'history_length': len(self.opponent_history),
+            'history_length': len(self._eval_history),
         }
     
     def visualize_attention(self, obs) -> Dict:
@@ -1205,18 +1206,22 @@ class TransformerStrategyAgent(Agent):
         Extract attention weights for visualization.
         Shows which frames the transformer focuses on.
         """
-        if len(self.opponent_history) < 10:
+        extractor = getattr(self.model.policy, "features_extractor", None)
+        if extractor is None or not hasattr(extractor, "strategy_encoder"):
             return {}
         
-        history_array = np.array(self.opponent_history)
+        if len(self._eval_history) < self.sequence_length:
+            return {}
+        
+        history_array = np.stack(list(self._eval_history), axis=0)
         history_tensor = torch.tensor(
             history_array,
             dtype=torch.float32,
-            device=TORCH_DEVICE  # Ensure tensor is on MPS/CUDA/CPU
+            device=TORCH_DEVICE
         ).unsqueeze(0)
         
         with torch.no_grad():
-            strategy_latent, attention_info = self.strategy_encoder(
+            _, attention_info = extractor.strategy_encoder(
                 history_tensor,
                 return_attention=True
             )
@@ -1227,15 +1232,14 @@ class TransformerStrategyAgent(Agent):
         }
     
     def save(self, file_path: str) -> None:
-        """Save both PPO model and transformer encoder."""
-        # Save main PPO model
+        """Save PPO model and export transformer weights for compatibility."""
         self.model.save(file_path)
-        
-        # Save transformer encoder separately
-        if self.strategy_encoder is not None:
+
+        extractor = getattr(self.model.policy, 'features_extractor', None)
+        if extractor is not None and hasattr(extractor, 'strategy_encoder'):
             encoder_path = file_path.replace('.zip', '_transformer_encoder.pth')
-            torch.save(self.strategy_encoder.state_dict(), encoder_path)
-            print(f"Saved transformer strategy encoder to {encoder_path}")
+            torch.save(extractor.strategy_encoder.state_dict(), encoder_path)
+            debug_log('agent_init', f'Transformer encoder weights saved to {encoder_path}')
     
     def learn(self, env, total_timesteps, log_interval: int = 2, verbose=0, callback=None):
         """
@@ -1950,35 +1954,22 @@ class TransformerHealthMonitor:
         if not isinstance(agent, TransformerStrategyAgent):
             return
         
-        # Get latent vector norm (is encoder producing meaningful outputs?)
-        if agent.current_strategy_latent is not None:
-            norm = torch.norm(agent.current_strategy_latent, p=2).item()
+        extractor = getattr(agent.model.policy, "features_extractor", None)
+        if extractor is None:
+            return
+
+        if extractor.last_strategy_latent is not None:
+            norm = torch.norm(extractor.last_strategy_latent, p=2).item()
             self.latent_norms.append(norm)
-        
-        # Get attention entropy (is transformer focusing or diffuse?)
-        if len(agent.opponent_history) >= 10:
+
+        if extractor.last_attention is not None:
             try:
-                history_array = np.array(agent.opponent_history)
-                history_tensor = torch.tensor(
-                    history_array, 
-                    dtype=torch.float32, 
-                    device=TORCH_DEVICE
-                ).unsqueeze(0)
-                
-                with torch.no_grad():
-                    _, attention_info = agent.strategy_encoder(
-                        history_tensor, 
-                        return_attention=True
-                    )
-                    
-                    # Calculate entropy of pooling attention
-                    attn_weights = attention_info['pooling_attention'].squeeze().cpu().numpy()
-                    # Entropy: -sum(p * log(p))
-                    attn_weights = attn_weights + 1e-10  # Avoid log(0)
-                    entropy = -np.sum(attn_weights * np.log(attn_weights))
-                    self.attention_entropies.append(entropy)
-            except:
-                pass  # Silent fail - don't disrupt training
+                attn_weights = extractor.last_attention.squeeze().detach().cpu().numpy()
+                attn_weights = attn_weights + 1e-10
+                entropy = -np.sum(attn_weights * np.log(attn_weights))
+                self.attention_entropies.append(entropy)
+            except Exception:
+                pass
     
     def get_stats(self) -> Dict[str, float]:
         """Get current health statistics."""
@@ -2299,8 +2290,8 @@ class PerformanceBenchmark:
             dense_total = 0.0
             sparse_total = 0.0
 
-            for step_data in recent_rewards:
-                for term_name, value in step_data.items():
+            for _, breakdown in recent_rewards:
+                for term_name, value in breakdown.items():
                     if term_name in ['head_to_opponent', 'on_attack_button_press']:
                         dense_total += abs(value)
                     elif term_name in ['damage_interaction_reward', 'on_win_reward', 'on_knockout_reward']:
@@ -2466,6 +2457,8 @@ class PerformanceBenchmark:
         """Run matches and return results."""
         results = []
         for _ in range(num_matches):
+            if hasattr(agent, 'reset'):
+                agent.reset()
             match_stats = env_run_match(
                 agent,
                 opponent_factory,
@@ -2510,8 +2503,9 @@ class PerformanceBenchmark:
         if not isinstance(agent, TransformerStrategyAgent):
             return
 
-        if agent.current_strategy_latent is not None:
-            latent_numpy = agent.current_strategy_latent.cpu().detach().numpy().flatten()
+        extractor = getattr(agent.model.policy, "features_extractor", None)
+        if extractor is not None and extractor.last_strategy_latent is not None:
+            latent_numpy = extractor.last_strategy_latent.detach().cpu().numpy().flatten()
             self.recent_latent_vectors.append(latent_numpy)
 
         # Update transformer health monitor
@@ -2771,6 +2765,8 @@ class TrainingMonitorCallback(BaseCallback):
         
         for i in range(self.eval_matches):
             try:
+                if hasattr(self.agent, "reset"):
+                    self.agent.reset()
                 match_stats = env_run_match(
                     self.agent,
                     partial(BasedAgent),
@@ -3035,14 +3031,26 @@ def run_training_loop(
     from environment.agent import SelfPlayWarehouseBrawl
     from stable_baselines3.common.monitor import Monitor
     
-    env = SelfPlayWarehouseBrawl(
+    base_env = SelfPlayWarehouseBrawl(
         reward_manager=reward_manager,
         opponent_cfg=opponent_cfg,
         save_handler=save_handler,
         resolution=resolution
     )
-    reward_manager.subscribe_signals(env.raw_env)
-    
+    reward_manager.subscribe_signals(base_env.raw_env)
+
+    env: gym.Env = base_env
+    if isinstance(agent, TransformerStrategyAgent):
+        opponent_obs_dim = agent.opponent_obs_dim
+        if opponent_obs_dim is None:
+            opponent_obs_dim = base_env.observation_space.shape[0] // 2
+            agent.opponent_obs_dim = opponent_obs_dim
+        env = OpponentHistoryWrapper(
+            base_env,
+            opponent_obs_dim=opponent_obs_dim,
+            sequence_length=agent.sequence_length,
+        )
+
     if train_logging != TrainLogging.NONE:
         # Create log dir
         log_dir = f"{save_handler._experiment_path()}/" if save_handler is not None else "/tmp/gym/"
@@ -3134,7 +3142,7 @@ def main() -> None:
     # Display device information at start
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
-    print("ELLIOT TESTING10")
+    print("ELLIOT TESTING21")
     
     # Check if monitoring is enabled
     training_cfg = TRAIN_CONFIG.get("training", {})

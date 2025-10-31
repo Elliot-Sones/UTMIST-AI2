@@ -368,22 +368,24 @@ _SHARED_AGENT_CONFIG = {
         "share_features_extractor": True,     # Share feature extraction
     },
     
-    # PPO training hyperparameters (OPTIMIZED FOR LEARNING FREQUENCY)
-    # 
-    # Learning Update Frequency Calculation:
-    # - n_steps = 2048 (rollout buffer size)
-    # - For 50k training: 50,000 / 2,048 = ~24 learning updates
-    # - For 10M training: 10,000,000 / 2,048 = ~4,883 learning updates
-    # - Each update does 10 gradient epochs (n_epochs=10)
-    # - Total gradient updates: 24*10=240 (50k) or 4,883*10=48,830 (10M)
+    # PPO training hyperparameters (OPTIMIZED FOR COMBAT GAME LEARNING)
     #
-    # This ensures FREQUENT LEARNING throughout training (every ~2k steps)
-    # vs previous n_steps=54,000 which only allowed 1 update per 50k run!
-    "n_steps": 2048,             # Rollout buffer size (balance memory & frequency)
-    "batch_size": 128,           # Mini-batch size for gradient updates
-                                 # n_steps / batch_size = 2048/128 = 16 batches per update
+    # Learning Update Frequency Calculation:
+    # - n_steps = 512 (rollout buffer size - REDUCED for frequent updates)
+    # - For 50k training: 50,000 / 512 = ~98 learning updates (4x more than before!)
+    # - For 10M training: 10,000,000 / 512 = ~19,531 learning updates
+    # - Each update does 10 gradient epochs (n_epochs=10)
+    # - Total gradient updates: 98*10=980 (50k) or 19,531*10=195,310 (10M)
+    #
+    # WHY 512 instead of 2048?
+    # - Combat game needs FAST reward feedback (damage, knockouts)
+    # - Shorter rollouts = more frequent policy updates = faster learning
+    # - Agent sees updated policy every ~17 seconds (512 steps / 30 FPS)
+    "n_steps": 512,              # Rollout buffer size (optimized for fast learning)
+    "batch_size": 64,            # Mini-batch size for gradient updates
+                                 # n_steps / batch_size = 512/64 = 8 batches per update
     "n_epochs": 10,              # Gradient epochs per rollout (standard PPO)
-    "ent_coef": 0.10,            # Entropy coefficient (encourage exploration)
+    "ent_coef": 0.15,            # Entropy coefficient (INCREASED for attack exploration)
     "learning_rate": 2.5e-4,     # Learning rate (standard PPO, works well with Adam)
     "clip_range": 0.2,           # PPO clip range (prevent large policy changes)
     "gamma": 0.99,               # Discount factor (value long-term rewards)
@@ -401,24 +403,62 @@ TRAIN_CONFIG_10M: Dict[str, dict] = {
     "agent": _SHARED_AGENT_CONFIG.copy(),
     "reward": _SHARED_REWARD_CONFIG.copy(),
     "self_play": {
-        "run_name": "transformer_10M_t4",  # Experiment name
-        "save_freq": 100_000,              # Save checkpoint every 100k steps
-        "max_saved": 100,                  # Keep last 100 checkpoints (10M worth)
-        "mode": SaveHandlerMode.FORCE,     # Always save at intervals
-        
-        # Self-play opponent mix (with self-play enabled)
+        "run_name": "competition_10M_final",  # COMPETITION AGENT
+        "save_freq": 50_000,               # Save every 50k (200 checkpoints total)
+        "max_saved": 200,                  # Keep ALL checkpoints for diverse opponent pool
+        "mode": SaveHandlerMode.FORCE,
+
+        # COMPETITION opponent mix (maximize strategy diversity)
         "opponent_mix": {
-            "self_play": (8.0, None),              # 80% self-play vs past snapshots
-            "based_agent": (1.5, partial(BasedAgent)),  # 15% scripted opponent
-            "ClockworkAgent": (0.5, partial(ClockworkAgent)),  # 5% random baseline
+            "self_play": (7.0, None),                      # 70% self-play (learn counter-strategies)
+            "based_agent": (2.0, partial(BasedAgent)),     # 20% scripted (learn fundamentals)
+            "clockwork_agent": (0.5, partial(ClockworkAgent)),  # 5% predictable patterns
+            "random_agent": (0.5, partial(RandomAgent)),   # 5% chaos (robustness)
         },
-        "handler": SelfPlayRandom,  # Randomly sample from past snapshots
+        "handler": SelfPlayRandom,  # Randomly sample from 200-checkpoint opponent pool
     },
     "training": {
         "resolution": CameraResolution.LOW,
         "timesteps": 10_000_000,   # 10 million timesteps (~10-12 hours on T4)
         "logging": TrainLogging.PLOT,
-        "enable_debug": False,     # Disable debug mode for full training
+
+        # Light monitoring for 10M (balance insight vs speed)
+        "enable_debug": True,
+        "eval_freq": 100_000,      # Evaluate every 100k steps
+        "eval_episodes": 5,        # 5 matches per evaluation
+        "light_log_freq": 5000,    # Log every 5k steps (lower overhead)
+    },
+}
+
+# ============ DEBUG RUN: RAPID VALIDATION (5K STEPS) ============
+# Goal: Verify agent ATTACKS and DEALS DAMAGE (not passive)
+# Success criteria: damage_dealt > 0 after 5k steps
+# Run this FIRST before any curriculum training!
+TRAIN_CONFIG_DEBUG: Dict[str, dict] = {
+    "agent": _SHARED_AGENT_CONFIG.copy(),
+    "reward": _SHARED_REWARD_CONFIG.copy(),
+    "self_play": {
+        "run_name": "debug_5k_attack_test",  # Debug checkpoint folder
+        "save_freq": 2500,                    # Save at 2.5k and 5k
+        "max_saved": 2,                       # Keep only last 2
+        "mode": SaveHandlerMode.FORCE,
+
+        # 100% ConstantAgent - simplest opponent to validate attacking
+        "opponent_mix": {
+            "constant_agent": (1.0, partial(ConstantAgent)),
+        },
+        "handler": SelfPlayRandom,
+    },
+    "training": {
+        "resolution": CameraResolution.LOW,
+        "timesteps": 5_000,        # FAST: 5k steps (~2-3 minutes on T4)
+        "logging": TrainLogging.PLOT,
+
+        # AGGRESSIVE monitoring for debug
+        "enable_debug": True,
+        "eval_freq": 2_500,        # Evaluate at 2.5k and 5k
+        "eval_episodes": 3,
+        "light_log_freq": 100,     # Log every 100 steps (high frequency)
     },
 }
 
@@ -443,14 +483,14 @@ TRAIN_CONFIG_CURRICULUM: Dict[str, dict] = {
     },
     "training": {
         "resolution": CameraResolution.LOW,
-        "timesteps": 50_000,       # 50k timesteps (~15 minutes)
+        "timesteps": 50_000,       # 50k timesteps (~15 minutes on T4)
         "logging": TrainLogging.PLOT,
-        
+
         # Heavy monitoring for curriculum stage
         "enable_debug": True,
-        "eval_freq": 5_000,        # Evaluate every 5k steps (10 times total)
+        "eval_freq": 10_000,       # Evaluate every 10k steps (5 times total)
         "eval_episodes": 5,        # Run 5 matches per evaluation (more samples)
-        "light_log_freq": 250,     # Log every 250 steps (higher frequency)
+        "light_log_freq": 500,     # Log every 500 steps (balanced frequency)
     },
 }
 
@@ -524,23 +564,42 @@ TRAIN_CONFIG_TEST: Dict[str, dict] = {
 }
 
 # ============ SWITCH CONFIGURATION HERE ============
-# TRAINING PIPELINE (run in order):
-# 1. TRAIN_CONFIG_CURRICULUM         → Learn basic combat (beat ConstantAgent)
-# 2. TRAIN_CONFIG_CURRICULUM_STAGE2  → Learn vs scripted AI (beat BasedAgent) 
-# 3. TRAIN_CONFIG_TEST               → Test self-play stability
-# 4. TRAIN_CONFIG_10M                → Full 10M production training
+# COMPETITION TRAINING PIPELINE (run in order):
+#
+# 🔥 STEP 0: DEBUG RUN (2-3 minutes on T4)
+#    TRAIN_CONFIG_DEBUG → Verify agent attacks and deals damage (not passive)
+#    Success: damage_dealt > 0, attack_button_presses > 0
+#
+# 🎯 STEP 1: CURRICULUM STAGE 1 (15 minutes on T4)
+#    TRAIN_CONFIG_CURRICULUM → Beat ConstantAgent reliably
+#    Success: 90%+ win rate, consistent damage output
+#
+# 🎯 STEP 2: CURRICULUM STAGE 2 (15 minutes on T4)
+#    TRAIN_CONFIG_CURRICULUM_STAGE2 → Beat BasedAgent (heuristic AI)
+#    Success: 60%+ win rate, adapts to scripted patterns
+#
+# 🎯 STEP 3: SELF-PLAY TEST (15 minutes on T4)
+#    TRAIN_CONFIG_TEST → Validate self-play with growing opponent pool
+#    Success: 40%+ win rate, stable learning with diverse opponents
+#
+# 🏆 STEP 4: COMPETITION TRAINING (10-12 hours on T4)
+#    TRAIN_CONFIG_10M → Full 10M adversarial self-play
+#    Goal: Create agent that beats ANY opponent strategy
 
-# START HERE: Curriculum Stage 1 (validate reward function)
-TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # 🎯 ACTIVE: Learn to beat ConstantAgent
+# ⚠️ START HERE: Run DEBUG first to validate all fixes!
+TRAIN_CONFIG = TRAIN_CONFIG_DEBUG  # 🚨 ACTIVE: 5k debug run (verify attacking)
 
-# After Stage 1 success (90%+ win rate), uncomment next stage:
-# TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM_STAGE2  # Stage 2: Beat BasedAgent
+# After debug success (damage > 0), uncomment curriculum:
+# TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # Stage 1: Beat ConstantAgent (90%+ win)
 
-# After Stage 2 success (60%+ win rate), test self-play:
-# TRAIN_CONFIG = TRAIN_CONFIG_TEST  # Test self-play with 70% self-play mix
+# After Stage 1, uncomment Stage 2:
+# TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM_STAGE2  # Stage 2: Beat BasedAgent (60%+ win)
 
-# After test validation, run full training:
-# TRAIN_CONFIG = TRAIN_CONFIG_10M   # Production: 10M timesteps on T4 GPU
+# After Stage 2, test self-play:
+# TRAIN_CONFIG = TRAIN_CONFIG_TEST  # Self-play validation (40%+ win rate)
+
+# After validation, run COMPETITION training:
+# TRAIN_CONFIG = TRAIN_CONFIG_10M   # 🏆 FINAL: 10M competition agent
 
 
 
@@ -1094,14 +1153,15 @@ class TransformerStrategyAgent(Agent):
         history_array = np.array(self.opponent_history)  # [seq_len, obs_dim]
         current_len = len(self.opponent_history)
         
-        # 🔥 ZERO-PADDING for short sequences (enables early strategy extraction)
-        # Minimum sequence length for transformer (avoid extreme short sequences)
-        min_seq_len = 5
+        # 🔥 REPEAT-PADDING for short sequences (maintains valid opponent info)
+        # For sequences < 10 frames, repeat the available history to reach min length
+        # This preserves opponent information instead of using meaningless zeros
+        min_seq_len = 10  # Increased from 5 (transformer needs meaningful context)
         if current_len < min_seq_len:
-            # Pad with zeros at the beginning
-            obs_dim = history_array.shape[1]
-            padding = np.zeros((min_seq_len - current_len, obs_dim), dtype=np.float32)
-            history_array = np.vstack([padding, history_array])  # [min_seq_len, obs_dim]
+            # Repeat the available frames to fill the sequence
+            # E.g., [A, B, C] -> [A, B, C, A, B, C, A, B, C, A] for min_seq_len=10
+            repeats_needed = (min_seq_len + current_len - 1) // current_len
+            history_array = np.tile(history_array, (repeats_needed, 1))[:min_seq_len]
         
         # Convert to tensor [1, seq_len, obs_dim] on the correct device
         history_tensor = torch.tensor(
@@ -1670,31 +1730,32 @@ def gen_reward_manager():
     reward_functions = {
         # PRIMARY REWARD: Landing damage on opponent (MASSIVE POSITIVE)
         'damage_interaction_reward': RewTerm(
-            func=damage_interaction_reward, 
-            weight=150.0,  # 🔥 3x increase - make damage THE goal
+            func=damage_interaction_reward,
+            weight=200.0,  # 🔥 COMPETITION MODE: Make damage supremely valuable
             params={'mode': RewardMode.SYMMETRIC}  # Reward damage dealt, penalize damage taken
         ),
-        
+
         # SAFETY: Discourage getting knocked off (but don't over-penalize)
         'danger_zone_reward': RewTerm(
-            func=danger_zone_reward, 
-            weight=2.0,  # ✅ FIXED: Positive weight (function returns negative value)
+            func=danger_zone_reward,
+            weight=2.0,  # Light penalty (function returns negative value)
             params={'zone_penalty': 1, 'zone_height': 4.2}
         ),
-        
+
         # ENGAGEMENT: Encourage moving toward opponent (overcome passivity)
         'head_to_opponent': RewTerm(
-            func=head_to_opponent, 
-            weight=5.0  # 🔥 50x increase: FORCE agent to engage! (was 0.1)
-                         # Agent MUST get close to opponent to learn that attacking works
+            func=head_to_opponent,
+            weight=10.0  # 🔥 DOUBLED: Agent MUST close distance to attack
+                         # This fires every frame, so keep it moderate vs damage (200)
         ),
-        
+
         # 🔥 EXPLORATION: Reward pressing attack buttons (breaks zero-damage deadlock)
         'on_attack_button_press': RewTerm(
             func=on_attack_button_press,
-            weight=2.0  # Small reward for pressing j (light) or k (heavy) attack
-                        # Once agent starts attacking, damage_interaction_reward (150) takes over
-                        # This is TEMPORARY - reduce/remove once agent learns to attack consistently
+            weight=5.0  # 🚀 INCREASED: Strong exploration signal to discover attacking
+                        # This is CRITICAL for initial learning (first 10k steps)
+                        # Once agent attacks consistently (50+ damage), this becomes noise
+                        # But damage_interaction_reward (200) will dominate by then
         ),
         
         # CLEANUP: Discourage button mashing (but keep light)
@@ -2602,7 +2663,7 @@ def main() -> None:
     # Display device information at start
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
-    print("ELLIOT TESTING3")
+    print("ELLIOT TESTING4")
     
     # Check if monitoring is enabled
     training_cfg = TRAIN_CONFIG.get("training", {})

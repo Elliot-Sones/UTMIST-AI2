@@ -982,15 +982,21 @@ def plot_results(log_folder, title="Learning Curve"):
     :param title: (str) the title of the task to plot
     """
     x, y = ts2xy(load_results(log_folder), "timesteps")
+    if len(y) == 0:
+        print("No training data to plot yet.")
+        return
 
-    weights = np.repeat(1.0, 50) / 50
-    print(weights, y)
-    y = np.convolve(y, weights, "valid")
-    # Truncate x
-    x = x[len(x) - len(y) :]
+    window = min(len(y), 50)
+    if window <= 1:
+        y_smooth = y
+        x_smooth = x
+    else:
+        weights = np.ones(window, dtype=float) / window
+        y_smooth = np.convolve(y, weights, mode="valid")
+        x_smooth = x[len(x) - len(y_smooth) :]
 
     fig = plt.figure(title)
-    plt.plot(x, y)
+    plt.plot(x_smooth, y_smooth)
     plt.xlabel("Number of Timesteps")
     plt.ylabel("Rewards")
     plt.title(title + " Smoothed")

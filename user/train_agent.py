@@ -342,11 +342,7 @@ def attach_opponent_debug(opponent_cfg: OpponentsCfg) -> OpponentsCfg:
 # --------------------------------------------------------------------------------
 # Centralised knobs for experiments; update these values to change training behaviour.
 
-# ============================================================================
-# TRAINING CONFIGURATIONS - FOLLOWING SCALING LAWS
-# ============================================================================
-# All configurations use IDENTICAL hyperparameters for proper scaling behavior
-# Only timesteps and checkpoint frequencies differ between test and full training
+
 
 # ------------ SHARED HYPERPARAMETERS (DO NOT MODIFY INDIVIDUALLY) ------------
 # These hyperparameters are identical across all configs to ensure scaling laws hold
@@ -371,14 +367,26 @@ _SHARED_AGENT_CONFIG = {
         "share_features_extractor": True,     # Share feature extraction
     },
     
-    # PPO training hyperparameters
-    "n_steps": 2048,             # 🔧 FIXED: Was 54,000 (too large for 50k training!)
-                                 # Now 2048 = standard PPO rollout size
-                                 # Allows ~24 learning updates during 50k training
-    "batch_size": 128,           # Batch size (safe for T4 16GB VRAM)
-    "n_epochs": 10,              # Gradient epochs per rollout
-    "ent_coef": 0.10,            # Entropy coefficient (exploration)
-    "learning_rate": 2.5e-4,     # Learning rate (standard PPO)
+    # PPO training hyperparameters (OPTIMIZED FOR LEARNING FREQUENCY)
+    # 
+    # Learning Update Frequency Calculation:
+    # - n_steps = 2048 (rollout buffer size)
+    # - For 50k training: 50,000 / 2,048 = ~24 learning updates
+    # - For 10M training: 10,000,000 / 2,048 = ~4,883 learning updates
+    # - Each update does 10 gradient epochs (n_epochs=10)
+    # - Total gradient updates: 24*10=240 (50k) or 4,883*10=48,830 (10M)
+    #
+    # This ensures FREQUENT LEARNING throughout training (every ~2k steps)
+    # vs previous n_steps=54,000 which only allowed 1 update per 50k run!
+    "n_steps": 2048,             # Rollout buffer size (balance memory & frequency)
+    "batch_size": 128,           # Mini-batch size for gradient updates
+                                 # n_steps / batch_size = 2048/128 = 16 batches per update
+    "n_epochs": 10,              # Gradient epochs per rollout (standard PPO)
+    "ent_coef": 0.10,            # Entropy coefficient (encourage exploration)
+    "learning_rate": 2.5e-4,     # Learning rate (standard PPO, works well with Adam)
+    "clip_range": 0.2,           # PPO clip range (prevent large policy changes)
+    "gamma": 0.99,               # Discount factor (value long-term rewards)
+    "gae_lambda": 0.95,          # GAE lambda (balance bias-variance in advantage)
 }
 
 _SHARED_REWARD_CONFIG = {
@@ -401,7 +409,7 @@ TRAIN_CONFIG_10M: Dict[str, dict] = {
         "opponent_mix": {
             "self_play": (8.0, None),              # 80% self-play vs past snapshots
             "based_agent": (1.5, partial(BasedAgent)),  # 15% scripted opponent
-            "constant_agent": (0.5, partial(ConstantAgent)),  # 5% random baseline
+            "ClockworkAgent": (0.5, partial(ClockworkAgent)),  # 5% random baseline
         },
         "handler": SelfPlayRandom,  # Randomly sample from past snapshots
     },
@@ -413,43 +421,125 @@ TRAIN_CONFIG_10M: Dict[str, dict] = {
     },
 }
 
-# ============ 50K TEST CONFIGURATION (SCALING LAW TEST) ============
-# Quick test run following 1:200 scaling ratio to validate configuration
-# Estimated time on T4: ~15 minutes
-# If this works well, 10M training will work identically (just 200x longer)
-TRAIN_CONFIG_TEST: Dict[str, dict] = {
+# ============ CURRICULUM STAGE 1: LEARN BASIC COMBAT (50K) ============
+# Goal: Agent must learn to beat ConstantAgent (stationary target) reliably
+# Success criteria: 90%+ win rate vs ConstantAgent, positive damage ratio
+# This validates reward function before proceeding to harder opponents
+TRAIN_CONFIG_CURRICULUM: Dict[str, dict] = {
     "agent": _SHARED_AGENT_CONFIG.copy(),
     "reward": _SHARED_REWARD_CONFIG.copy(),
     "self_play": {
-        "run_name": "test_50k_t4",         # Separate folder for test runs
-        "save_freq": 5_000,                # Save every 5k steps (10 checkpoints total)
-        "max_saved": 10,                   # Keep last 10 checkpoints
+        "run_name": "curriculum_basic_combat",  # Stage 1 checkpoint folder
+        "save_freq": 5_000,                     # Save every 5k steps
+        "max_saved": 10,                        # Keep last 10 checkpoints
         "mode": SaveHandlerMode.FORCE,
         
-        # Same opponent mix as 10M (CRITICAL for scaling laws)
+        # 100% ConstantAgent - learn to attack stationary target
         "opponent_mix": {
-            "self_play": (8.0, None),              # 80% self-play vs past snapshots
-            "based_agent": (1.5, partial(BasedAgent)),  # 15% scripted opponent
-            "constant_agent": (0.5, partial(ConstantAgent)),  # 5% random baseline
+            "constant_agent": (1.0, partial(ConstantAgent)),  # 100% easy target
         },
         "handler": SelfPlayRandom,
     },
     "training": {
         "resolution": CameraResolution.LOW,
-        "timesteps": 50_000,       # 50k timesteps (1:200 ratio, ~15 minutes)
+        "timesteps": 50_000,       # 50k timesteps (~15 minutes)
+        "logging": TrainLogging.PLOT,
+        
+        # Heavy monitoring for curriculum stage
+        "enable_debug": True,
+        "eval_freq": 5_000,        # Evaluate every 5k steps (10 times total)
+        "eval_episodes": 5,        # Run 5 matches per evaluation (more samples)
+        "light_log_freq": 250,     # Log every 250 steps (higher frequency)
+    },
+}
+
+# ============ CURRICULUM STAGE 2: SCRIPTED OPPONENTS (50K) ============
+# Goal: Agent must learn to beat BasedAgent (heuristic AI)
+# Success criteria: 60%+ win rate vs BasedAgent
+# Assumes Stage 1 checkpoint as starting point
+TRAIN_CONFIG_CURRICULUM_STAGE2: Dict[str, dict] = {
+    "agent": {
+        **_SHARED_AGENT_CONFIG.copy(),
+        "load_path": None,  # Set this to Stage 1 checkpoint path when running
+    },
+    "reward": _SHARED_REWARD_CONFIG.copy(),
+    "self_play": {
+        "run_name": "curriculum_scripted",
+        "save_freq": 5_000,
+        "max_saved": 10,
+        "mode": SaveHandlerMode.FORCE,
+        
+        # 70% BasedAgent, 30% ConstantAgent (maintain basic skills)
+        "opponent_mix": {
+            "based_agent": (7.0, partial(BasedAgent)),        # 70% harder opponent
+            "constant_agent": (3.0, partial(ConstantAgent)),  # 30% easy (retain skills)
+        },
+        "handler": SelfPlayRandom,
+    },
+    "training": {
+        "resolution": CameraResolution.LOW,
+        "timesteps": 50_000,
+        "logging": TrainLogging.PLOT,
+        "enable_debug": True,
+        "eval_freq": 5_000,
+        "eval_episodes": 5,
+    },
+}
+
+# ============ 50K TEST CONFIGURATION (SELF-PLAY TEST) ============
+# Goal: Test self-play stability and opponent diversity
+# Run AFTER curriculum stages to validate full pipeline
+# Success criteria: Win rate stays above 40% as opponent pool grows
+TRAIN_CONFIG_TEST: Dict[str, dict] = {
+    "agent": {
+        **_SHARED_AGENT_CONFIG.copy(),
+        "load_path": None,  # Set this to Stage 2 checkpoint when running
+    },
+    "reward": _SHARED_REWARD_CONFIG.copy(),
+    "self_play": {
+        "run_name": "test_50k_selfplay",   # Test self-play mechanism
+        "save_freq": 5_000,                # Save every 5k steps (10 snapshots)
+        "max_saved": 10,                   # Keep last 10 checkpoints
+        "mode": SaveHandlerMode.FORCE,
+        
+        # Full opponent mix (validates self-play)
+        "opponent_mix": {
+            "self_play": (7.0, None),                      # 70% self-play
+            "based_agent": (2.0, partial(BasedAgent)),     # 20% scripted
+            "constant_agent": (1.0, partial(ConstantAgent)),  # 10% baseline
+        },
+        "handler": SelfPlayRandom,
+    },
+    "training": {
+        "resolution": CameraResolution.LOW,
+        "timesteps": 50_000,       # 50k timesteps (1:200 ratio)
         "logging": TrainLogging.PLOT,
         
         # Enhanced debugging for test runs
-        "enable_debug": True,      # Enable reward tracking, behavior metrics, etc.
-        "eval_freq": 10_000,       # Evaluate every 10k steps (5 times total)
+        "enable_debug": True,
+        "eval_freq": 10_000,       # Evaluate every 10k steps
         "eval_episodes": 3,        # Run 3 matches per evaluation
     },
 }
 
 # ============ SWITCH CONFIGURATION HERE ============
-# Toggle between test and full training
-# TRAIN_CONFIG = TRAIN_CONFIG_10M    # For full 10M training on T4 GPU
-TRAIN_CONFIG = TRAIN_CONFIG_TEST   # For fast 50k test runs
+# TRAINING PIPELINE (run in order):
+# 1. TRAIN_CONFIG_CURRICULUM         → Learn basic combat (beat ConstantAgent)
+# 2. TRAIN_CONFIG_CURRICULUM_STAGE2  → Learn vs scripted AI (beat BasedAgent) 
+# 3. TRAIN_CONFIG_TEST               → Test self-play stability
+# 4. TRAIN_CONFIG_10M                → Full 10M production training
+
+# START HERE: Curriculum Stage 1 (validate reward function)
+TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # 🎯 ACTIVE: Learn to beat ConstantAgent
+
+# After Stage 1 success (90%+ win rate), uncomment next stage:
+# TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM_STAGE2  # Stage 2: Beat BasedAgent
+
+# After Stage 2 success (60%+ win rate), test self-play:
+# TRAIN_CONFIG = TRAIN_CONFIG_TEST  # Test self-play with 70% self-play mix
+
+# After test validation, run full training:
+# TRAIN_CONFIG = TRAIN_CONFIG_10M   # Production: 10M timesteps on T4 GPU
 
 
 
@@ -802,11 +892,16 @@ class TransformerStrategyAgent(Agent):
         # Transformer strategy encoder (initialized in _initialize)
         self.strategy_encoder = None
         
-        # Default hyperparameters
+        # Default hyperparameters (set by create_learning_agent)
         self.default_policy_kwargs: Optional[dict] = None
         self.default_n_steps: Optional[int] = None
         self.default_batch_size: Optional[int] = None
+        self.default_n_epochs: Optional[int] = None
+        self.default_learning_rate: Optional[float] = None
         self.default_ent_coef: Optional[float] = None
+        self.default_clip_range: Optional[float] = None
+        self.default_gamma: Optional[float] = None
+        self.default_gae_lambda: Optional[float] = None
     
     def _initialize(self) -> None:
         """Initialize agent with transformer-based strategy recognition."""
@@ -868,9 +963,17 @@ class TransformerStrategyAgent(Agent):
                 "MlpLstmPolicy",
                 self.env,
                 verbose=0,
-                n_steps=self.default_n_steps or 30*90*20,
+                # Core hyperparameters (from agent config)
+                n_steps=self.default_n_steps or 2048,
                 batch_size=self.default_batch_size or 128,
+                n_epochs=self.default_n_epochs or 10,
+                learning_rate=self.default_learning_rate or 2.5e-4,
                 ent_coef=self.default_ent_coef or 0.10,
+                # Additional PPO hyperparameters
+                clip_range=self.default_clip_range or 0.2,
+                gamma=self.default_gamma or 0.99,
+                gae_lambda=self.default_gae_lambda or 0.95,
+                # Architecture
                 policy_kwargs=policy_kwargs,
                 device=TORCH_DEVICE,  # Use MPS/CUDA/CPU device
             )
@@ -910,10 +1013,17 @@ class TransformerStrategyAgent(Agent):
                 debug_log("agent_init", f"Transformer encoder weights not found; initialized new encoder on {TORCH_DEVICE}")
     
     def reset(self) -> None:
-        """Reset for new episode - clear opponent history."""
+        """
+        Reset for new episode - clear opponent history.
+        
+        🔧 FIX: Initialize with zero latent (ensures policy has valid input from frame 1).
+        """
         self.episode_starts = True
         self.opponent_history = []
-        self.current_strategy_latent = None
+        
+        # Initialize with zero latent (will be updated as opponent history grows)
+        # This ensures the policy's features extractor always has a valid latent
+        self.current_strategy_latent = torch.zeros(1, self.latent_dim, device=TORCH_DEVICE)
     
     def predict(self, obs):
         """
@@ -922,9 +1032,11 @@ class TransformerStrategyAgent(Agent):
         Process:
         1. Split observation into player and opponent components
         2. Update opponent history buffer
-        3. Extract strategy latent via transformer self-attention
+        3. Extract strategy latent via transformer self-attention (ALWAYS, with padding if needed)
         4. Update policy features extractor with strategy latent
         5. Generate strategy-conditioned action
+        
+        🔧 FIX: Strategy encoder now works from FRAME 1 (uses zero-padding for short histories)
         """
         # Split observation
         player_obs, opponent_obs = self._split_observation(obs)
@@ -934,8 +1046,9 @@ class TransformerStrategyAgent(Agent):
         if len(self.opponent_history) > self.sequence_length:
             self.opponent_history.pop(0)
         
-        # Extract strategy latent with transformer (need at least 10 frames)
-        if len(self.opponent_history) >= 10:
+        # 🔥 CRITICAL FIX: Extract strategy latent ALWAYS (not just after 10 frames)
+        # For short histories, we'll zero-pad to minimum sequence length
+        if len(self.opponent_history) >= 1:  # Changed from >= 10
             self._update_strategy_latent()
             
             # Update policy's features extractor with strategy latent
@@ -972,24 +1085,41 @@ class TransformerStrategyAgent(Agent):
         """
         Extract strategy latent using transformer self-attention.
         Discovers patterns in opponent behavior automatically.
+        
+        🔧 FIX: Now handles SHORT sequences (< 10 frames) with zero-padding.
+        This allows strategy conditioning from FRAME 1 instead of waiting for 10+ frames.
         """
-        # Convert history to tensor [1, seq_len, obs_dim] on the correct device
-        history_array = np.array(self.opponent_history)
+        # Get current history
+        history_array = np.array(self.opponent_history)  # [seq_len, obs_dim]
+        current_len = len(self.opponent_history)
+        
+        # 🔥 ZERO-PADDING for short sequences (enables early strategy extraction)
+        # Minimum sequence length for transformer (avoid extreme short sequences)
+        min_seq_len = 5
+        if current_len < min_seq_len:
+            # Pad with zeros at the beginning
+            obs_dim = history_array.shape[1]
+            padding = np.zeros((min_seq_len - current_len, obs_dim), dtype=np.float32)
+            history_array = np.vstack([padding, history_array])  # [min_seq_len, obs_dim]
+        
+        # Convert to tensor [1, seq_len, obs_dim] on the correct device
         history_tensor = torch.tensor(
             history_array,
             dtype=torch.float32,
-            device=TORCH_DEVICE  # Ensure tensor is on MPS/CUDA/CPU
+            device=TORCH_DEVICE
         ).unsqueeze(0)  # Add batch dimension
         
         # Extract latent via transformer (already on correct device)
         with torch.no_grad():
             latent_tensor = self.strategy_encoder(history_tensor)
+        
         self.current_strategy_latent = latent_tensor
+        
         if DEBUG_FLAGS.get("strategy_latent", False):
             latent_norm = torch.norm(latent_tensor, p=2).item()
             debug_log(
                 "strategy_latent",
-                f"Updated latent (history_len={len(self.opponent_history)}, norm={latent_norm:.4f})",
+                f"Updated latent (history_len={current_len}, padded={current_len<min_seq_len}, norm={latent_norm:.4f})",
             )
     
     def get_strategy_latent_info(self) -> Dict[str, any]:
@@ -1067,171 +1197,40 @@ class TransformerStrategyAgent(Agent):
 
 
 # --------------------------------------------------------------------------------
-# ----------------------------- 4. Supporting Training Agents -----------------------------
+# ----------------------------- 4. Available Agents Reference -----------------------------
 # --------------------------------------------------------------------------------
-# Auxiliary controllers for curriculum opponents, baselines, and human/demo play.
+"""
+ALL AVAILABLE AGENTS (imported from environment.agent):
 
-class SB3Agent(Agent):
-    '''
-    Generic SB3 Agent:
-    - Wraps any Stable-Baselines3 algorithm for quick baselines or comparisons
-    '''
-    def __init__(
-            self,
-            sb3_class: Optional[Type[BaseAlgorithm]] = PPO,
-            file_path: Optional[str] = None
-    ):
-        self.sb3_class = sb3_class
-        super().__init__(file_path)
+SCRIPTED AGENTS (no training required):
+  • ConstantAgent       : Does nothing (baseline for testing)
+  • RandomAgent         : Random actions (curriculum starting point)
+  • BasedAgent          : Heuristic AI with chase/attack/dodge tactics
+  • ClockworkAgent      : Pre-programmed action sequences
+  • UserInputAgent      : Human keyboard control (WASD+HJKL+Space)
 
-    def _initialize(self) -> None:
-        if self.file_path is None:
-            self.model = self.sb3_class(
-                "MlpPolicy",
-                self.env,
-                verbose=0,
-                n_steps=30*90*3,
-                batch_size=128,
-                ent_coef=0.01,
-                device=TORCH_DEVICE,  # Use MPS/CUDA/CPU device
-            )
-            del self.env
-        else:
-            self.model = self.sb3_class.load(self.file_path, device=TORCH_DEVICE)
+LEARNING AGENTS (trainable with RL):
+  • SB3Agent            : Generic Stable-Baselines3 wrapper (PPO, A2C, etc.)
+  • RecurrentPPOAgent   : LSTM-based memory agent for sequential decisions
+  • TransformerStrategyAgent : Strategy-aware transformer (defined below in this file)
 
-    def _gdown(self) -> str:
-        return
-
-    def predict(self, obs):
-        action, _ = self.model.predict(obs)
-        return action
-
-    def save(self, file_path: str) -> None:
-        self.model.save(file_path, include=['num_timesteps'])
-
-    def learn(self, env, total_timesteps, log_interval: int = 1, verbose=0):
-        self.model.set_env(env)
-        self.model.verbose = verbose
-        self.model.learn(
-            total_timesteps=total_timesteps,
-            log_interval=log_interval,
-        )
+CONFIGURATION USAGE:
+  In opponent_mix, use partial() to configure agents:
+    "based_agent": (0.5, partial(BasedAgent))
+    "random_agent": (0.3, partial(RandomAgent))
+  
+  In TRAIN_CONFIG['agent'], specify agent type:
+    "type": "sb3"                    → uses SB3Agent
+    "type": "transformer_strategy"   → uses TransformerStrategyAgent
+    "type": "custom"                 → uses CustomAgent with MLPExtractor
+"""
 
 
-class BasedAgent(Agent):
-    '''
-    BasedAgent:
-    - Hard-coded heuristic opponent for early-stage curriculum matches
-    '''
-    def __init__(
-            self,
-            *args,
-            **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.time = 0
 
-    def predict(self, obs):
-        self.time += 1
-        pos = self.obs_helper.get_section(obs, 'player_pos')
-        opp_pos = self.obs_helper.get_section(obs, 'opponent_pos')
-        opp_KO = self.obs_helper.get_section(obs, 'opponent_state') in [5, 11]
-        action = self.act_helper.zeros()
-
-        if pos[0] > 10.67/2:
-            action = self.act_helper.press_keys(['a'])
-        elif pos[0] < -10.67/2:
-            action = self.act_helper.press_keys(['d'])
-        elif not opp_KO:
-            action = self.act_helper.press_keys(['d' if opp_pos[0] > pos[0] else 'a'])
-
-        if (pos[1] > 1.6 or pos[1] > opp_pos[1]) and self.time % 2 == 0:
-            action = self.act_helper.press_keys(['space'], action)
-
-        if (pos[0] - opp_pos[0])**2 + (pos[1] - opp_pos[1])**2 < 4.0:
-            action = self.act_helper.press_keys(['j'], action)
-        return action
-
-
-class UserInputAgent(Agent):
-    '''
-    UserInputAgent:
-    - Enables human-controlled demos or debugging sessions
-    '''
-    def __init__(
-            self,
-            *args,
-            **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-
-    def predict(self, obs):
-        action = self.act_helper.zeros()
-        keys = pygame.key.get_pressed()
-        if keys[pygame.K_w]:
-            action = self.act_helper.press_keys(['w'], action)
-        if keys[pygame.K_a]:
-            action = self.act_helper.press_keys(['a'], action)
-        if keys[pygame.K_s]:
-            action = self.act_helper.press_keys(['s'], action)
-        if keys[pygame.K_d]:
-            action = self.act_helper.press_keys(['d'], action)
-        if keys[pygame.K_SPACE]:
-            action = self.act_helper.press_keys(['space'], action)
-        if keys[pygame.K_h]:
-            action = self.act_helper.press_keys(['h'], action)
-        if keys[pygame.K_j]:
-            action = self.act_helper.press_keys(['j'], action)
-        if keys[pygame.K_k]:
-            action = self.act_helper.press_keys(['k'], action)
-        if keys[pygame.K_l]:
-            action = self.act_helper.press_keys(['l'], action)
-        if keys[pygame.K_g]:
-            action = self.act_helper.press_keys(['g'], action)
-        return action
-
-
-class ClockworkAgent(Agent):
-    '''
-    ClockworkAgent:
-    - Plays a scripted sequence of actions; useful for style opponents
-    '''
-    def __init__(
-            self,
-            action_sheet: Optional[List[Tuple[int, List[str]]]] = None,
-            *args,
-            **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.steps = 0
-        self.current_action_end = 0
-        self.current_action_data = None
-        self.action_index = 0
-
-        if action_sheet is None:
-            self.action_sheet = [
-                (10, ['a']),
-                (1, ['l']),
-                (20, ['a']),
-                (3, ['a', 'j']),
-                (15, ['space']),
-            ]
-        else:
-            self.action_sheet = action_sheet
-
-    def predict(self, obs):
-        if self.steps >= self.current_action_end and self.action_index < len(self.action_sheet):
-            hold_time, action_data = self.action_sheet[self.action_index]
-            self.current_action_data = action_data
-            self.current_action_end = self.steps + hold_time
-            self.action_index += 1
-
-        action = self.act_helper.press_keys(self.current_action_data)
-        self.steps += 1
-        return action
-
+# ========== Custom Feature Extractors & Agent Architectures ==========
 
 class MLPPolicy(nn.Module):
+    """Simple 3-layer MLP for feature extraction."""
     def __init__(self, obs_dim: int = 64, action_dim: int = 10, hidden_dim: int = 64):
         super(MLPPolicy, self).__init__()
         self.fc1 = nn.Linear(obs_dim, hidden_dim, dtype=torch.float32)
@@ -1245,6 +1244,7 @@ class MLPPolicy(nn.Module):
 
 
 class MLPExtractor(BaseFeaturesExtractor):
+    """MLP-based feature extractor for SB3 agents. Used with CustomAgent."""
     def __init__(self, observation_space: gym.Space, features_dim: int = 64, hidden_dim: int = 64):
         super(MLPExtractor, self).__init__(observation_space, features_dim)
         self.model = MLPPolicy(
@@ -1265,6 +1265,7 @@ class MLPExtractor(BaseFeaturesExtractor):
 
 
 class CustomAgent(Agent):
+    """SB3 agent with custom feature extractors (e.g., MLPExtractor, CNN)."""
     def __init__(self, sb3_class: Optional[Type[BaseAlgorithm]] = PPO, file_path: str = None, extractor: BaseFeaturesExtractor = None):
         self.sb3_class = sb3_class
         self.extractor = extractor
@@ -1283,7 +1284,7 @@ class CustomAgent(Agent):
                 n_steps=30*90*3,
                 batch_size=128,
                 ent_coef=0.01,
-                device=TORCH_DEVICE,  # Use MPS/CUDA/CPU device
+                device=TORCH_DEVICE,
             )
             del self.env
         else:
@@ -1308,6 +1309,9 @@ class CustomAgent(Agent):
         )
 
 
+
+# ========== Agent Factory Utilities ==========
+
 def _resolve_callable(value, fallback):
     """Resolve config entries that may be callables or string names."""
     if value is None:
@@ -1319,7 +1323,11 @@ def _resolve_callable(value, fallback):
 
 
 def create_learning_agent(agent_cfg: Dict[str, object]) -> Agent:
-    """Factory that instantiates the training agent based on TRAIN_CONFIG."""
+    """
+    Factory that instantiates the training agent based on TRAIN_CONFIG.
+    
+    Supports agent types: "transformer_strategy", "custom", "sb3"
+    """
 
     agent_type = agent_cfg.get("type", "custom")
     load_path = agent_cfg.get("load_path")
@@ -1345,16 +1353,23 @@ def create_learning_agent(agent_cfg: Dict[str, object]) -> Agent:
             sequence_length=agent_cfg.get("sequence_length", 90),
             opponent_obs_dim=agent_cfg.get("opponent_obs_dim", None)
         )
+        # Set all default hyperparameters from config
         agent.default_policy_kwargs = agent_cfg.get("policy_kwargs")
         agent.default_n_steps = agent_cfg.get("n_steps")
         agent.default_batch_size = agent_cfg.get("batch_size")
+        agent.default_n_epochs = agent_cfg.get("n_epochs")
+        agent.default_learning_rate = agent_cfg.get("learning_rate")
         agent.default_ent_coef = agent_cfg.get("ent_coef")
+        agent.default_clip_range = agent_cfg.get("clip_range")
+        agent.default_gamma = agent_cfg.get("gamma")
+        agent.default_gae_lambda = agent_cfg.get("gae_lambda")
         debug_log(
             "agent_init",
             (
                 "Instantiated TransformerStrategyAgent "
                 f"(latent_dim={agent.latent_dim}, num_heads={agent.num_heads}, "
-                f"num_layers={agent.num_layers}, sequence_length={agent.sequence_length})"
+                f"num_layers={agent.num_layers}, sequence_length={agent.sequence_length}, "
+                f"n_steps={agent.default_n_steps})"
             ),
         )
         return agent
@@ -1570,34 +1585,84 @@ Add your dictionary of RewardFunctions here using RewTerms
 '''
 def gen_reward_manager():
     """
-    🔧 REWARD SYSTEM - FIXED FOR LEARNING
+    🔧 REWARD SYSTEM V2 - CRITICAL FIX FOR LEARNING
     
-    Key changes:
-    1. Increased ALL reward weights by 20-50x (rewards were too small to learn from)
-    2. Damage rewards are now PRIMARY signal (weight=50.0 instead of 1.0)
-    3. Sparse event rewards remain strong to provide clear goals
-    4. Penalty rewards increased to provide clear negative feedback
+    ROOT CAUSE: Agent learned to be PASSIVE (like ConstantAgent) because penalties
+    overwhelmed rewards. Attack penalty fired every frame (-1.0) but damage reward
+    only fired on successful hits (+50.0 but rare).
     
-    Previous issue: rewards like -0.001 were invisible to the network
-    Now: rewards in range of -5.0 to +100.0 provide strong learning signals
+    NEW STRATEGY:
+    1. REMOVED attack spam penalty (was killing all offensive behavior)
+    2. INCREASED damage reward to +150.0 (make landing hits extremely valuable)
+    3. REDUCED danger zone penalty to -2.0 (only severe falls punished)
+    4. ADDED approach reward (+0.1) to encourage engagement
+    5. ADDED win incentive (+500) to make victories dominant signal
+    
+    Expected behavior: Agent learns to approach, attack, and land hits.
     """
     reward_functions = {
-        #'target_height_reward': RewTerm(func=base_height_l2, weight=0.0, params={'target_height': -4, 'obj_name': 'player'}),
-        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=15.0),  # Was 0.5 → Now 15.0 (30x increase)
-        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=50.0),  # Was 1.0 → Now 50.0 (PRIMARY REWARD!)
-        #'head_to_middle_reward': RewTerm(func=head_to_middle_reward, weight=0.01),
-        #'head_to_opponent': RewTerm(func=head_to_opponent, weight=0.05),
-        'penalize_attack_reward': RewTerm(func=in_state_reward, weight=-1.0, params={'desired_state': AttackState}),  # Was -0.04 → Now -1.0 (25x)
-        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-0.5),  # Was -0.01 → Now -0.5 (50x)
-        #'taunt_reward': RewTerm(func=in_state_reward, weight=0.2, params={'desired_state': TauntState}),
+        # PRIMARY REWARD: Landing damage on opponent (MASSIVE POSITIVE)
+        'damage_interaction_reward': RewTerm(
+            func=damage_interaction_reward, 
+            weight=150.0,  # 🔥 3x increase - make damage THE goal
+            params={'mode': RewardMode.SYMMETRIC}  # Reward damage dealt, penalize damage taken
+        ),
+        
+        # SAFETY: Discourage getting knocked off (but don't over-penalize)
+        'danger_zone_reward': RewTerm(
+            func=danger_zone_reward, 
+            weight=-2.0,  # Reduced from -15.0 (was too punishing)
+            params={'zone_penalty': 1, 'zone_height': 4.2}
+        ),
+        
+        # ENGAGEMENT: Encourage moving toward opponent (overcome passivity)
+        'head_to_opponent': RewTerm(
+            func=head_to_opponent, 
+            weight=0.1  # Small positive for approaching (builds momentum)
+        ),
+        
+        # CLEANUP: Discourage button mashing (but keep light)
+        'holding_more_than_3_keys': RewTerm(
+            func=holding_more_than_3_keys, 
+            weight=-0.05  # Reduced from -0.5 (was too harsh)
+        ),
+        
+        # ❌ REMOVED: penalize_attack_reward (this was killing offensive play!)
+        # The agent needs to attack to win - don't penalize it!
     }
+    
     signal_subscriptions = {
-        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=100)),  # Was 50 → Now 100 (major goal!)
-        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=20)),  # Was 8 → Now 20
-        'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=10)),  # Was 5 → Now 10
-        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=15)),  # Was 10 → Now 15
-        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=20))  # Was 15 → Now 20
+        # VICTORY: Make winning the dominant long-term signal
+        'on_win_reward': ('win_signal', RewTerm(
+            func=on_win_reward, 
+            weight=500  # 🎯 5x increase - winning is EVERYTHING
+        )),
+        
+        # KNOCKOUT: Reward eliminating opponent
+        'on_knockout_reward': ('knockout_signal', RewTerm(
+            func=on_knockout_reward, 
+            weight=50  # 2.5x increase
+        )),
+        
+        # COMBO: Reward strategic hits during stun
+        'on_combo_reward': ('hit_during_stun', RewTerm(
+            func=on_combo_reward, 
+            weight=20  # 2x increase
+        )),
+        
+        # WEAPONS: Encourage picking up weapons
+        'on_equip_reward': ('weapon_equip_signal', RewTerm(
+            func=on_equip_reward, 
+            weight=25  # Nearly 2x increase
+        )),
+        
+        # WEAPON DROP: Mild penalty for losing weapon
+        'on_drop_reward': ('weapon_drop_signal', RewTerm(
+            func=on_drop_reward, 
+            weight=10  # Reduced from 20 (less punishing)
+        ))
     }
+    
     return RewardManager(reward_functions, signal_subscriptions)
 
 
@@ -2110,8 +2175,8 @@ class TrainingMonitorCallback(BaseCallback):
         
         # 1. Win rate spot check (3 quick matches)
         wins = 0
-        total_damage_dealt = 0
-        total_damage_taken = 0
+        eval_damage_dealt = 0  # Damage in this evaluation
+        eval_damage_taken = 0  # Damage taken in this evaluation
         
         for i in range(self.eval_matches):
             try:
@@ -2124,14 +2189,22 @@ class TrainingMonitorCallback(BaseCallback):
                 )
                 if match_stats.player1_result == Result.WIN:
                     wins += 1
-                # 🔧 FIXED: Changed total_damage → damage_done (correct PlayerStats attribute)
-                total_damage_dealt += match_stats.player2.damage_taken  # Damage we dealt = opponent's damage_taken
-                total_damage_taken += match_stats.player1.damage_taken  # Damage we took
+                
+                # Track damage for this evaluation
+                damage_dealt = match_stats.player2.damage_taken  # Damage we dealt = opponent's damage_taken
+                damage_taken = match_stats.player1.damage_taken  # Damage we took
+                
+                eval_damage_dealt += damage_dealt
+                eval_damage_taken += damage_taken
+                
+                # 🔥 ACCUMULATE to total (for passive behavior detection)
+                self.total_damage_dealt += damage_dealt
+                self.total_damage_taken += damage_taken
             except:
                 pass
         
         win_rate = (wins / self.eval_matches) * 100
-        avg_damage_ratio = total_damage_dealt / max(total_damage_taken, 1.0)
+        avg_damage_ratio = eval_damage_dealt / max(eval_damage_taken, 1.0)
         
         print(f"  Win Rate: {win_rate:.1f}% ({wins}/{self.eval_matches} matches)")
         print(f"  Damage Ratio: {avg_damage_ratio:.2f}")
@@ -2153,8 +2226,25 @@ class TrainingMonitorCallback(BaseCallback):
         self.benchmark.record_latent_vector(self.agent)
     
     def _run_sanity_checks(self):
-        """Run sanity checks on training progress."""
+        """
+        Run sanity checks on training progress.
+        
+        🔧 ENHANCED: Now includes PASSIVE BEHAVIOR detection (critical for combat game!)
+        """
         issues = []
+        warnings = []
+        
+        # === CRITICAL CHECK: Passive Behavior Detection ===
+        # If agent is not attacking/dealing damage, it learned passivity (like old bug)
+        if self.total_damage_dealt == 0 and self.num_timesteps > 5000:
+            issues.append("🚨 PASSIVE BEHAVIOR: Agent has dealt ZERO damage in 5k+ steps!")
+            issues.append("   → Agent learned NOT to attack (reward function broken)")
+            issues.append("   → STOP TRAINING and fix reward function")
+        elif self.total_damage_dealt > 0:
+            avg_damage_per_1k = (self.total_damage_dealt / max(self.num_timesteps, 1)) * 1000
+            if avg_damage_per_1k < 1.0 and self.num_timesteps > 10000:
+                warnings.append(f"⚠️  LOW DAMAGE OUTPUT: {avg_damage_per_1k:.2f} damage per 1k steps")
+                warnings.append("   → Agent may be too passive (should be 5-20 damage/1k)")
         
         # Check if reward is stuck
         if len(self.model.ep_info_buffer) >= 50:
@@ -2170,20 +2260,37 @@ class TrainingMonitorCallback(BaseCallback):
             recent_rewards = [ep['r'] for ep in list(self.model.ep_info_buffer)[-20:]]
             
             if np.mean(recent_rewards) <= np.mean(early_rewards) * 1.05:
-                issues.append("NO IMPROVEMENT detected (agent not learning)")
+                warnings.append("NO IMPROVEMENT detected (agent not learning effectively)")
         
         # Check for loss explosions
         if len(self.recent_losses) >= 10:
             recent_losses = list(self.recent_losses)[-10:]
             if any(l > 1000 for l in recent_losses):
-                issues.append("Loss values very high (check learning rate)")
+                issues.append("Loss values very high (gradient explosion, check learning rate)")
         
-        # Print issues
+        # Check if agent is winning at all
+        if self.num_timesteps > 10000:
+            # Try to estimate win rate from damage ratio
+            if self.total_damage_taken > 0:
+                damage_ratio = self.total_damage_dealt / self.total_damage_taken
+                if damage_ratio < 0.5:
+                    warnings.append(f"LOW DAMAGE RATIO: {damage_ratio:.2f} (getting beaten badly)")
+                    warnings.append("   → Agent may need more training or reward tuning")
+        
+        # Print issues (critical problems)
         if issues:
-            print(f"  ⚠️  Sanity Check Issues:")
+            print(f"  🚨 CRITICAL ISSUES:")
             for issue in issues:
-                print(f"      - {issue}")
-        else:
+                print(f"      {issue}")
+        
+        # Print warnings (concerning but not critical)
+        if warnings:
+            print(f"  ⚠️  Warnings:")
+            for warning in warnings:
+                print(f"      {warning}")
+        
+        # Print success
+        if not issues and not warnings:
             print(f"  ✓ Sanity checks passed")
     
     def _checkpoint_benchmark(self):

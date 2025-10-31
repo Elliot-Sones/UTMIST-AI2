@@ -542,6 +542,14 @@ class SelfPlayWarehouseBrawl(gymnasium.Env):
 
         if self.save_handler is not None:
             self.save_handler.process()
+            # Expose a monotonically increasing training step counter to raw_env
+            try:
+                self.raw_env.training_steps = getattr(self, 'training_steps', 0) + 1
+                # Prefer save handler's notion of total steps if available
+                if hasattr(self, 'save_handler') and hasattr(self.save_handler, 'num_timesteps'):
+                    self.raw_env.training_steps = self.save_handler.num_timesteps
+            except Exception:
+                pass
 
         if self.reward_manager is None:
             reward = rewards[0]

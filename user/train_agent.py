@@ -656,7 +656,7 @@ TRAIN_CONFIG_TEST: Dict[str, dict] = {
 #    Goal: Create agent that beats ANY opponent strategy
 
 # ⚠️ START HERE: Curriculum Stage 1 to reliably learn attacking vs ConstantAgent
-TRAIN_CONFIG = TRAIN_CONFIG_CURRICULUM  # Stage 1: Beat ConstantAgent (dense shaping enabled)
+TRAIN_CONFIG = TRAIN_CONFIG_TEST # Stage 1: Beat ConstantAgent (dense shaping enabled)
 
 # For quick validation only (50k, ConstantAgent only):
 # TRAIN_CONFIG = TRAIN_CONFIG_DEBUG
@@ -1800,9 +1800,9 @@ def on_attack_button_press(env: WarehouseBrawl) -> float:
             player.body.position.y - opponent.body.position.y,
         )
 
-        # Anneal effective range: start generous, tighten over time
+        # Anneal effective range using global training steps when available
         # Allows early exploration to get signal, then focuses on true range
-        steps = getattr(env, 'steps', 0)
+        steps = getattr(env, 'training_steps', getattr(env, 'steps', 0))
         warmup_steps = 10_000
         start_range = 14.0
         end_range = 3.5
@@ -1810,6 +1810,16 @@ def on_attack_button_press(env: WarehouseBrawl) -> float:
         max_effective_range = end_range + (start_range - end_range) * (1.0 - frac)
         if distance > max_effective_range:
             return 0.0
+
+        # Require facing toward opponent
+        try:
+            opp_right = opponent.body.position.x > player.body.position.x
+            facing_right = (player.facing.name == 'RIGHT') if hasattr(player.facing, 'name') else bool(player.facing)
+            correct_facing = (opp_right and facing_right) or ((not opp_right) and (not facing_right))
+            if not correct_facing:
+                return 0.0
+        except Exception:
+            pass
 
         # Within range: shape on proximity and vertical alignment
         proximity_scale = max(0.0, 1.0 - min(distance, max_effective_range) / max_effective_range)
@@ -3589,7 +3599,7 @@ def main() -> None:
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
     print("📝 MODE: LIVE STEP PRINTS (no training CSV logging)")
-    print("ELLIOT TESTING 3")
+    print("ELLIOT TESTING 4")
     print("=" * 70)
 
     agent_cfg = TRAIN_CONFIG.get("agent", {})

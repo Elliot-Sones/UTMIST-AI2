@@ -431,7 +431,7 @@ TRAIN_CONFIG_CURRICULUM: Dict[str, dict] = {
     "reward": _SHARED_REWARD_CONFIG.copy(),
     "self_play": {
         "run_name": "curriculum_basic_combat",  # Stage 1 checkpoint folder
-        "save_freq": 5_000,                     # Save every 5k steps
+        "save_freq": 10_000,                    # Save every 10k steps (more time to learn)
         "max_saved": 10,                        # Keep last 10 checkpoints
         "mode": SaveHandlerMode.FORCE,
         
@@ -2199,7 +2199,7 @@ class TrainingMonitorCallback(BaseCallback):
     
     def _quick_evaluation(self):
         """
-        Quick evaluation every 5000 steps.
+        Quick evaluation every 10000 steps.
         - Win rate spot check
         - Behavior metrics summary
         - Sanity checks
@@ -2627,7 +2627,7 @@ def main() -> None:
     if enable_monitoring:
         log_dir = f"{save_handler._experiment_path()}/" if save_handler is not None else f"{CHECKPOINT_BASE_PATH}/tmp/"
         light_log_freq = training_cfg.get("light_log_freq", 500)  # Every 500 steps
-        eval_freq = training_cfg.get("eval_freq", 5000)  # Every 5000 steps
+        eval_freq = training_cfg.get("eval_freq", 10000)  # Every 10000 steps (more time to learn)
         eval_matches = training_cfg.get("eval_episodes", 3)  # 3 matches per eval
         
         print("\n" + "🔬 " + "="*68)

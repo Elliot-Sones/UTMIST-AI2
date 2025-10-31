@@ -1609,6 +1609,64 @@ def head_to_opponent(
 
     return reward
 
+def closing_distance_reward(
+    env: WarehouseBrawl,
+    engage_range: float = 4.5,
+    approach_scale: float = 0.25,
+) -> float:
+    """
+    Encourage the agent to close distance to the opponent and stay in range.
+
+    Returns positive reward when distance shrinks and a small bonus for
+    remaining within the engage_range. Penalizes backing away.
+    """
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+
+    # Current and previous frame distances in world units
+    dx = player.body.position.x - opponent.body.position.x
+    dy = player.body.position.y - opponent.body.position.y
+    current_distance = math.hypot(dx, dy)
+
+    prev_dx = getattr(player, "prev_x", player.body.position.x) - getattr(opponent, "prev_x", opponent.body.position.x)
+    prev_dy = getattr(player, "prev_y", player.body.position.y) - getattr(opponent, "prev_y", opponent.body.position.y)
+    prev_distance = math.hypot(prev_dx, prev_dy)
+
+    approach_delta = prev_distance - current_distance
+    approach_term = approach_delta * approach_scale
+
+    proximity_term = 0.0
+    if current_distance < engage_range:
+        proximity_term = (engage_range - current_distance) / max(engage_range, 1e-6)
+        proximity_term *= env.dt
+
+    total = approach_term + proximity_term
+    # Guard against teleports/respawns creating huge spikes
+    return max(-1.0, min(1.0, total))
+
+def edge_pressure_reward(
+    env: WarehouseBrawl,
+    retreat_penalty_scale: float = 0.5,
+) -> float:
+    """
+    Reward pushing the opponent toward the blast zones to secure knockouts.
+
+    Positive when opponent moves outward, slight negative if they drift back in.
+    """
+    opponent: Player = env.objects["opponent"]
+    stage_half_width = getattr(env, "stage_width_tiles", 36) / 2
+    stage_half_width = max(stage_half_width, 1.0)
+
+    prev_offset = min(stage_half_width, abs(getattr(opponent, "prev_x", opponent.body.position.x)))
+    current_offset = min(stage_half_width, abs(opponent.body.position.x))
+    outward_delta = current_offset - prev_offset
+
+    if outward_delta > 0:
+        return outward_delta / stage_half_width
+    if outward_delta < 0:
+        return (outward_delta * retreat_penalty_scale) / stage_half_width
+    return 0.0
+
 def on_attack_button_press(env: WarehouseBrawl) -> float:
     """
     🔥 CRITICAL EXPLORATION REWARD: Rewards agent for pressing attack buttons.
@@ -1620,7 +1678,7 @@ def on_attack_button_press(env: WarehouseBrawl) -> float:
     Indices:      [0, 1, 2, 3,   4,  5, 6, 7, 8, 9]
     
     Returns:
-        +1.0 dt if light or heavy attack button pressed
+        Positive dt-scaled bonus emphasizing attacks launched within striking range.
         0.0 otherwise
     
     Note: This is a TEMPORARY exploration bonus. Once agent learns to attack,
@@ -1628,7 +1686,7 @@ def on_attack_button_press(env: WarehouseBrawl) -> float:
     take over once attacks start landing.
     """
     player: Player = env.objects["player"]
-    
+
     # Get current action (stored in player object)
     action = player.cur_action
     
@@ -1639,7 +1697,26 @@ def on_attack_button_press(env: WarehouseBrawl) -> float:
     
     # Reward any attack button press
     if light_attack or heavy_attack:
-        return 1.0 * env.dt
+        opponent: Player = env.objects["opponent"]
+
+        # Distance-based shaping to discourage blind spamming
+        distance = math.hypot(
+            player.body.position.x - opponent.body.position.x,
+            player.body.position.y - opponent.body.position.y,
+        )
+        max_effective_range = 8.0
+        proximity_scale = max(0.0, 1.0 - min(distance, max_effective_range) / max_effective_range)
+
+        vertical_alignment = 1.0 - min(abs(player.body.position.y - opponent.body.position.y), 5.0) / 5.0
+        vertical_alignment = max(0.0, vertical_alignment)
+
+        reward = 0.15 + 0.65 * proximity_scale + 0.2 * vertical_alignment
+
+        # Penalize whiffed attacks slightly so hits become more valuable
+        if opponent.damage_taken_this_frame == 0:
+            reward *= 0.5
+
+        return reward * env.dt
     return 0.0
 
 def holding_more_than_3_keys(
@@ -1737,20 +1814,59 @@ class CurriculumRewardScheduler:
     Solution: Smooth transitions between reward regimes across training milestones
 
     Schedule:
-    - Stage 1 (0-25k):    High dense rewards (exploration phase)
-    - Stage 2 (25k-50k):  Moderate reduction (refinement phase)
-    - Stage 3 (50k-100k): Conservative reduction (optimization phase)
-    - Stage 4 (100k+):    Minimal dense rewards (mastery phase)
+    - Stage 1 (0-30k):    Foundational exploration (maximum shaping)
+    - Stage 2 (30k-50k):  Confident pressure (moderate shaping)
+    - Stage 3 (50k-100k): Conversion focus (reduced shaping)
+    - Stage 4 (100k-200k): Mastery preparation (light shaping)
+    - Stage 5 (200k+):    Minimal dense rewards (policy-driven)
     """
 
     def __init__(self):
-        # Define curriculum milestones: (step_threshold, head_to_opponent_weight, attack_button_weight)
+        # Dense reward heads to anneal across the curriculum
+        self.weight_keys = (
+            "head_to_opponent",
+            "attack_button",
+            "close_distance",
+            "edge_pressure",
+        )
+
+        # Define curriculum milestones with richer shaping terms
         self.milestones = [
-            (0,      10.0, 15.0),  # Stage 1: Initial exploration (original weights)
-            (25_000,  7.0, 10.0),  # Stage 2: First reduction (30-33% cut)
-            (50_000,  5.0,  6.0),  # Stage 3: Moderate reduction (50-60% cut total)
-            (100_000, 3.0,  3.0),  # Stage 4: Conservative reduction (70-80% cut total)
-            (200_000, 1.0,  1.0),  # Stage 5: Minimal guidance (90-93% cut total)
+            {
+                "threshold": 0,
+                "head_to_opponent": 10.0,
+                "attack_button": 15.0,
+                "close_distance": 6.0,
+                "edge_pressure": 4.0,
+            },  # Stage 1: Maximum guidance for early exploration
+            {
+                "threshold": 30_000,
+                "head_to_opponent": 8.0,
+                "attack_button": 11.0,
+                "close_distance": 4.5,
+                "edge_pressure": 3.0,
+            },  # Stage 2: Encourage pressure & consistent offense
+            {
+                "threshold": 50_000,
+                "head_to_opponent": 5.5,
+                "attack_button": 6.5,
+                "close_distance": 3.0,
+                "edge_pressure": 2.0,
+            },  # Stage 3: Transition toward sparse rewards
+            {
+                "threshold": 100_000,
+                "head_to_opponent": 3.5,
+                "attack_button": 3.0,
+                "close_distance": 1.5,
+                "edge_pressure": 1.0,
+            },  # Stage 4: Light shaping, focus on finishing stocks
+            {
+                "threshold": 200_000,
+                "head_to_opponent": 1.0,
+                "attack_button": 1.0,
+                "close_distance": 0.5,
+                "edge_pressure": 0.5,
+            },  # Stage 5: Minimal guidance
         ]
 
         self.current_stage = 0
@@ -1764,52 +1880,52 @@ class CurriculumRewardScheduler:
             training_step: Current training timestep
 
         Returns:
-            Dictionary with 'head_to_opponent' and 'attack_button' weights
+            Dictionary with curriculum-controlled dense reward weights.
         """
         self.current_step = training_step
 
-        # Find current milestone
-        for i, (threshold, head_weight, attack_weight) in enumerate(self.milestones):
-            if training_step < threshold:
+        # Find current milestone configuration
+        current_config = self.milestones[0]
+        for i, milestone in enumerate(self.milestones):
+            if training_step >= milestone["threshold"]:
+                self.current_stage = i
+                current_config = milestone
+            else:
                 break
-            self.current_stage = i
-            current_head_weight = head_weight
-            current_attack_weight = attack_weight
-        else:
-            # Use last milestone if beyond all thresholds
-            current_head_weight = self.milestones[-1][1]
-            current_attack_weight = self.milestones[-1][2]
 
-        return {
-            'head_to_opponent': current_head_weight,
-            'attack_button': current_attack_weight,
-            'stage': self.current_stage,
-        }
+        weights = {key: current_config.get(key, 0.0) for key in self.weight_keys}
+        weights['stage'] = self.current_stage
+        return weights
 
     def print_schedule(self):
         """Print full curriculum schedule for reference."""
         print("\n" + "="*70)
         print("🎓 CURRICULUM REWARD ANNEALING SCHEDULE")
         print("="*70)
-        for i, (threshold, head_weight, attack_weight) in enumerate(self.milestones):
-            stage_name = [
-                "STAGE 1: Initial Exploration",
-                "STAGE 2: First Reduction",
-                "STAGE 3: Moderate Reduction",
-                "STAGE 4: Conservative Reduction",
-                "STAGE 5: Minimal Guidance"
-            ][i]
+        stage_names = [
+            "STAGE 1: Foundational Exploration",
+            "STAGE 2: Confident Pressure",
+            "STAGE 3: Conversion Focus",
+            "STAGE 4: Mastery Preparation",
+            "STAGE 5: Minimal Guidance",
+        ]
+        orig_head = self.milestones[0]["head_to_opponent"]
+        orig_attack = self.milestones[0]["attack_button"]
 
-            print(f"\n{stage_name}")
+        for i, milestone in enumerate(self.milestones):
+            threshold = milestone["threshold"]
+            head_weight = milestone.get("head_to_opponent", 0.0)
+            attack_weight = milestone.get("attack_button", 0.0)
+
+            print(f"\n{stage_names[i]}")
             print(f"  Start: Step {threshold:,}")
-            print(f"  head_to_opponent: {head_weight:.1f}")
-            print(f"  attack_button: {attack_weight:.1f}")
+            for key in self.weight_keys:
+                if key in milestone:
+                    print(f"  {key}: {milestone[key]:.1f}")
 
-            # Calculate reduction from original
-            orig_head, orig_attack = 10.0, 15.0
-            head_pct = ((orig_head - head_weight) / orig_head) * 100
-            attack_pct = ((orig_attack - attack_weight) / orig_attack) * 100
-            print(f"  Reduction: {head_pct:.0f}% / {attack_pct:.0f}% from original")
+            head_pct = ((orig_head - head_weight) / orig_head) * 100 if orig_head else 0.0
+            attack_pct = ((orig_attack - attack_weight) / orig_attack) * 100 if orig_attack else 0.0
+            print(f"  Reduction (head/attack): {head_pct:.0f}% / {attack_pct:.0f}%")
         print("="*70 + "\n")
 
 
@@ -1826,10 +1942,11 @@ def gen_reward_manager(training_step: int = 0):
     - Agent regressed from 0.05 damage ratio to 0.02 (worse than before!)
 
     NEW STRATEGY: GRADUAL CURRICULUM ANNEALING
-    - Stage 1 (0-25k):    High dense rewards (10.0, 15.0) - exploration
-    - Stage 2 (25k-50k):  First reduction (7.0, 10.0) - refinement
-    - Stage 3 (50k-100k): Moderate reduction (5.0, 6.0) - optimization
-    - Stage 4 (100k+):    Conservative reduction (3.0, 3.0) - mastery
+    - Stage 1 (0-30k):    High dense rewards (max shaping for movement + offense)
+    - Stage 2 (30k-50k):  Moderate reduction to cement pressure & conversions
+    - Stage 3 (50k-100k): Transition toward sparse rewards (policy learns to finish)
+    - Stage 4 (100k-200k): Light shaping, focus on clutch play
+    - Stage 5 (200k+):    Minimal dense rewards (policy-driven mastery)
 
     This allows value function to adapt gradually over training.
     """
@@ -1844,6 +1961,8 @@ def gen_reward_manager(training_step: int = 0):
     curriculum_weights = _CURRICULUM_SCHEDULER.get_weights(training_step)
     head_weight = curriculum_weights['head_to_opponent']
     attack_weight = curriculum_weights['attack_button']
+    close_weight = curriculum_weights.get('close_distance', 0.0)
+    edge_weight = curriculum_weights.get('edge_pressure', 0.0)
     stage = curriculum_weights['stage']
 
     # Log curriculum transition (when stage changes)
@@ -1852,8 +1971,9 @@ def gen_reward_manager(training_step: int = 0):
             print("\n" + "="*70)
             print(f"🎓 CURRICULUM TRANSITION: Moving to Stage {stage + 1}")
             print(f"   Step: {training_step:,}")
-            print(f"   head_to_opponent: {_CURRICULUM_SCHEDULER.milestones[stage][1]:.1f}")
-            print(f"   attack_button: {_CURRICULUM_SCHEDULER.milestones[stage][2]:.1f}")
+            milestone_cfg = _CURRICULUM_SCHEDULER.milestones[stage]
+            for key in _CURRICULUM_SCHEDULER.weight_keys:
+                print(f"   {key}: {milestone_cfg.get(key, 0.0):.1f}")
             print("="*70 + "\n")
     _CURRICULUM_SCHEDULER._last_logged_stage = stage
 
@@ -1876,6 +1996,18 @@ def gen_reward_manager(training_step: int = 0):
         'head_to_opponent': RewTerm(
             func=head_to_opponent,
             weight=head_weight  # Dynamic weight from curriculum scheduler
+        ),
+
+        # 🎯 NEW: Encourage decisive distance closing (annealed over training)
+        'closing_distance_reward': RewTerm(
+            func=closing_distance_reward,
+            weight=close_weight
+        ),
+
+        # 💥 NEW: Reward pushing opponent toward blast zones
+        'edge_pressure_reward': RewTerm(
+            func=edge_pressure_reward,
+            weight=edge_weight
         ),
 
         # 🎓 CURRICULUM: Exploration reward (annealed over training)
@@ -2611,6 +2743,8 @@ class TrainingMonitorCallback(BaseCallback):
         curriculum_weights = self.curriculum_scheduler.get_weights(self.num_timesteps)
         head_weight = curriculum_weights['head_to_opponent']
         attack_weight = curriculum_weights['attack_button']
+        close_weight = curriculum_weights.get('close_distance', 0.0)
+        edge_weight = curriculum_weights.get('edge_pressure', 0.0)
         stage = curriculum_weights['stage']
 
         # Update reward manager weights directly
@@ -2619,6 +2753,12 @@ class TrainingMonitorCallback(BaseCallback):
 
         if 'on_attack_button_press' in self.reward_manager.reward_functions:
             self.reward_manager.reward_functions['on_attack_button_press'].weight = attack_weight
+
+        if 'closing_distance_reward' in self.reward_manager.reward_functions:
+            self.reward_manager.reward_functions['closing_distance_reward'].weight = close_weight
+
+        if 'edge_pressure_reward' in self.reward_manager.reward_functions:
+            self.reward_manager.reward_functions['edge_pressure_reward'].weight = edge_weight
 
         # Log curriculum transitions (only when stage changes)
         if not hasattr(self, '_last_curriculum_stage'):
@@ -2630,6 +2770,8 @@ class TrainingMonitorCallback(BaseCallback):
             print(f"   Step: {self.num_timesteps:,}")
             print(f"   head_to_opponent: {head_weight:.1f}")
             print(f"   on_attack_button_press: {attack_weight:.1f}")
+            print(f"   closing_distance_reward: {close_weight:.1f}")
+            print(f"   edge_pressure_reward: {edge_weight:.1f}")
             print("="*70 + "\n")
             self._last_curriculum_stage = stage
 
@@ -3151,7 +3293,7 @@ def main() -> None:
     # Display device information at start
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
-    print("ELLIOT TESTING21")
+    print("ELLIOT TESTING221")
     
     # Check if monitoring is enabled
     training_cfg = TRAIN_CONFIG.get("training", {})

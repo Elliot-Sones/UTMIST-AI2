@@ -1,18 +1,4 @@
 """
-Version: 123
---------------------------------------------------------
-🚀 QUICK START FOR GOOGLE COLAB
---------------------------------------------------------
-
-For quick experiments (< 2 hours) with auto-download to desktop:
-1. See COLAB_QUICK_START.md for step-by-step guide
-2. Or copy-paste COLAB_ONE_CELL_SETUP.py into a Colab cell
-3. Results auto-download to your Downloads folder every 15 minutes!
-
-For long training (> 2 hours):
-- Remove QUICK_EXPERIMENT flag to use Google Drive storage
-- Files persist even if Colab disconnects
-
 --------------------------------------------------------
 Logic overview
 --------------------------------------------------------
@@ -42,22 +28,6 @@ the policy win, policy learns how to use those patterns.
 
 5. Self-advisory training loop
 Runs the model vs past versions of ITSELF (snapshots) and scripted bots
-
-
-
-=============================================================================
-WHAT WE ARE BUILDING: AlphaGo-Style Strategy Understanding
-=============================================================================
-
-TRAINING MODE:
-
-• TRANSFORMER MODE (TransformerStrategyAgent):
-  - Pure Latent Space Learning: NO pre-defined concepts
-  - Self-Attention: Automatically discovers opponent patterns
-  - Infinite Strategies: Continuous 256-dim representation space
-  - Like AlphaGo: Learns abstract representations from experience
-  - Good for: Competition, robust generalization to unseen opponents
-
 
 
 """
@@ -173,6 +143,7 @@ from stable_baselines3 import A2C, PPO, SAC, DQN, DDPG, TD3, HER
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.logger import configure as sb3_configure
 
 # --------------------------------------------------------------------------------
 # ----------------------------- GPU Device Configuration -----------------------------
@@ -1277,11 +1248,17 @@ class TransformerStrategyAgent(Agent):
             obs_array = obs_array.reshape(1, -1)
         obs_prepared = self._ensure_observation_shape(obs_array)
         
+        # Use stochastic actions early to avoid the "exact 0.5" deadzone
+        # Deterministic mean maps to ~0.5 after tanh-squash into [0,1],
+        # which fails "> 0.5" press thresholds and looks passive in early evals.
+        # Switch to deterministic earlier (10k) so evaluation reflects intent sooner.
+        use_deterministic = bool(getattr(self.model, "num_timesteps", 0) > 10_000)
+
         action, self.lstm_states = self.model.predict(
             obs_prepared,
             state=self.lstm_states,
             episode_start=self.episode_starts,
-            deterministic=True,
+            deterministic=use_deterministic,
         )
 
         if isinstance(action, np.ndarray) and action.ndim > 1:
@@ -1364,6 +1341,11 @@ class TransformerStrategyAgent(Agent):
         """
         self.model.set_env(env)
         self.model.verbose = verbose
+        # Print SB3 training stats (losses, KL, entropy) to stdout each update
+        try:
+            self.model.set_logger(sb3_configure(None, ["stdout"]))
+        except Exception:
+            pass
         self.model.learn(
             total_timesteps=total_timesteps, 
             log_interval=log_interval,
@@ -1936,7 +1918,8 @@ class CurriculumRewardScheduler:
             {
                 "threshold": 0,
                 "head_to_opponent": 10.0,
-                "attack_button": 15.0,
+                # Reduce early attack-button shaping to avoid mashing bias
+                "attack_button": 5.0,
                 "close_distance": 6.0,
                 "edge_pressure": 4.0,
             },  # Stage 1: Maximum guidance for early exploration
@@ -2383,6 +2366,81 @@ class RewardBreakdownTracker:
     def get_active_terms(self) -> List[str]:
         """Get list of reward terms that have activated."""
         return [name for name, count in self.term_activation_counts.items() if count > 0]
+
+
+class LiveRewardLossPrinter(BaseCallback):
+    """
+    Minimal training-time printer.
+    - Prints per-step reward and optional per-term breakdown.
+    - Lets SB3 print training losses via stdout logger.
+    """
+
+    def __init__(self, reward_manager: RewardManager, print_breakdown: bool = True):
+        super().__init__(verbose=0)
+        self.reward_manager = reward_manager
+        self.print_breakdown = print_breakdown
+
+    def _get_raw_env(self):
+        env = getattr(self, 'training_env', None)
+        if env is None:
+            return None
+        try:
+            if hasattr(env, 'envs') and len(env.envs) > 0:
+                e = env.envs[0]
+            else:
+                e = env
+            # Unwrap nested wrappers
+            while hasattr(e, 'env'):
+                e = e.env
+            # SelfPlayWarehouseBrawl exposes raw_env
+            if hasattr(e, 'raw_env'):
+                return e.raw_env
+            return e
+        except Exception:
+            return None
+
+    def _print_breakdown(self, raw_env):
+        if self.reward_manager is None or not getattr(self.reward_manager, 'reward_functions', None):
+            return
+        try:
+            parts = []
+            total = 0.0
+            for name, term_cfg in self.reward_manager.reward_functions.items():
+                if term_cfg.weight == 0.0:
+                    value = 0.0
+                else:
+                    value = float(term_cfg.func(raw_env, **term_cfg.params) * term_cfg.weight)
+                total += value
+                parts.append(f"{name}={value:.6f}")
+            print("  terms: " + ", ".join(parts) + f" | total={total:.6f}")
+        except Exception:
+            pass
+
+    def _on_step(self) -> bool:
+        # Step-level reward print
+        try:
+            rewards = self.locals.get('rewards', None)
+            dones = self.locals.get('dones', None)
+            r = None
+            if rewards is not None:
+                r = float(np.asarray(rewards).reshape(-1)[0])
+            d = None
+            if dones is not None:
+                d = bool(np.asarray(dones).reshape(-1)[0])
+            if r is not None:
+                if d is None:
+                    print(f"[step {self.num_timesteps}] reward={r:.6f}")
+                else:
+                    print(f"[step {self.num_timesteps}] reward={r:.6f} done={int(d)}")
+        except Exception:
+            pass
+
+        # Optional reward-term breakdown on each step
+        if self.print_breakdown:
+            raw_env = self._get_raw_env()
+            if raw_env is not None:
+                self._print_breakdown(raw_env)
+        return True
 
 
 class PerformanceBenchmark:
@@ -3394,6 +3452,18 @@ def run_training_loop(
     
     try:
         agent.get_env_info(env)
+        # Print observation/action specifics now that env is bound
+        try:
+            print("Obs/Action Layout:")
+            if isinstance(agent, TransformerStrategyAgent):
+                print(
+                    f"  base_obs_dim={agent.base_obs_dim} opponent_obs_dim={agent.opponent_obs_dim} "
+                    f"history_dim={agent.history_obs_dim} expected_obs_dim={agent.expected_obs_dim}"
+                )
+            if hasattr(base_env, 'action_space'):
+                print(f"  action_space={getattr(base_env.action_space, 'shape', None)} (threshold>0.5)")
+        except Exception:
+            pass
         base_env.on_training_start()
         
         # Train with callback if provided
@@ -3473,15 +3543,7 @@ def main() -> None:
     # Display device information at start
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
-    print("ELLIOT TESTING AHHHHH")
-    
-    # Check if monitoring is enabled
-    training_cfg = TRAIN_CONFIG.get("training", {})
-    enable_monitoring = training_cfg.get("enable_debug", True)  # Default to True (always monitor)
-    if enable_monitoring:
-        print(f"📝 MODE: MONITORED TRAINING (Hierarchical logging active)")
-    else:
-        print(f"📝 MODE: MINIMAL LOGGING")
+    print("📝 MODE: LIVE STEP PRINTS (no training CSV logging)")
     print("=" * 70)
 
     agent_cfg = TRAIN_CONFIG.get("agent", {})
@@ -3498,13 +3560,30 @@ def main() -> None:
     }
     learning_agent = create_learning_agent(normalized_agent_cfg)
 
+    # Identify selected TRAIN_CONFIG name for summary
+    def _config_name(cfg: dict) -> str:
+        try:
+            for name in [
+                'TRAIN_CONFIG_DEBUG',
+                'TRAIN_CONFIG_CURRICULUM',
+                'TRAIN_CONFIG_CURRICULUM_STAGE2',
+                'TRAIN_CONFIG_TEST',
+                'TRAIN_CONFIG_EXPLORATION',
+                'TRAIN_CONFIG_10M',
+            ]:
+                if cfg is globals().get(name):
+                    return name
+        except Exception:
+            pass
+        return 'TRAIN_CONFIG(custom)'
+
+    selected_config_name = _config_name(TRAIN_CONFIG)
+
     reward_cfg = TRAIN_CONFIG.get("reward", {})
     reward_factory = _resolve_callable(reward_cfg.get("factory"), gen_reward_manager)
     reward_manager = reward_factory()
     reward_terms = getattr(reward_manager, "reward_functions", {}) or {}
     debug_log("config", f"Reward terms active: {list(reward_terms.keys())}")
-    if DEBUG_FLAGS.get("reward_terms", False):
-        reward_manager = attach_reward_debug(reward_manager, steps=8)
 
     self_play_cfg = TRAIN_CONFIG.get("self_play", {})
     self_play_run_name = self_play_cfg.get("run_name", "experiment_9")
@@ -3528,40 +3607,61 @@ def main() -> None:
     training_cfg = TRAIN_CONFIG.get("training", {})
     train_resolution = training_cfg.get("resolution", CameraResolution.LOW)
     train_timesteps = training_cfg.get("timesteps", 50_000)
-    train_logging = training_cfg.get("logging", TrainLogging.PLOT)
+    # Disable SB3 Monitor/CSV logging during training; we print live instead
+    train_logging = TrainLogging.NONE
+
+    # ---- RUN SUMMARY (configuration snapshot) ----
+    print("\n" + "📋" + "="*68)
+    print("RUN SUMMARY")
+    print("="*70)
+    print(f"Config: {selected_config_name}")
+    try:
+        exp_path = save_handler._experiment_path() if save_handler is not None else 'n/a'
+    except Exception:
+        exp_path = 'n/a'
+    print(f"Checkpoints: base='{CHECKPOINT_BASE_PATH}', run='{exp_path}'")
+    print(f"Self-play: run_name='{self_play_run_name}', save_freq={self_play_save_freq}, max_saved={self_play_max_saved}, mode={self_play_mode.name}")
+    print(f"Training: timesteps={train_timesteps:,}, resolution={train_resolution.name}, logging={train_logging.name}")
+    print("Algorithm: RecurrentPPO + MlpLstmPolicy (Transformer-conditioned features)")
+    # PPO core
+    print("PPO Hyperparams:")
+    print(f"  n_steps={_SHARED_AGENT_CONFIG.get('n_steps')} batch_size={_SHARED_AGENT_CONFIG.get('batch_size')} n_epochs={_SHARED_AGENT_CONFIG.get('n_epochs')}")
+    print(f"  lr={_SHARED_AGENT_CONFIG.get('learning_rate')} ent_coef={_SHARED_AGENT_CONFIG.get('ent_coef')} clip={_SHARED_AGENT_CONFIG.get('clip_range')} gamma={_SHARED_AGENT_CONFIG.get('gamma')} gae_lambda={_SHARED_AGENT_CONFIG.get('gae_lambda')}")
+    # Transformer
+    print("Transformer:")
+    print(f"  latent_dim={_SHARED_AGENT_CONFIG.get('latent_dim')} heads={_SHARED_AGENT_CONFIG.get('num_heads')} layers={_SHARED_AGENT_CONFIG.get('num_layers')} seq_len={_SHARED_AGENT_CONFIG.get('sequence_length')}")
+    # Policy kwargs (LSTM size etc.)
+    pk = _SHARED_AGENT_CONFIG.get('policy_kwargs', {})
+    print("Policy:")
+    print(f"  lstm_hidden_size={pk.get('lstm_hidden_size')} shared_lstm={pk.get('shared_lstm')} critic_lstm={pk.get('enable_critic_lstm')} net_arch={pk.get('net_arch')}")
+    # Rewards
+    print("Rewards:")
+    print(f"  factory={getattr(reward_factory, '__name__', str(reward_factory))}")
+    if reward_manager.reward_functions:
+        print("  terms:")
+        for n, t in reward_manager.reward_functions.items():
+            print(f"    - {n}: weight={t.weight}")
+    if reward_manager.signal_subscriptions:
+        print("  signals:")
+        for n, (sig_name, t) in reward_manager.signal_subscriptions.items():
+            print(f"    - {t.func.__name__}: weight={t.weight} (signal={sig_name})")
+    print("Gameplay thresholds:")
+    print("  action_press_threshold=0.5  deterministic_eval_after_steps=10000")
+    # Opponents
+    try:
+        opp_list = [f"{k}:{(v[0] if isinstance(v, tuple) else v)}" for k, v in opponent_cfg.opponents.items()]
+        print("Opponents:")
+        print("  mix=" + ", ".join(opp_list))
+    except Exception:
+        pass
+    print("="*70 + "\n")
     debug_log(
         "config",
         f"Training config: timesteps={train_timesteps}, resolution={train_resolution.name}, logging={train_logging.name}",
     )
     
-    # Create monitoring callback if enabled
-    monitor_callback = None
-    if enable_monitoring:
-        log_dir = f"{save_handler._experiment_path()}/" if save_handler is not None else f"{CHECKPOINT_BASE_PATH}/tmp/"
-        light_log_freq = training_cfg.get("light_log_freq", 500)  # Every 500 steps
-        eval_freq = training_cfg.get("eval_freq", 10000)  # Every 10000 steps (more time to learn)
-        eval_matches = training_cfg.get("eval_episodes", 3)  # 3 matches per eval
-        
-        print("\n" + "🔬 " + "="*68)
-        print("OPTIMIZED MONITORING SYSTEM ACTIVE")
-        print("="*70)
-        print(f"  • Light logging every {light_log_freq} steps (reward breakdown, transformer health, PPO metrics)")
-        print(f"  • Quick evaluation every {eval_freq} steps ({eval_matches} matches)")
-        print(f"  • Full benchmarks at each checkpoint save (~{self_play_save_freq} steps)")
-        print(f"  • Frame-level alerts: Console only (gradient explosions, NaN, reward spikes)")
-        print(f"  • Log directory: {log_dir}")
-        print("="*70 + "\n")
-        
-        monitor_callback = TrainingMonitorCallback(
-            agent=learning_agent,
-            reward_manager=reward_manager,
-            save_handler=save_handler,
-            log_dir=log_dir,
-            light_log_freq=light_log_freq,
-            eval_freq=eval_freq,
-            eval_matches=eval_matches,
-            verbose=1
-    )
+    # Replace hierarchical monitor with live per-step reward printer
+    monitor_callback = LiveRewardLossPrinter(reward_manager, print_breakdown=True)
 
     run_training_loop(
         agent=learning_agent,
@@ -3574,27 +3674,7 @@ def main() -> None:
         monitor_callback=monitor_callback,
     )
     
-    # Print final summary if monitoring was enabled
-    if enable_monitoring and monitor_callback is not None:
-        print("\n" + "="*70)
-        print("✅ TRAINING COMPLETE - MONITORING SUMMARY")
-        print("="*70)
-        print(f"  • Total steps tracked: {monitor_callback.total_steps}")
-        print(f"  • Reward breakdown CSV: {monitor_callback.reward_tracker.csv_path}")
-        print(f"  • Episode summary CSV: {monitor_callback.episode_csv_path}")
-        print(f"  • Checkpoint benchmarks CSV: {monitor_callback.benchmark.csv_path}")
-        
-        # Check for any issues
-        if monitor_callback.reward_stuck_warning_issued or monitor_callback.loss_explosion_warning_issued:
-            print(f"\n  ⚠️  Warnings issued during training:")
-            if monitor_callback.reward_stuck_warning_issued:
-                print(f"      - Reward appeared stuck at some point")
-            if monitor_callback.loss_explosion_warning_issued:
-                print(f"      - Gradient explosion detected")
-        else:
-            print(f"\n  ✓ No critical issues detected during training")
-        
-        print("="*70 + "\n")
+    # Keep evaluation/testing helpers intact; no training summary printing
 
 
 if __name__ == '__main__':

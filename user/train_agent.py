@@ -428,11 +428,9 @@ _SHARED_AGENT_CONFIG = {
     "batch_size": 64,            # Mini-batch size for gradient updates
                                  # n_steps / batch_size = 512/64 = 8 batches per update
     "n_epochs": 10,              # Gradient epochs per rollout (standard PPO)
-    "ent_coef": linear_entropy_schedule(0.5, 0.05, end_fraction=0.8),  # 🔥 EXPLORATION SCHEDULE
-                                 # Starts at 0.5 (high exploration) → decays to 0.05 (exploitation)
-                                 # Decay completes at 80% of training (gives more time to reinforce strategies)
-                                 # Extended from 0.7 → 0.8 to ensure discovered strategies get reinforced
-                                 # Agent needs time to: discover → try multiple times → reinforce
+    "ent_coef": 0.01,  # Entropy coefficient for exploration
+                                 # RecurrentPPO doesn't support callable schedules, using fixed value
+                                 # Standard value for stable training
     "learning_rate": 2.5e-4,     # Learning rate (standard PPO, works well with Adam)
     "clip_range": 0.2,           # PPO clip range (prevent large policy changes)
     "gamma": 0.99,               # Discount factor (value long-term rewards)
@@ -3468,7 +3466,7 @@ def main() -> None:
     # Display device information at start
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
-    print("ELLIOT TESTING")
+    print("ELLIOT TESTING heelo")
     
     # Check if monitoring is enabled
     training_cfg = TRAIN_CONFIG.get("training", {})

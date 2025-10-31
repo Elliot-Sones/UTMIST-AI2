@@ -1550,16 +1550,49 @@ def holding_more_than_3_keys(
     return 0
 
 def on_win_reward(env: WarehouseBrawl, agent: str) -> float:
+    """
+    Reward based on REAL wins (stock advantage), not timeout draws.
+    
+    Game mechanics:
+    - Each player starts with 3 stocks (lives)
+    - Knockout = lose 1 stock
+    - Match ends when: stocks <= 0 OR timeout
+    - Winner = player with MORE stocks left
+    
+    Returns:
+        +1.0 if we have MORE stocks (real win by knockout)
+        0.0 if same stocks (timeout draw - no reward!)
+        -1.0 if opponent has more stocks (we got knocked out more)
+    """
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+    
+    stock_diff = player.stocks - opponent.stocks
+    
     if agent == 'player':
-        return 1.0
+        if stock_diff > 0:
+            return 1.0  # We have stock advantage = real win!
+        elif stock_diff < 0:
+            return -1.0  # Opponent has advantage = we're losing
+        else:
+            return 0.0  # Timeout draw = no reward (discourage passive play)
     else:
-        return -1.0
+        if stock_diff < 0:
+            return 1.0
+        elif stock_diff > 0:
+            return -1.0
+        else:
+            return 0.0
 
 def on_knockout_reward(env: WarehouseBrawl, agent: str) -> float:
+    """
+    Reward for TAKING a stock (knocking out opponent).
+    This triggers when opponent loses a life.
+    """
     if agent == 'player':
-        return -1.0
+        return -1.0  # We got knocked out = bad
     else:
-        return 1.0
+        return 1.0  # We knocked out opponent = good!
 
 def on_equip_reward(env: WarehouseBrawl, agent: str) -> float:
     if agent == "player":

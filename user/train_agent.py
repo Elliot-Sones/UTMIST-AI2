@@ -663,6 +663,10 @@ class OpponentHistoryWrapper(gym.ObservationWrapper):
             self._history.pop(0)
         return self.observation(obs), reward, terminated, truncated, info
 
+    def __getattr__(self, name: str):
+        # Delegate attribute access to the underlying environment for helpers
+        return getattr(self.env, name)
+
 
 # --------------------------------------------------------------------------------
 # ----------------------------- 3. Encoder-Based Strategy Recognition -----------------------------

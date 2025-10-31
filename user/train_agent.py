@@ -1,5 +1,5 @@
 """
-Version: hello? 
+Version: 123
 --------------------------------------------------------
 🚀 QUICK START FOR GOOGLE COLAB
 --------------------------------------------------------
@@ -2560,7 +2560,7 @@ def main() -> None:
     # Display device information at start
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
-    print("New version of code")
+    print("ELLIOT TESTING")
     
     # Check if monitoring is enabled
     training_cfg = TRAIN_CONFIG.get("training", {})

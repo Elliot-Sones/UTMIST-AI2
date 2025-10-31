@@ -385,7 +385,7 @@ _SHARED_AGENT_CONFIG = {
     "batch_size": 64,            # Mini-batch size for gradient updates
                                  # n_steps / batch_size = 512/64 = 8 batches per update
     "n_epochs": 10,              # Gradient epochs per rollout (standard PPO)
-    "ent_coef": 0.15,            # Entropy coefficient (INCREASED for attack exploration)
+    "ent_coef": 0.25,            # 🔥 BOOSTED: 0.15→0.25 for aggressive exploration (debug run 2)
     "learning_rate": 2.5e-4,     # Learning rate (standard PPO, works well with Adam)
     "clip_range": 0.2,           # PPO clip range (prevent large policy changes)
     "gamma": 0.99,               # Discount factor (value long-term rewards)
@@ -1752,10 +1752,10 @@ def gen_reward_manager():
         # 🔥 EXPLORATION: Reward pressing attack buttons (breaks zero-damage deadlock)
         'on_attack_button_press': RewTerm(
             func=on_attack_button_press,
-            weight=5.0  # 🚀 INCREASED: Strong exploration signal to discover attacking
-                        # This is CRITICAL for initial learning (first 10k steps)
-                        # Once agent attacks consistently (50+ damage), this becomes noise
-                        # But damage_interaction_reward (200) will dominate by then
+            weight=15.0  # 🚀🚀 BOOSTED: 5.0→15.0 (3x stronger!) for debug run 2
+                         # CRITICAL: Agent needs VERY strong signal to discover attacking
+                         # 5.0 wasn't enough in first 5k steps - trying 15.0
+                         # Once agent lands hits, damage_interaction_reward (200) takes over
         ),
         
         # CLEANUP: Discourage button mashing (but keep light)

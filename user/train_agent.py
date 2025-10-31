@@ -1731,7 +1731,7 @@ def gen_reward_manager():
         # PRIMARY REWARD: Landing damage on opponent (MASSIVE POSITIVE)
         'damage_interaction_reward': RewTerm(
             func=damage_interaction_reward,
-            weight=200.0,  # 🔥 COMPETITION MODE: Make damage supremely valuable
+            weight=500.0,  # 🔥 INCREASED: 200→500 (agent proved it can attack, now make damage dominant)
             params={'mode': RewardMode.SYMMETRIC}  # Reward damage dealt, penalize damage taken
         ),
 
@@ -1742,28 +1742,29 @@ def gen_reward_manager():
             params={'zone_penalty': 1, 'zone_height': 4.2}
         ),
 
-        # ENGAGEMENT: Encourage moving toward opponent (overcome passivity)
+        # ENGAGEMENT: Reduced guidance (still provides signal)
         'head_to_opponent': RewTerm(
             func=head_to_opponent,
-            weight=10.0  # 🔥 DOUBLED: Agent MUST close distance to attack
-                         # This fires every frame, so keep it moderate vs damage (200)
+            weight=3.0  # 🔧 REDUCED: 10.0→3.0 (70% cut - conservative rebalance)
+                        # Agent was farming approach rewards instead of winning
+                        # 3.0 maintains exploration while shifting focus to outcomes
         ),
 
-        # 🔥 EXPLORATION: Reward pressing attack buttons (breaks zero-damage deadlock)
+        # 🔧 EXPLORATION: Reduced signal (agent already learned to attack)
         'on_attack_button_press': RewTerm(
             func=on_attack_button_press,
-            weight=15.0  # 🚀🚀 BOOSTED: 5.0→15.0 (3x stronger!) for debug run 2
-                         # CRITICAL: Agent needs VERY strong signal to discover attacking
-                         # 5.0 wasn't enough in first 5k steps - trying 15.0
-                         # Once agent lands hits, damage_interaction_reward (200) takes over
+            weight=3.0  # 🔧 REDUCED: 15.0→3.0 (80% cut - safer than 1.0)
+                        # Agent was pressing buttons for reward, not to win
+                        # 3.0 keeps attack behavior while making wins more valuable
+                        # Evidence: 0% win rate but constantly getting +0.5 reward at 15.0
         ),
-        
+
         # CLEANUP: Discourage button mashing (but keep light)
         'holding_more_than_3_keys': RewTerm(
-            func=holding_more_than_3_keys, 
+            func=holding_more_than_3_keys,
             weight=-0.05  # Reduced from -0.5 (was too harsh)
         ),
-        
+
         # ❌ REMOVED: penalize_attack_reward (this was killing offensive play!)
         # The agent needs to attack to win - don't penalize it!
     }
@@ -1771,32 +1772,34 @@ def gen_reward_manager():
     signal_subscriptions = {
         # VICTORY: Make winning the dominant long-term signal
         'on_win_reward': ('win_signal', RewTerm(
-            func=on_win_reward, 
-            weight=500  # 🎯 5x increase - winning is EVERYTHING
+            func=on_win_reward,
+            weight=2000  # 🚀 BOOSTED: 500→2000 (4x increase - winning MUST be dominant!)
+                         # With reduced dense rewards (1.0 each), this makes winning worth
+                         # ~20x more than spamming buttons. Agent MUST learn to win.
         )),
-        
+
         # KNOCKOUT: Reward eliminating opponent
         'on_knockout_reward': ('knockout_signal', RewTerm(
-            func=on_knockout_reward, 
-            weight=50  # 2.5x increase
+            func=on_knockout_reward,
+            weight=150  # 🔥 INCREASED: 50→150 (3x increase - knockouts are key to winning)
         )),
-        
+
         # COMBO: Reward strategic hits during stun
         'on_combo_reward': ('hit_during_stun', RewTerm(
-            func=on_combo_reward, 
-            weight=20  # 2x increase
+            func=on_combo_reward,
+            weight=50  # 🔥 INCREASED: 20→50 (combos are advanced tactics)
         )),
-        
+
         # WEAPONS: Encourage picking up weapons
         'on_equip_reward': ('weapon_equip_signal', RewTerm(
-            func=on_equip_reward, 
-            weight=25  # Nearly 2x increase
+            func=on_equip_reward,
+            weight=25  # Keep same - weapons help but aren't the goal
         )),
-        
+
         # WEAPON DROP: Mild penalty for losing weapon
         'on_drop_reward': ('weapon_drop_signal', RewTerm(
-            func=on_drop_reward, 
-            weight=10  # Reduced from 20 (less punishing)
+            func=on_drop_reward,
+            weight=10  # Keep same - minor penalty
         ))
     }
     

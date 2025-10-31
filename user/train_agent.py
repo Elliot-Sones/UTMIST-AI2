@@ -3582,7 +3582,7 @@ def main() -> None:
     print("=" * 70)
     print(f"🚀 UTMIST AI² Training - Device: {TORCH_DEVICE}")
     print("📝 MODE: LIVE STEP PRINTS (no training CSV logging)")
-    print("ELLIOT TESTING OMMMMGMGMGMMGMG")
+    print("ELLIOT TESTING 1")
     print("=" * 70)
 
     agent_cfg = TRAIN_CONFIG.get("agent", {})

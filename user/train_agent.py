@@ -1536,6 +1536,39 @@ def head_to_opponent(
 
     return reward
 
+def on_attack_button_press(env: WarehouseBrawl) -> float:
+    """
+    🔥 CRITICAL EXPLORATION REWARD: Rewards agent for pressing attack buttons.
+    
+    Problem: Agent has zero-damage deadlock because it never explores attacking.
+    Solution: Directly reward pressing light attack (j, index 7) or heavy attack (k, index 8).
+    
+    Action space: [w, a, s, d, space, h, l, j, k, g]
+    Indices:      [0, 1, 2, 3,   4,  5, 6, 7, 8, 9]
+    
+    Returns:
+        +1.0 dt if light or heavy attack button pressed
+        0.0 otherwise
+    
+    Note: This is a TEMPORARY exploration bonus. Once agent learns to attack,
+    reduce weight or remove. The damage_interaction_reward (weight=150) will
+    take over once attacks start landing.
+    """
+    player: Player = env.objects["player"]
+    
+    # Get current action (stored in player object)
+    action = player.cur_action
+    
+    # Check if attack buttons are pressed (indices 7=j, 8=k)
+    # Actions are continuous [0, 1], threshold at 0.5
+    light_attack = action[7] > 0.5 if len(action) > 7 else False
+    heavy_attack = action[8] > 0.5 if len(action) > 8 else False
+    
+    # Reward any attack button press
+    if light_attack or heavy_attack:
+        return 1.0 * env.dt
+    return 0.0
+
 def holding_more_than_3_keys(
     env: WarehouseBrawl,
 ) -> float:

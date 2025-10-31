@@ -1656,6 +1656,14 @@ def gen_reward_manager():
                          # Agent MUST get close to opponent to learn that attacking works
         ),
         
+        # 🔥 EXPLORATION: Reward pressing attack buttons (breaks zero-damage deadlock)
+        'on_attack_button_press': RewTerm(
+            func=on_attack_button_press,
+            weight=2.0  # Small reward for pressing j (light) or k (heavy) attack
+                        # Once agent starts attacking, damage_interaction_reward (150) takes over
+                        # This is TEMPORARY - reduce/remove once agent learns to attack consistently
+        ),
+        
         # CLEANUP: Discourage button mashing (but keep light)
         'holding_more_than_3_keys': RewTerm(
             func=holding_more_than_3_keys, 

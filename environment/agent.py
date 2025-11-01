@@ -663,29 +663,30 @@ def run_match(agent_1: Agent | partial,
     # 596, 336
     platform1 = env.objects["platform1"]
 
-    for time in tqdm(range(max_timesteps), total=max_timesteps):
-      platform1.physics_process(0.05)
-      full_action = {
-          0: agent_1.predict(obs_1),
-          1: agent_2.predict(obs_2)
-      }
+    with tqdm(range(max_timesteps), total=max_timesteps) as progress_bar:
+        for time in progress_bar:
+            platform1.physics_process(0.05)
+            full_action = {
+                0: agent_1.predict(obs_1),
+                1: agent_2.predict(obs_2)
+            }
 
-      observations, rewards, terminated, truncated, info = env.step(full_action)
-      obs_1 = observations[0]
-      obs_2 = observations[1]
+            observations, rewards, terminated, truncated, info = env.step(full_action)
+            obs_1 = observations[0]
+            obs_2 = observations[1]
 
-      if reward_manager is not None:
-          reward_manager.process(env, 1 / env.fps)
+            if reward_manager is not None:
+                reward_manager.process(env, 1 / env.fps)
 
-      if video_path is not None:
-            img = env.render()
-            img = np.rot90(img, k=-1)  #video output rotate fix
-            img = np.fliplr(img)  # Mirror/flip the image horizontally
-            writer.writeFrame(img) 
-            del img
+            if video_path is not None:
+                img = env.render()
+                img = np.rot90(img, k=-1)  #video output rotate fix
+                img = np.fliplr(img)  # Mirror/flip the image horizontally
+                writer.writeFrame(img)
+                del img
 
-      if terminated or truncated:
-          break
+            if terminated or truncated:
+                break
 
 
     if video_path is not None:

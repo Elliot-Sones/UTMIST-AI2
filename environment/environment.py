@@ -3154,9 +3154,11 @@ class AnimationSprite2D(GameObject):
             category_path = os.path.join(animation_folder, category)
             if os.path.isdir(category_path):
                 frames = []
-                for file in tqdm(sorted(os.listdir(category_path))):
-                    file_name = os.path.splitext(file)[0]
-                    self.animations[file_name] = self.load_animation(os.path.join(category_path, file))
+                files = sorted(os.listdir(category_path))
+                with tqdm(files, desc=f"Loading {category}") as file_progress:
+                    for file in file_progress:
+                        file_name = os.path.splitext(file)[0]
+                        self.animations[file_name] = self.load_animation(os.path.join(category_path, file))
             else:
                 file_name = os.path.splitext(category)[0]
                 self.animations[file_name] = self.load_animation(category_path)

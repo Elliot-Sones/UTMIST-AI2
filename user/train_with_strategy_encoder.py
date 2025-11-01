@@ -145,7 +145,7 @@ AGENT_CONFIG = {
     "batch_size": 1024,
     "n_epochs": 6,
     "learning_rate": linear_schedule(3e-4, 3e-5),  # Decay from 3e-4 to 3e-5
-    "ent_coef": linear_schedule(0.02, 0.005),  # Decay from 0.02 to 0.005
+    "ent_coef": 0.02,  # High exploration (constant for stability)
     "clip_range": linear_schedule(0.2, 0.1),  # Decay from 0.2 to 0.1
     "gamma": 0.995,
     "gae_lambda": 0.98,

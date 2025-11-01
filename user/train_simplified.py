@@ -24,6 +24,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import numpy as np
+from collections import deque
 from functools import partial
 
 from sb3_contrib import RecurrentPPO
@@ -81,7 +82,7 @@ AGENT_CONFIG = {
     "batch_size": 64,            # Mini-batch size
     "n_epochs": 10,              # Gradient epochs per update
     "learning_rate": 2.5e-4,
-    "ent_coef": 0.01,            # Exploration entropy
+    "ent_coef": 0.002,           # Reduced entropy to limit random key spam
     "clip_range": 0.2,
     "gamma": 0.99,
     "gae_lambda": 0.95,
@@ -188,6 +189,18 @@ print("=" * 70)
 # REWARD FUNCTIONS (Same as before - these work great!)
 # ============================================================================
 
+
+def _get_diag_stats(env: WarehouseBrawl) -> dict:
+    if not hasattr(env, '_diag_stats'):
+        env._diag_stats = {
+            'damage_dealt': 0.0,
+            'damage_taken': 0.0,
+            'zone_time': 0.0,
+            'sparsity_penalty': 0.0,
+            'reward': 0.0,
+        }
+    return env._diag_stats
+
 def damage_interaction_reward(env: WarehouseBrawl, mode: int = 1) -> float:
     """Reward dealing damage, penalize taking damage"""
     player = env.objects["player"]
@@ -209,13 +222,21 @@ def damage_interaction_reward(env: WarehouseBrawl, mode: int = 1) -> float:
     env._last_damage_totals["player"] = player.damage_taken_total
     env._last_damage_totals["opponent"] = opponent.damage_taken_total
 
+    stats = _get_diag_stats(env)
+    stats['damage_dealt'] += delta_dealt
+    stats['damage_taken'] += delta_taken
+
     return (delta_dealt - delta_taken) / 140
 
 
 def danger_zone_reward(env: WarehouseBrawl, zone_height: float = 4.2) -> float:
     """Penalize being too high (about to get knocked out)"""
     player = env.objects["player"]
-    return -1.0 * env.dt if player.body.position.y >= zone_height else 0.0
+    if player.body.position.y >= zone_height:
+        stats = _get_diag_stats(env)
+        stats['zone_time'] += env.dt
+        return -1.0 * env.dt
+    return 0.0
 
 
 def on_win_reward(env: WarehouseBrawl, agent: str) -> float:
@@ -229,6 +250,23 @@ def on_knockout_reward(env: WarehouseBrawl, agent: str) -> float:
     return 5.0 if agent == 'opponent' else -5.0  # Reduced from 10
 
 
+def action_sparsity_reward(env: WarehouseBrawl, max_active: int = 2, penalty_per_key: float = 0.005) -> float:
+    """Small per-step penalty when too many keys are pressed simultaneously."""
+    action = getattr(env, "cur_action", {}).get(0)
+    if action is None:
+        return 0.0
+
+    pressed = float((action > 0.5).sum())
+    excess = max(0.0, pressed - max_active)
+    penalty = -penalty_per_key * excess
+
+    if excess > 0.0:
+        stats = _get_diag_stats(env)
+        stats['sparsity_penalty'] += penalty
+
+    return penalty
+
+
 def gen_reward_manager():
     """Create reward manager with WIN-FOCUSED rewards
 
@@ -237,7 +275,8 @@ def gen_reward_manager():
     """
     reward_functions = {
         'danger_zone': RewTerm(func=danger_zone_reward, weight=0.2),
-        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.5),
+        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.75),
+        'action_sparsity': RewTerm(func=action_sparsity_reward, weight=1.0),
     }
     signal_subscriptions = {
         'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=1.0)),  # 30 points!
@@ -359,6 +398,9 @@ def train():
             self.eval_freq = eval_freq  # Evaluate every N steps
             self.eval_games = eval_games  # Games per opponent during eval
             self.last_eval_step = 0
+            self._seen_ep_ids = deque()
+            self._seen_ep_id_set = set()
+            self.last_episode_summary = None
 
         def evaluate_against_all_opponents(self):
             """Run evaluation games against all opponent types and return win rates"""
@@ -434,12 +476,28 @@ def train():
         def _on_step(self):
             # Track episode completion from buffer
             if hasattr(self, 'model') and hasattr(self.model, 'ep_info_buffer'):
-                if len(self.model.ep_info_buffer) > 0:
-                    for ep_info in self.model.ep_info_buffer:
-                        if 'r' in ep_info and ep_info['r'] not in [r for r in self.episode_rewards[-10:]]:
-                            self.episode_rewards.append(ep_info['r'])
-                            self.episode_lengths.append(ep_info.get('l', 0))
-                            self.episode_count += 1
+                buffer = list(self.model.ep_info_buffer)
+                for ep_info in buffer:
+                    ep_id = id(ep_info)
+                    if ep_id in self._seen_ep_id_set:
+                        continue
+                    self._seen_ep_ids.append(ep_id)
+                    self._seen_ep_id_set.add(ep_id)
+                    if len(self._seen_ep_ids) > 200:
+                        old_id = self._seen_ep_ids.popleft()
+                        self._seen_ep_id_set.discard(old_id)
+
+                    reward = ep_info.get('r')
+                    length = ep_info.get('l', 0)
+                    if reward is not None:
+                        self.episode_rewards.append(reward)
+                        self.episode_lengths.append(length)
+                        self.episode_count += 1
+
+                    if self.env_ref is not None and hasattr(self.env_ref, 'raw_env'):
+                        summary = getattr(self.env_ref.raw_env, '_diag_last_episode', None)
+                        if summary is not None:
+                            self.last_episode_summary = summary
 
             # Run evaluation every eval_freq steps
             if self.num_timesteps >= self.last_eval_step + self.eval_freq and self.num_timesteps > 0:
@@ -459,6 +517,15 @@ def train():
                     print(f"  Episodes completed: {self.episode_count}")
                     print(f"  Avg Reward (last 100 ep): {np.mean(recent_rewards):.2f}")
                     print(f"  Reward Std: {np.std(recent_rewards):.2f}")
+
+                if self.last_episode_summary:
+                    stats = self.last_episode_summary
+                    print(f"\n[EPISODE DIAGNOSTICS]")
+                    print(f"  Damage dealt: {stats.get('damage_dealt', 0):.1f}")
+                    print(f"  Damage taken: {stats.get('damage_taken', 0):.1f}")
+                    print(f"  Time in danger zone (s): {stats.get('zone_time', 0):.1f}")
+                    print(f"  Sparsity penalty: {stats.get('sparsity_penalty', 0):.2f}")
+                    print(f"  Episode reward: {stats.get('reward', 0):.2f}")
 
                 # === LEARNING STABILITY ===
                 print(f"\n[LEARNING]")
@@ -499,7 +566,7 @@ def train():
 
     training_callback = TrainingMonitor(
         env=env,  # Pass environment reference for opponent tracking
-        eval_freq=15_000,  # Evaluate every 15k steps
+        eval_freq=20_000,  # Evaluate every 20k steps
         eval_games=3,  # 3 games per opponent during evaluation
         save_freq=TRAINING_CONFIG["save_freq"],
         save_path=CHECKPOINT_DIR,

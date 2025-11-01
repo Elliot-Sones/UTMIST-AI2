@@ -3451,14 +3451,13 @@ class Player(GameObject):
 
         obs = []
         pos = self.body.position
-        # Clamp values to [-1, 1] (or replace with proper normalization if needed)
-        x_norm = max(-18, min(18, pos.x))
-        y_norm = max(-7, min(7, pos.y))
+        x_norm = max(-18.0, min(18.0, pos.x)) / 18.0
+        y_norm = max(-7.0, min(7.0, pos.y)) / 7.0
         obs.extend([x_norm, y_norm])
 
         vel = self.body.velocity
-        vx_norm = max(-10.0, min(10.0, vel.x))
-        vy_norm = max(-10.0, min(10.0, vel.y))
+        vx_norm = max(-10.0, min(10.0, vel.x)) / 10.0
+        vy_norm = max(-10.0, min(10.0, vel.y)) / 10.0
         obs.extend([vx_norm, vy_norm])
 
         obs.append(1.0 if self.facing == Facing.RIGHT else 0.0)

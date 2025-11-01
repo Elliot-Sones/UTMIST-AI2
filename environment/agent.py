@@ -233,6 +233,10 @@ class RewardManager():
 
         self.total_reward += reward
 
+        stats = getattr(env, '_diag_stats', None)
+        if stats is not None:
+            stats['reward'] += reward
+
         log = env.logger[0]
         log['reward'] = f'{reward_buffer:.3f}'
         log['total_reward'] = f'{self.total_reward:.3f}'
@@ -240,8 +244,8 @@ class RewardManager():
         return reward
 
     def reset(self):
-        self.total_reward = 0
-        self.collected_signal_rewards
+        self.total_reward = 0.0
+        self.collected_signal_rewards = 0.0
 
 
 # ### Save, Self-play, and Opponents

@@ -253,9 +253,17 @@ class WarehouseBrawl(MalachiteEnv[np.ndarray, np.ndarray, int]):
 
     def reset(self, seed=None) -> Tuple[dict[int, np.ndarray], dict[str, Any]]:
         self.seed = seed
-
-
-
+        if hasattr(self, '_diag_stats'):
+            self._diag_last_episode = dict(self._diag_stats)
+        else:
+            self._diag_last_episode = None
+        self._diag_stats = {
+            'damage_dealt': 0.0,
+            'damage_taken': 0.0,
+            'zone_time': 0.0,
+            'sparsity_penalty': 0.0,
+            'reward': 0.0,
+        }
 
         self.space = pymunk.Space()
         self.dt = 1 / 30.0
@@ -431,4 +439,3 @@ class WarehouseBrawl(MalachiteEnv[np.ndarray, np.ndarray, int]):
         self.objects['opponent'] = p2
 
         self.players += [p1, p2]
-

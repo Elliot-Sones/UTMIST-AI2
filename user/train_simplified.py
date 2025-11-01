@@ -238,9 +238,11 @@ class SimplifiedExtractor(BaseFeaturesExtractor):
         self.device = device if device is not None else DEVICE
         self.history_dim = opponent_obs_dim * sequence_length
 
-        # Simple 1-layer encoder for current observation
+        # Simple 1-layer encoder for current observation (PLAYER STATE ONLY!)
+        # base_obs contains [player_state, opponent_state], we only use player_state
+        player_obs_dim = base_obs_dim // 2
         self.obs_encoder = nn.Sequential(
-            nn.Linear(base_obs_dim, 128),
+            nn.Linear(player_obs_dim, 128),
             nn.ReLU()
         )
 
@@ -274,6 +276,10 @@ class SimplifiedExtractor(BaseFeaturesExtractor):
         """
         Extract features by combining current obs + opponent encoding.
 
+        CRITICAL CHANGE: Information bottleneck!
+        We split base_obs in half (player state | opponent state)
+        Then we DISCARD opponent state, forcing LSTM to rely on encoder.
+
         Args:
             observations: [batch, base_obs_dim + history_dim]
         Returns:
@@ -294,11 +300,17 @@ class SimplifiedExtractor(BaseFeaturesExtractor):
                 f"received {history_flat.shape[1]}"
             )
 
+        # INFORMATION BOTTLENECK: Remove opponent's current state!
+        # base_obs = [player_state, opponent_state] (each is half)
+        # We only keep player_state, forcing model to use encoder for opponent info
+        player_obs_dim = self.base_obs_dim // 2
+        player_only_obs = base_obs[:, :player_obs_dim]
+
         # Reshape history
         history = history_flat.view(batch_size, self.sequence_length, self.opponent_obs_dim)
 
         # Encode both parts
-        obs_features = self.obs_encoder(base_obs)  # [batch, 128]
+        obs_features = self.obs_encoder(player_only_obs)  # [batch, 128] - PLAYER ONLY!
         opponent_features = self.opponent_encoder(history)  # [batch, latent_dim]
 
         # CRITICAL: Strategy-dependent gating!
@@ -888,11 +900,14 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 1.2.0 - Gating + Explicit Diversity Loss + Aggressive Noise")
-    print("  - Strategy-gated architecture (forces encoder dependency)")
-    print("  - Explicit diversity loss (penalizes low variance)")
-    print("  - Aggressive noise injection (0.5 when collapsed)")
-    print("  - 8 diverse opponents (aggressive, defensive, aerial, etc.)\n")
+    print("Version 1.3.0 - INFORMATION BOTTLENECK (Nuclear Option)")
+    print("  ⚠️  CRITICAL: Removed opponent's current state from LSTM input!")
+    print("  - LSTM can only see: player state + encoder output")
+    print("  - LSTM cannot see: opponent position, velocity, damage")
+    print("  - Strategy encoder is now the ONLY source of opponent info")
+    print("  - If encoder collapses → model blind to opponent → terrible performance")
+    print("  - This creates maximum gradient pressure for diverse encodings")
+    print("  - Plus: Gating + Diversity loss + Noise + 8 diverse opponents\n")
 
     # Train!
     model.learn(

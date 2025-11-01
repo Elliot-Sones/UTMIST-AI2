@@ -122,10 +122,10 @@ AGENT_CONFIG = {
     },
 
     # STATE-OF-THE-ART PPO HYPERPARAMETERS - GPU OPTIMIZED
-    "n_steps": 8192,                                # Even longer rollouts (4096→8192) for better GPU utilization
+    "n_steps": 4096,                                # Balanced rollouts for GPU utilization without overload
     "batch_size": 1024,                             # Larger batches (512→1024) for maximum GPU parallelization
     "n_epochs": 3,                                  # Reduced epochs (4→3) to maintain throughput
-    "learning_rate": 3e-4,                          # Slightly higher LR for faster learning on GPU
+    "learning_rate": 2.5e-4,                       # Balanced LR for stable learning
     "min_learning_rate": 3e-5,                      # Adjusted minimum LR proportionally
     "ent_coef": 0.003,                              # Moderate entropy bonus for GPU efficiency
     "clip_range": 0.2,                              # Standard clip range for stability
@@ -394,7 +394,7 @@ def danger_zone_reward(env: WarehouseBrawl, zone_height: float = 4.2) -> float:
 def on_win_reward(env: WarehouseBrawl, agent: str) -> float:
     """Strong reward for winning - dominates other rewards without exploding value function
     Winning needs to be very valuable to force opponent-specific strategies."""
-    return 30.0 if agent == 'player' else -30.0  # Reduced from 100 to prevent value explosion
+    return 50.0 if agent == 'player' else -50.0  # Balanced - enough to dominate but not too extreme
 
 
 def on_knockout_reward(env: WarehouseBrawl, agent: str) -> float:
@@ -466,19 +466,22 @@ def gen_reward_manager(curiosity_module: CuriosityModule = None):
     Philosophy: Winning must be very valuable to force the model to
     learn opponent-specific strategies, but not so large it breaks value function.
     Exploration bonuses help discover winning strategies.
+
+    NOTE: Training uses shaped rewards with penalties, but evaluation measures pure win rate.
+    This creates apparent discrepancy but is actually correct - agent learns efficient winning.
     """
     reward_functions = {
-        'danger_zone': RewTerm(func=danger_zone_reward, weight=0.2),
-        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.75),
-        'action_sparsity': RewTerm(func=action_sparsity_reward, weight=1.0),
+        'danger_zone': RewTerm(func=danger_zone_reward, weight=0.1),        # Reduced from 0.2
+        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.5), # Reduced from 0.75
+        'action_sparsity': RewTerm(func=action_sparsity_reward, weight=0.5),      # Reduced from 1.0
         'intrinsic_curiosity': RewTerm(
             func=partial(intrinsic_curiosity_reward, curiosity_module=curiosity_module),
-            weight=0.1
+            weight=0.05  # Reduced from 0.1
         ),
     }
     signal_subscriptions = {
-        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=1.0)),  # 30 points!
-        'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=1.0)),  # 5 points
+        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=3.0)),  # Increased to 150 points total!
+        'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=2.0)),  # Increased to 10 points
     }
     return RewardManager(reward_functions, signal_subscriptions)
 
@@ -995,6 +998,7 @@ def train():
                     print(f"  Sparsity penalty: {stats.get('sparsity_penalty', 0):.2f}")
                     print(f"  Intrinsic reward: {stats.get('intrinsic_reward', 0):.3f}")
                     print(f"  Episode reward: {stats.get('reward', 0):.2f}")
+                    print(f"  Episode length: {self.episode_lengths[-1] if self.episode_lengths else 0} steps")
 
                 # Add exploration metrics
                 if self.exploration_scheduler is not None:
@@ -1004,6 +1008,11 @@ def train():
                 if self.intrinsic_rewards:
                     recent_intrinsic = np.mean(self.intrinsic_rewards[-20:])  # Last 20 intrinsic rewards
                     print(f"  Recent intrinsic reward: {recent_intrinsic:.4f}")
+
+                # Add curriculum info
+                if hasattr(self, 'env_ref') and hasattr(self.env_ref, 'opponent_cfg'):
+                    current_opponent = getattr(self.env_ref.opponent_cfg, 'current_opponent_name', 'unknown')
+                    print(f"  Current opponent type: {current_opponent}")
 
                 # === LEARNING STABILITY ===
                 print(f"\n[LEARNING]")
@@ -1036,8 +1045,8 @@ def train():
     training_callback = TrainingMonitor(
         env=env,  # Pass environment reference for opponent tracking
         exploration_scheduler=exploration_scheduler,  # Dynamic exploration scheduling
-        eval_freq=50_000,  # Evaluate every 50k steps (reduced frequency for GPU focus)
-        eval_games=2,  # 2 games per opponent during evaluation (reduced for speed)
+        eval_freq=25_000,  # Evaluate every 25k steps (more frequent to track progress)
+        eval_games=3,  # 3 games per opponent during evaluation (better statistics)
         save_freq=TRAINING_CONFIG["save_freq"],
         save_path=CHECKPOINT_DIR,
         name_prefix="rl_model",

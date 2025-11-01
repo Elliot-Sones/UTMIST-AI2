@@ -204,7 +204,8 @@ class WarehouseBrawl(MalachiteEnv[np.ndarray, np.ndarray, int]):
             player.process(action[agent])
             if player.stocks <= 0:
                 self.terminated = True
-                winner = 'player' if agent == 1 else 'opponent'
+                # When a player runs out of stocks, they LOST, so their opponent wins
+                winner = 'opponent' if agent == 1 else 'player'
                 self.win_signal.emit(agent=winner)
             if player.on_platform is not None:
                 platform_vel = player.on_platform.velocity

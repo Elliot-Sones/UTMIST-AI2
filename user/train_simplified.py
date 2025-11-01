@@ -171,26 +171,27 @@ class SimpleOpponentEncoder(nn.Module):
         # Encode current state to latent space (no flattening needed)
         encoding = self.encoder(opponent_state)
 
-        # CRITICAL: Explicit diversity loss to prevent collapse
+        # CRITICAL: MASSIVE diversity loss to FORCE diversity
         if self.training and batch_size > 1:
             # Compute batch-wise standard deviation per dimension
             encoding_std = encoding.std(dim=0).mean()  # Higher = more diverse
 
-            # Diversity loss: penalize low variance (we want high variance)
-            # Using negative std as loss (minimize negative = maximize positive)
-            diversity_loss = -encoding_std * 0.5  # Scale factor for loss strength
+            # MASSIVE diversity loss - make it hurt to collapse!
+            # Increased from 0.5 to 10.0 (20x stronger!)
+            # This should create enormous gradient pressure for diversity
+            diversity_loss = -encoding_std * 10.0
 
             # Inject into computational graph without changing forward output
             # During forward: diversity_loss - diversity_loss.detach() = 0
             # During backward: gradients flow through diversity_loss
             encoding = encoding + (diversity_loss - diversity_loss.detach())
 
-            # Additional noise injection if still too collapsed
+            # PERMANENT noise injection to prevent any collapse
+            # Always add noise in training, not just when below threshold
             with torch.no_grad():
-                if encoding_std < 0.05:
-                    # Aggressive noise to break out of collapse
-                    noise = torch.randn_like(encoding) * 0.5
-                    encoding = encoding + noise
+                # Add moderate random noise to every encoding during training
+                noise = torch.randn_like(encoding) * 0.3
+                encoding = encoding + noise
 
         return encoding
 
@@ -532,24 +533,30 @@ def danger_zone_reward(env: WarehouseBrawl, zone_height: float = 4.2) -> float:
 
 
 def on_win_reward(env: WarehouseBrawl, agent: str) -> float:
-    """Big reward for winning"""
-    return 10.0 if agent == 'player' else -10.0
+    """MASSIVE reward for winning - this should dominate all other rewards!
+    Winning needs to be so valuable that distinguishing opponent strategies
+    and adapting to beat them is the only path to high reward."""
+    return 100.0 if agent == 'player' else -100.0  # 10x increase!
 
 
 def on_knockout_reward(env: WarehouseBrawl, agent: str) -> float:
     """Reward knocking out opponent, penalize getting knocked out"""
-    return 2.0 if agent == 'opponent' else -2.0
+    return 10.0 if agent == 'opponent' else -10.0  # 5x increase!
 
 
 def gen_reward_manager():
-    """Create reward manager with sparse rewards"""
+    """Create reward manager with WIN-FOCUSED rewards
+
+    Philosophy: Winning must be SO valuable that the model is forced to
+    learn opponent-specific strategies. Generic play won't cut it anymore.
+    """
     reward_functions = {
-        'danger_zone': RewTerm(func=danger_zone_reward, weight=0.5),
-        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=1.0),
+        'danger_zone': RewTerm(func=danger_zone_reward, weight=0.1),  # Reduced importance
+        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.2),  # Reduced importance
     }
     signal_subscriptions = {
-        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=1.0)),  # Weight=1.0, not 50!
-        'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=1.0)),  # Weight=1.0, not 8!
+        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=1.0)),  # MASSIVE: 100 points!
+        'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=1.0)),  # 10 points
     }
     return RewardManager(reward_functions, signal_subscriptions)
 
@@ -697,8 +704,15 @@ def train():
             if step_infos is not None:
                 for info in step_infos:
                     # Check for winner info when episode ends
+                    # In SB3, final episode info might be under 'final_info' key
+                    winner_info = None
                     if 'winner' in info:
-                        is_win = info['winner'] == 'player'
+                        winner_info = info['winner']
+                    elif 'final_info' in info and isinstance(info['final_info'], dict) and 'winner' in info['final_info']:
+                        winner_info = info['final_info']['winner']
+
+                    if winner_info is not None:
+                        is_win = winner_info == 'player'
                         self.episode_outcomes.append(is_win)
                         if is_win:
                             self.win_count += 1
@@ -864,18 +878,23 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 2.0.0 - REMOVED ENCODER MEMORY (Brilliant Insight!)")
+    print("Version 2.1.0 - WIN-FOCUSED REWARDS (Motivation Fix!)")
     print("="*70)
-    print("  ✅ REMOVED: 32-frame opponent history buffer")
-    print("  ✅ ENCODER NOW: Just encodes current opponent snapshot")
-    print("  ✅ LSTM NOW: Handles all temporal patterns via hidden state")
+    print("  🎯 WIN REWARD: 10 → 100 (10x increase!)")
+    print("  🎯 KNOCKOUT: 2 → 10 (5x increase!)")
+    print("  🎯 Damage rewards: Reduced to 0.2x (now less important)")
     print("  ")
-    print("  Why this fixes collapse:")
-    print("  - Old: Encoder memory vs LSTM memory (conflicting/redundant)")
-    print("  - New: Encoder=instant snapshot, LSTM=temporal memory (complementary!)")
-    print("  - LSTM must use encoder output → strong dependency → forced diversity")
+    print("  WHY THIS MATTERS:")
+    print("  - Old: Model could get good rewards without winning much")
+    print("  - New: Winning is EVERYTHING - must beat opponents consistently")
+    print("  - Generic play won't work - MUST learn opponent-specific strategies")
+    print("  - This creates HUGE pressure to use encoder for adaptation")
     print("  ")
-    print("  Plus: Information bottleneck + Gating + Diversity loss + 8 opponents")
+    print("  Architecture:")
+    print("  - No encoder memory (LSTM handles temporal patterns)")
+    print("  - Information bottleneck (LSTM can't see raw opponent state)")
+    print("  - Massive diversity loss (10x strength) + Permanent noise")
+    print("  - Strategy gating + 8 diverse opponents")
     print("="*70 + "\n")
 
     # Train!

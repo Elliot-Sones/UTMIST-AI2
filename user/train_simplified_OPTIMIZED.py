@@ -219,7 +219,10 @@ CURRICULUM_CONFIG = {
     "target_win_rate": 0.75,
     "min_probability": 0.05,
     "adaptation_strength": 0.6,
-    "self_play_weight": 0.40,  # INCREASED from 0.20 - more self-play!
+    "self_play_weight": 0.0,  # START at 0% - increase as model improves!
+    "self_play_max_weight": 0.50,  # Max self-play weight once model is good
+    "self_play_warmup_steps": 200_000,  # Start increasing self-play after this
+    "self_play_enable_winrate": 0.50,  # Enable self-play once we hit 50% overall win rate
 }
 
 EVAL_TO_TRAIN_KEY = {
@@ -283,7 +286,8 @@ print(f"  • Entropy coef: 0.005 → 0.02 (4x exploration)")
 print(f"  • Win reward: 30 → 100 (dominates damage trading)")
 print(f"  • Batch size: 512 → 1024 (2x stability)")
 print(f"  • Feature blocks: 3 → 5 (deeper feature extraction)")
-print(f"  • Self-play: 20% → 40% (2x self-improvement)")
+print(f"  • Self-play: Curriculum-based (0% → 50%)")
+print(f"    - Disabled until 200k steps + 50% win rate")
 print(f"  • Target KL: 0.015 → 0.035 (more flexible updates)")
 print(f"  • Ortho init: False → True (better gradient flow)")
 print(f"  • Grad norm: 0.5 → 1.5 (larger policy updates)")
@@ -690,6 +694,29 @@ def train():
             if cfg is None or not hasattr(cfg, "opponents"):
                 return
 
+            # === DYNAMIC SELF-PLAY SCHEDULING ===
+            # Calculate overall win rate
+            total_wins = sum(stats['wins'] for stats in eval_results.values())
+            total_games = sum(stats['total'] for stats in eval_results.values())
+            overall_win_rate = (total_wins / total_games) if total_games > 0 else 0.0
+
+            # Compute target self-play weight based on progress
+            warmup_steps = CURRICULUM_CONFIG["self_play_warmup_steps"]
+            enable_winrate = CURRICULUM_CONFIG["self_play_enable_winrate"]
+            max_sp_weight = CURRICULUM_CONFIG["self_play_max_weight"]
+
+            if self.num_timesteps < warmup_steps or overall_win_rate < enable_winrate:
+                # Before warmup or below threshold: keep self-play at 0
+                target_self_play_weight = 0.0
+            else:
+                # After warmup and above threshold: gradually increase self-play
+                progress = (self.num_timesteps - warmup_steps) / (TRAINING_CONFIG["total_timesteps"] - warmup_steps)
+                progress = min(1.0, max(0.0, progress))
+                # Also scale by how much we exceed the threshold
+                performance_factor = min(1.0, (overall_win_rate - enable_winrate) / 0.25)  # Full weight at 75%+
+                target_self_play_weight = max_sp_weight * progress * performance_factor
+
+            # Update self-play probability in base_probabilities
             base_probs = getattr(cfg, "base_probabilities", None)
             if base_probs is None:
                 base_probs = {
@@ -697,6 +724,13 @@ def train():
                     for name, value in cfg.opponents.items()
                 }
                 cfg.base_probabilities = base_probs
+
+            if "self_play" in base_probs:
+                old_sp_weight = base_probs["self_play"]
+                base_probs["self_play"] = target_self_play_weight
+                if abs(target_self_play_weight - old_sp_weight) > 0.01:
+                    print(f"[CURRICULUM] Self-play weight: {old_sp_weight:.3f} → {target_self_play_weight:.3f} "
+                          f"(WR: {overall_win_rate:.1%}, Step: {self.num_timesteps:,})")
 
             prev_probs = {
                 name: value[0] if isinstance(value, tuple) else value
@@ -890,14 +924,16 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 3.0 - OPTIMIZED LSTM RecurrentPPO")
+    print("Version 3.1 - OPTIMIZED LSTM RecurrentPPO with Curriculum Self-Play")
     print("="*70)
-    print("  - 4x more exploration (ent_coef)")
-    print("  - 3.3x stronger win signal")
-    print("  - Deeper feature extraction")
-    print("  - 2x more self-play")
+    print("  - 4x more exploration (ent_coef: 0.02)")
+    print("  - 3.3x stronger win signal (win reward: 100)")
+    print("  - Deeper feature extraction (5 residual blocks)")
+    print("  - Curriculum self-play (0% → 50% as model improves)")
+    print("    • Disabled until 200k steps AND 50% win rate")
+    print("    • Gradually increases to 50% by end of training")
     print("  - Strategic positioning rewards")
-    print("  - More flexible policy updates")
+    print("  - More flexible policy updates (target_kl: 0.035)")
     print("="*70 + "\n")
 
     model.learn(

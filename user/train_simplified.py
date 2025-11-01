@@ -107,76 +107,69 @@ DEVICE = get_device()
 
 class SimpleOpponentEncoder(nn.Module):
     """
-    Encodes opponent behavior into a compact latent vector.
+    Encodes CURRENT opponent state into a strategy vector.
 
-    Input:  32 frames × 32 features = 1024 numbers (opponent history)
-    Output: 128-dim strategy encoding
+    **CRITICAL CHANGE**: No more history buffer!
+    - Input: opponent_obs_dim features (CURRENT opponent state ONLY)
+    - Output: 128-dim strategy encoding
 
-    How it works:
-    - Flattens the sequence of observations
-    - Passes through 2-layer MLP to extract patterns
-    - Outputs compact representation for LSTM to use
+    **Why remove history?**
+    The encoder's 32-frame buffer was competing with LSTM's infinite memory.
+    Now they complement each other:
+    - Encoder: "What type of opponent is this RIGHT NOW?" (instant snapshot)
+    - LSTM: "What patterns have I seen over time?" (temporal memory)
+
+    This eliminates redundant memory systems and forces them to work together.
     """
     def __init__(
         self,
         opponent_obs_dim: int = 32,
-        history_length: int = 32,
         latent_dim: int = 128,
         device: Optional[torch.device] = None
     ):
         super().__init__()
         self.opponent_obs_dim = opponent_obs_dim
-        self.history_length = history_length
         self.latent_dim = latent_dim
         self.device = device if device is not None else DEVICE
 
-        # Simple 2-layer MLP with strong dropout to prevent collapse
-        input_dim = opponent_obs_dim * history_length
+        # 2-layer MLP - encodes CURRENT snapshot only
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 256),
+            nn.Linear(opponent_obs_dim, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
-            nn.Dropout(0.5),  # Strong dropout forces encoder to maintain diversity
+            nn.Dropout(0.3),  # Moderate dropout
             nn.Linear(256, latent_dim),
-            nn.Tanh()  # Bounded outputs prevent explosion (removed LayerNorm before Tanh)
+            nn.Tanh()
         )
 
-        # Orthogonal initialization prevents early collapse
+        # Orthogonal initialization
         for layer in self.encoder:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=1.0)
                 nn.init.constant_(layer.bias, 0.0)
-
-        # Diversity regularization: track recent outputs to promote variance
-        self.register_buffer('output_buffer', torch.zeros(100, latent_dim))
-        self.register_buffer('buffer_idx', torch.tensor(0))
-        self.diversity_strength = 0.1  # How much noise to add when diversity is low
 
         # Store encodings for diversity loss computation
         self.last_batch_encodings = None
 
         self.to(self.device)
 
-    def forward(self, opponent_history):
+    def forward(self, opponent_state):
         """
         Args:
-            opponent_history: [batch, seq_len, opponent_obs_dim]
+            opponent_state: [batch, opponent_obs_dim] - CURRENT state only!
         Returns:
             strategy_encoding: [batch, latent_dim]
         """
         # Ensure correct device
-        if not isinstance(opponent_history, torch.Tensor):
-            opponent_history = torch.tensor(opponent_history, dtype=torch.float32, device=self.device)
-        elif opponent_history.device != self.device:
-            opponent_history = opponent_history.to(self.device)
+        if not isinstance(opponent_state, torch.Tensor):
+            opponent_state = torch.tensor(opponent_state, dtype=torch.float32, device=self.device)
+        elif opponent_state.device != self.device:
+            opponent_state = opponent_state.to(self.device)
 
-        batch_size = opponent_history.shape[0]
+        batch_size = opponent_state.shape[0]
 
-        # Flatten: [batch, seq_len, obs_dim] → [batch, seq_len * obs_dim]
-        flat_history = opponent_history.reshape(batch_size, -1)
-
-        # Encode to latent space
-        encoding = self.encoder(flat_history)
+        # Encode current state to latent space (no flattening needed)
+        encoding = self.encoder(opponent_state)
 
         # CRITICAL: Explicit diversity loss to prevent collapse
         if self.training and batch_size > 1:
@@ -199,13 +192,6 @@ class SimpleOpponentEncoder(nn.Module):
                     noise = torch.randn_like(encoding) * 0.5
                     encoding = encoding + noise
 
-            # Track in buffer for monitoring
-            with torch.no_grad():
-                for i in range(min(batch_size, encoding.shape[0])):
-                    idx = int(self.buffer_idx.item()) % 100
-                    self.output_buffer[idx] = encoding[i].detach()
-                    self.buffer_idx += 1
-
         return encoding
 
 
@@ -226,17 +212,14 @@ class SimplifiedExtractor(BaseFeaturesExtractor):
         latent_dim: int = 128,
         base_obs_dim: int = 256,
         opponent_obs_dim: int = 32,
-        sequence_length: int = 32,
         device: Optional[torch.device] = None,
     ):
         super().__init__(observation_space, features_dim)
 
         self.base_obs_dim = base_obs_dim
-        self.sequence_length = sequence_length
         self.opponent_obs_dim = opponent_obs_dim
         self.latent_dim = latent_dim
         self.device = device if device is not None else DEVICE
-        self.history_dim = opponent_obs_dim * sequence_length
 
         # Simple 1-layer encoder for current observation (PLAYER STATE ONLY!)
         # base_obs contains [player_state, opponent_state], we only use player_state
@@ -246,13 +229,15 @@ class SimplifiedExtractor(BaseFeaturesExtractor):
             nn.ReLU()
         )
 
-        # Opponent encoder
+        # Opponent encoder (NO MORE HISTORY - just current snapshot!)
         self.opponent_encoder = SimpleOpponentEncoder(
             opponent_obs_dim=opponent_obs_dim,
-            history_length=sequence_length,
             latent_dim=latent_dim,
             device=self.device
         )
+
+        # Track encoding diversity for reward signal
+        self.register_buffer('encoding_diversity', torch.tensor(0.0))
 
         # Strategy-dependent gating: Forces model to use opponent encoding!
         # The strategy encoding gates the observation features
@@ -276,12 +261,15 @@ class SimplifiedExtractor(BaseFeaturesExtractor):
         """
         Extract features by combining current obs + opponent encoding.
 
-        CRITICAL CHANGE: Information bottleneck!
-        We split base_obs in half (player state | opponent state)
-        Then we DISCARD opponent state, forcing LSTM to rely on encoder.
+        **NEW ARCHITECTURE**: No history buffer! Encoder memory removed!
+        - base_obs = [player_state, opponent_state]
+        - Player state → obs_encoder → player features
+        - Opponent state → opponent_encoder → strategy encoding
+        - LSTM can only see player features + strategy encoding (NOT raw opponent state!)
+        - LSTM memory handles temporal patterns, encoder handles instant strategy recognition
 
         Args:
-            observations: [batch, base_obs_dim + history_dim]
+            observations: [batch, base_obs_dim] (just current obs, no history!)
         Returns:
             features: [batch, features_dim]
         """
@@ -290,28 +278,21 @@ class SimplifiedExtractor(BaseFeaturesExtractor):
 
         batch_size = observations.shape[0]
 
-        # Split observation into current state and opponent history
-        base_obs = observations[:, :self.base_obs_dim]
-        history_flat = observations[:, self.base_obs_dim:]
-
-        if history_flat.shape[1] != self.history_dim:
-            raise ValueError(
-                f"Expected history dimension {self.history_dim}, "
-                f"received {history_flat.shape[1]}"
-            )
-
-        # INFORMATION BOTTLENECK: Remove opponent's current state!
+        # Split observation into player and opponent states
         # base_obs = [player_state, opponent_state] (each is half)
-        # We only keep player_state, forcing model to use encoder for opponent info
         player_obs_dim = self.base_obs_dim // 2
-        player_only_obs = base_obs[:, :player_obs_dim]
-
-        # Reshape history
-        history = history_flat.view(batch_size, self.sequence_length, self.opponent_obs_dim)
+        player_only_obs = observations[:, :player_obs_dim]
+        opponent_state = observations[:, player_obs_dim:]
 
         # Encode both parts
         obs_features = self.obs_encoder(player_only_obs)  # [batch, 128] - PLAYER ONLY!
-        opponent_features = self.opponent_encoder(history)  # [batch, latent_dim]
+        opponent_features = self.opponent_encoder(opponent_state)  # [batch, latent_dim]
+
+        # Track encoding diversity for reward bonus (detached, no gradients)
+        with torch.no_grad():
+            if batch_size > 1:
+                diversity = opponent_features.std(dim=0).mean().item()
+                self.encoding_diversity.copy_(torch.tensor(diversity, device=self.device))
 
         # CRITICAL: Strategy-dependent gating!
         # Use opponent encoding to modulate observation features
@@ -633,27 +614,19 @@ def train():
     self_play_handler.env = env
     reward_manager.subscribe_signals(env.raw_env)
 
-    # Wrap environment to add opponent history
+    # NO MORE HISTORY WRAPPER! Encoder works on current state only.
+    # Calculate observation dimensions (just base observation now)
+    base_obs_dim = env.observation_space.shape[0]
     opponent_obs_dim = AGENT_CONFIG.get("opponent_obs_dim")
     if opponent_obs_dim is None:
-        opponent_obs_dim = env.observation_space.shape[0] // 2
-
-    env = OpponentHistoryWrapper(
-        env,
-        opponent_obs_dim=opponent_obs_dim,
-        sequence_length=AGENT_CONFIG["sequence_length"]
-    )
-
-    # Calculate observation dimensions
-    total_obs_dim = env.observation_space.shape[0]
-    history_dim = opponent_obs_dim * AGENT_CONFIG["sequence_length"]
-    base_obs_dim = total_obs_dim - history_dim
+        opponent_obs_dim = base_obs_dim // 2  # Half is player, half is opponent
 
     print(f"✓ Environment created")
-    print(f"  Base obs dim: {base_obs_dim}")
+    print(f"  Total obs dim: {base_obs_dim}")
+    print(f"  Player obs dim: {base_obs_dim // 2}")
     print(f"  Opponent obs dim: {opponent_obs_dim}")
-    print(f"  History dim: {history_dim}")
-    print(f"  Total obs dim: {total_obs_dim}\n")
+    print(f"  NO HISTORY BUFFER - Encoder sees current state only!")
+    print(f"  LSTM memory handles temporal patterns\n")
 
     # Create policy kwargs with SimplifiedExtractor
     policy_kwargs = {
@@ -664,7 +637,6 @@ def train():
             "latent_dim": AGENT_CONFIG["latent_dim"],
             "base_obs_dim": base_obs_dim,
             "opponent_obs_dim": opponent_obs_dim,
-            "sequence_length": AGENT_CONFIG["sequence_length"],
             "device": DEVICE,
         }
     }
@@ -900,14 +872,19 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 1.3.0 - INFORMATION BOTTLENECK (Nuclear Option)")
-    print("  ⚠️  CRITICAL: Removed opponent's current state from LSTM input!")
-    print("  - LSTM can only see: player state + encoder output")
-    print("  - LSTM cannot see: opponent position, velocity, damage")
-    print("  - Strategy encoder is now the ONLY source of opponent info")
-    print("  - If encoder collapses → model blind to opponent → terrible performance")
-    print("  - This creates maximum gradient pressure for diverse encodings")
-    print("  - Plus: Gating + Diversity loss + Noise + 8 diverse opponents\n")
+    print("Version 2.0.0 - REMOVED ENCODER MEMORY (Brilliant Insight!)")
+    print("="*70)
+    print("  ✅ REMOVED: 32-frame opponent history buffer")
+    print("  ✅ ENCODER NOW: Just encodes current opponent snapshot")
+    print("  ✅ LSTM NOW: Handles all temporal patterns via hidden state")
+    print("  ")
+    print("  Why this fixes collapse:")
+    print("  - Old: Encoder memory vs LSTM memory (conflicting/redundant)")
+    print("  - New: Encoder=instant snapshot, LSTM=temporal memory (complementary!)")
+    print("  - LSTM must use encoder output → strong dependency → forced diversity")
+    print("  ")
+    print("  Plus: Information bottleneck + Gating + Diversity loss + 8 opponents")
+    print("="*70 + "\n")
 
     # Train!
     model.learn(

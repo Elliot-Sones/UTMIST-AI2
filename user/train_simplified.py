@@ -1,57 +1,14 @@
 """
-Hello?
-================================================================================
-UTMIST AI² - SIMPLIFIED Strategy Recognition Training
-================================================================================
+UTMIST AI² - RecurrentPPO (LSTM-only) Training
+================================================
 
-ARCHITECTURE (Clean & Simple - Ready to Run!)
+Architecture: Pure RecurrentPPO with MlpLstmPolicy (no custom encoder).
+- No opponent history wrapper
+- No feature extractor customization
+- LSTM handles temporal credit assignment over raw observations
 
-┌─────────────────────────────────────────────────────────────┐
-│                    TRAINING ARCHITECTURE                     │
-└─────────────────────────────────────────────────────────────┘
-
-                    ┌──────────────────┐
-                    │ Opponent History │
-                    │   (32 frames)    │
-                    └────────┬─────────┘
-                             │
-                    ┌────────▼─────────┐
-                    │ SimpleOpponentEncoder │
-                    │   (2-layer MLP)   │
-                    └────────┬─────────┘
-                             │
-                     128-dim strategy
-                        encoding
-                             │
-         ┌───────────────────┼───────────────────┐
-         │                   │                   │
-    ┌────▼─────┐     ┌──────▼──────┐     ┌──────▼──────┐
-    │ Current  │     │  Strategy   │     │    LSTM     │
-    │   Obs    │     │  Encoding   │     │   Memory    │
-    └────┬─────┘     └──────┬──────┘     └──────┬──────┘
-         │                   │                   │
-         └───────────────────┴───────────────────┘
-                             │
-                    ┌────────▼─────────┐
-                    │   LSTM Policy    │
-                    │ (RecurrentPPO)   │
-                    └────────┬─────────┘
-                             │
-                        ┌────▼────┐
-                        │ Actions │
-                        └─────────┘
-
-KEY FEATURES:
-✅ Simple 2-layer MLP encodes opponent behavior → 128-dim vector
-✅ LSTM policy learns to use strategy encoding for counter-play
-✅ Self-adversarial training vs past checkpoints
-✅ No transformers, no attention, no complex fusion
-✅ 10x faster than complex version, still learns strategies!
-
-HOW TO RUN:
+Run:
     python user/train_simplified.py
-
-That's it! Training starts immediately with sensible defaults.
 """
 
 # ============================================================================
@@ -66,13 +23,9 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 from pathlib import Path
 import torch
 import torch.nn as nn
-import gymnasium as gym
 import numpy as np
 from functools import partial
-from typing import Optional
-from collections import deque
 
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from sb3_contrib import RecurrentPPO
 
 # Add project root to path
@@ -101,267 +54,7 @@ def get_device():
 
 DEVICE = get_device()
 
-# ============================================================================
-# SIMPLIFIED ARCHITECTURE
-# ============================================================================
-
-class SimpleOpponentEncoder(nn.Module):
-    """
-    Encodes CURRENT opponent state into a strategy vector.
-
-    **CRITICAL CHANGE**: No more history buffer!
-    - Input: opponent_obs_dim features (CURRENT opponent state ONLY)
-    - Output: 128-dim strategy encoding
-
-    **Why remove history?**
-    The encoder's 32-frame buffer was competing with LSTM's infinite memory.
-    Now they complement each other:
-    - Encoder: "What type of opponent is this RIGHT NOW?" (instant snapshot)
-    - LSTM: "What patterns have I seen over time?" (temporal memory)
-
-    This eliminates redundant memory systems and forces them to work together.
-    """
-    def __init__(
-        self,
-        opponent_obs_dim: int = 32,
-        latent_dim: int = 128,
-        device: Optional[torch.device] = None
-    ):
-        super().__init__()
-        self.opponent_obs_dim = opponent_obs_dim
-        self.latent_dim = latent_dim
-        self.device = device if device is not None else DEVICE
-
-        # 2-layer MLP - encodes CURRENT snapshot only
-        self.encoder = nn.Sequential(
-            nn.Linear(opponent_obs_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.3),  # Moderate dropout
-            nn.Linear(256, latent_dim),
-            nn.Tanh()
-        )
-
-        # Orthogonal initialization
-        for layer in self.encoder:
-            if isinstance(layer, nn.Linear):
-                nn.init.orthogonal_(layer.weight, gain=1.0)
-                nn.init.constant_(layer.bias, 0.0)
-
-        # Store encodings for diversity loss computation
-        self.last_batch_encodings = None
-
-        self.to(self.device)
-
-    def forward(self, opponent_state):
-        """
-        Args:
-            opponent_state: [batch, opponent_obs_dim] - CURRENT state only!
-        Returns:
-            strategy_encoding: [batch, latent_dim]
-        """
-        # Ensure correct device
-        if not isinstance(opponent_state, torch.Tensor):
-            opponent_state = torch.tensor(opponent_state, dtype=torch.float32, device=self.device)
-        elif opponent_state.device != self.device:
-            opponent_state = opponent_state.to(self.device)
-
-        batch_size = opponent_state.shape[0]
-
-        # Encode current state to latent space (no flattening needed)
-        encoding = self.encoder(opponent_state)
-
-        # Moderate diversity loss - balance diversity with learning
-        if self.training and batch_size > 1:
-            # Compute batch-wise standard deviation per dimension
-            encoding_std = encoding.std(dim=0).mean()  # Higher = more diverse
-
-            # Moderate diversity loss (reduced from 10.0 to 1.0)
-            # Strong enough to prevent collapse but allows gradients to flow
-            diversity_loss = -encoding_std * 1.0
-
-            # Inject into computational graph without changing forward output
-            # During forward: diversity_loss - diversity_loss.detach() = 0
-            # During backward: gradients flow through diversity_loss
-            encoding = encoding + (diversity_loss - diversity_loss.detach())
-
-            # NO MORE PERMANENT NOISE - let encoder learn real patterns!
-            # Only inject small noise if diversity collapses completely
-            with torch.no_grad():
-                if encoding_std < 0.02:  # Emergency only
-                    noise = torch.randn_like(encoding) * 0.05
-                    encoding = encoding + noise
-
-        return encoding
-
-
-class SimplifiedExtractor(BaseFeaturesExtractor):
-    """
-    Feature extractor combining current observation + opponent strategy.
-
-    This is what feeds into the LSTM policy. It combines:
-    1. Current game state (positions, health, etc.)
-    2. Opponent strategy encoding (from SimpleOpponentEncoder)
-
-    No transformers, no cross-attention - just simple concatenation!
-    """
-    def __init__(
-        self,
-        observation_space: gym.Space,
-        features_dim: int = 256,
-        latent_dim: int = 128,
-        base_obs_dim: int = 256,
-        opponent_obs_dim: int = 32,
-        device: Optional[torch.device] = None,
-    ):
-        super().__init__(observation_space, features_dim)
-
-        self.base_obs_dim = base_obs_dim
-        self.opponent_obs_dim = opponent_obs_dim
-        self.latent_dim = latent_dim
-        self.device = device if device is not None else DEVICE
-
-        # Simple 1-layer encoder for current observation (PLAYER STATE ONLY!)
-        # base_obs contains [player_state, opponent_state], we only use player_state
-        player_obs_dim = base_obs_dim // 2
-        self.obs_encoder = nn.Sequential(
-            nn.Linear(player_obs_dim, 128),
-            nn.ReLU()
-        )
-
-        # Opponent encoder (NO MORE HISTORY - just current snapshot!)
-        self.opponent_encoder = SimpleOpponentEncoder(
-            opponent_obs_dim=opponent_obs_dim,
-            latent_dim=latent_dim,
-            device=self.device
-        )
-
-        # Track encoding diversity for reward signal
-        self.register_buffer('encoding_diversity', torch.tensor(0.0))
-
-        # Strategy-dependent gating: Forces model to use opponent encoding!
-        # The strategy encoding gates the observation features
-        # If encoding is same for all opponents → gating is same → poor performance
-        # This creates strong gradient pressure for diverse encodings
-        self.strategy_gate = nn.Sequential(
-            nn.Linear(latent_dim, 128),
-            nn.Tanh()
-        )
-
-        # Fusion layer (now processes gated features)
-        self.fusion = nn.Sequential(
-            nn.Linear(128 + latent_dim, features_dim),
-            nn.LayerNorm(features_dim),
-            nn.ReLU()
-        )
-
-        self.to(self.device)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        """
-        Extract features by combining current obs + opponent encoding.
-
-        **NEW ARCHITECTURE**: No history buffer! Encoder memory removed!
-        - base_obs = [player_state, opponent_state]
-        - Player state → obs_encoder → player features
-        - Opponent state → opponent_encoder → strategy encoding
-        - LSTM can only see player features + strategy encoding (NOT raw opponent state!)
-        - LSTM memory handles temporal patterns, encoder handles instant strategy recognition
-
-        Args:
-            observations: [batch, base_obs_dim] (just current obs, no history!)
-        Returns:
-            features: [batch, features_dim]
-        """
-        if observations.device != self.device:
-            observations = observations.to(self.device)
-
-        batch_size = observations.shape[0]
-
-        # Split observation into player and opponent states
-        # base_obs = [player_state, opponent_state] (each is half)
-        player_obs_dim = self.base_obs_dim // 2
-        player_only_obs = observations[:, :player_obs_dim]
-        opponent_state = observations[:, player_obs_dim:]
-
-        # Encode both parts
-        obs_features = self.obs_encoder(player_only_obs)  # [batch, 128] - PLAYER ONLY!
-        opponent_features = self.opponent_encoder(opponent_state)  # [batch, latent_dim]
-
-        # Track encoding diversity for reward bonus (detached, no gradients)
-        with torch.no_grad():
-            if batch_size > 1:
-                diversity = opponent_features.std(dim=0).mean().item()
-                self.encoding_diversity.copy_(torch.tensor(diversity, device=self.device))
-
-        # CRITICAL: Strategy-dependent gating!
-        # Use opponent encoding to modulate observation features
-        # If all opponents get same encoding → same gating → poor performance
-        # This forces the encoder to learn diverse representations
-        gate = self.strategy_gate(opponent_features)  # [batch, 128]
-        gated_obs = obs_features * gate  # Element-wise multiplication
-
-        # Fuse gated observations with strategy encoding
-        combined = torch.cat([gated_obs, opponent_features], dim=-1)
-        features = self.fusion(combined)
-
-        return features
-
-
-# ============================================================================
-# OBSERVATION WRAPPER (Adds opponent history to observations)
-# ============================================================================
-
-class OpponentHistoryWrapper(gym.ObservationWrapper):
-    """
-    Wraps environment to add rolling opponent history to observations.
-
-    This allows the encoder to see the last 32 frames of opponent behavior.
-    """
-    def __init__(self, env: gym.Env, opponent_obs_dim: int, sequence_length: int):
-        super().__init__(env)
-        self.opponent_obs_dim = opponent_obs_dim
-        self.sequence_length = sequence_length
-
-        base_low = env.observation_space.low
-        base_high = env.observation_space.high
-        self.base_obs_dim = base_low.shape[0]
-
-        opponent_low = base_low[-opponent_obs_dim:]
-        opponent_high = base_high[-opponent_obs_dim:]
-
-        history_low = np.tile(opponent_low, sequence_length)
-        history_high = np.tile(opponent_high, sequence_length)
-
-        augmented_low = np.concatenate([base_low, history_low], dtype=base_low.dtype)
-        augmented_high = np.concatenate([base_high, history_high], dtype=base_high.dtype)
-
-        self.observation_space = gym.spaces.Box(
-            low=augmented_low,
-            high=augmented_high,
-            dtype=env.observation_space.dtype,
-        )
-
-        self._history = None
-
-    def observation(self, obs: np.ndarray) -> np.ndarray:
-        assert self._history is not None, "Call reset() first"
-        history_flat = np.concatenate(self._history, axis=0).astype(obs.dtype, copy=False)
-        return np.concatenate([obs, history_flat], axis=0)
-
-    def reset(self, *args, **kwargs):
-        obs, info = self.env.reset(*args, **kwargs)
-        opponent_frame = obs[-self.opponent_obs_dim:]
-        self._history = [opponent_frame.copy() for _ in range(self.sequence_length)]
-        return self.observation(obs), info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        opponent_frame = obs[-self.opponent_obs_dim:]
-        self._history.append(opponent_frame.copy())
-        if len(self._history) > self.sequence_length:
-            self._history.pop(0)
-        return self.observation(obs), reward, terminated, truncated, info
+# (No encoder or observation wrapper required for LSTM-only setup)
 
 
 # ============================================================================
@@ -374,10 +67,6 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # Agent hyperparameters
 AGENT_CONFIG = {
-    "latent_dim": 128,           # Opponent strategy encoding size
-    "sequence_length": 32,       # Opponent history frames
-    "opponent_obs_dim": None,    # Auto-detected
-
     # LSTM policy
     "policy_kwargs": {
         "activation_fn": nn.ReLU,
@@ -486,9 +175,7 @@ OPPONENT_MIX = {
 print("=" * 70)
 print("SIMPLIFIED TRAINING CONFIGURATION")
 print("=" * 70)
-print(f"Architecture: Simple MLP encoder + LSTM policy")
-print(f"Opponent encoding: {AGENT_CONFIG['latent_dim']}-dim latent")
-print(f"Sequence length: {AGENT_CONFIG['sequence_length']} frames")
+print(f"Architecture: LSTM-only RecurrentPPO (MlpLstmPolicy)")
 print(f"Training steps: {TRAINING_CONFIG['total_timesteps']:,}")
 print(f"Checkpoint dir: {CHECKPOINT_DIR}")
 print(f"Opponent diversity: {len(OPPONENT_MIX)} distinct agent types")
@@ -619,31 +306,13 @@ def train():
     self_play_handler.env = env
     reward_manager.subscribe_signals(env.raw_env)
 
-    # NO MORE HISTORY WRAPPER! Encoder works on current state only.
-    # Calculate observation dimensions (just base observation now)
-    base_obs_dim = env.observation_space.shape[0]
-    opponent_obs_dim = AGENT_CONFIG.get("opponent_obs_dim")
-    if opponent_obs_dim is None:
-        opponent_obs_dim = base_obs_dim // 2  # Half is player, half is opponent
-
     print(f"✓ Environment created")
-    print(f"  Total obs dim: {base_obs_dim}")
-    print(f"  Player obs dim: {base_obs_dim // 2}")
-    print(f"  Opponent obs dim: {opponent_obs_dim}")
-    print(f"  NO HISTORY BUFFER - Encoder sees current state only!")
-    print(f"  LSTM memory handles temporal patterns\n")
+    print(f"  Observation dim: {env.observation_space.shape[0]}")
+    print(f"  LSTM handles temporal patterns over raw obs\n")
 
-    # Create policy kwargs with SimplifiedExtractor
+    # Create policy kwargs (no custom feature extractor)
     policy_kwargs = {
         **AGENT_CONFIG["policy_kwargs"],
-        "features_extractor_class": SimplifiedExtractor,
-        "features_extractor_kwargs": {
-            "features_dim": 256,
-            "latent_dim": AGENT_CONFIG["latent_dim"],
-            "base_obs_dim": base_obs_dim,
-            "opponent_obs_dim": opponent_obs_dim,
-            "device": DEVICE,
-        }
     }
 
     # Create RecurrentPPO model
@@ -681,42 +350,88 @@ def train():
 
     # Lightweight training monitor - tracks essential metrics
     class TrainingMonitor(CheckpointCallback):
-        def __init__(self, *args, env=None, **kwargs):
+        def __init__(self, *args, env=None, eval_freq=10000, eval_games=10, **kwargs):
             self.env_ref = env  # Store env reference before calling super
             super().__init__(*args, **kwargs)
-            self.last_encoder_weights = None
             self.episode_rewards = []
             self.episode_lengths = []
-            self.episode_outcomes = []  # Track win/loss for each episode (True=win, False=loss)
-            self.win_count = 0
-            self.loss_count = 0
             self.episode_count = 0
+            self.eval_freq = eval_freq  # Evaluate every N steps
+            self.eval_games = eval_games  # Games per opponent during eval
+            self.last_eval_step = 0
+
+        def evaluate_against_all_opponents(self):
+            """Run evaluation games against all opponent types and return win rates"""
+            print(f"\n{'='*70}")
+            print(f"RUNNING EVALUATION @ {self.num_timesteps:,} steps")
+            print(f"{'='*70}")
+
+            # Create agent wrapper from current model
+            temp_model_path = os.path.join(CHECKPOINT_DIR, f"temp_eval_{self.num_timesteps}.zip")
+            self.model.save(temp_model_path)
+            eval_agent = RecurrentPPOAgent(file_path=temp_model_path)
+
+            # Define all opponent types (same as training)
+            opponent_types = {
+                "Constant": partial(ConstantAgent),
+                "Based": partial(BasedAgent),
+                "Random": partial(RandomAgent),
+                "Aggressive": partial(ClockworkAgent, action_sheet=AGGRESSIVE_PATTERN),
+                "Defensive": partial(ClockworkAgent, action_sheet=DEFENSIVE_PATTERN),
+                "Hit&Run": partial(ClockworkAgent, action_sheet=HIT_AND_RUN_PATTERN),
+                "Aerial": partial(ClockworkAgent, action_sheet=AERIAL_PATTERN),
+                "SpecialSpam": partial(ClockworkAgent, action_sheet=SPECIAL_SPAM_PATTERN),
+            }
+
+            results = {}
+            total_wins = 0
+            total_games = 0
+
+            for opp_name, opp_factory in opponent_types.items():
+                wins = 0
+                for _ in range(self.eval_games):
+                    match_stats = run_match(
+                        agent_1=eval_agent,
+                        agent_2=opp_factory,
+                        max_timesteps=30*90,
+                        video_path=None,
+                        resolution=TRAINING_CONFIG["resolution"],
+                        train_mode=False
+                    )
+                    if match_stats.player1_result == Result.WIN:
+                        wins += 1
+
+                win_rate = (wins / self.eval_games * 100)
+                results[opp_name] = {'wins': wins, 'total': self.eval_games, 'win_rate': win_rate}
+                total_wins += wins
+                total_games += self.eval_games
+
+            # Clean up temp file
+            if os.path.exists(temp_model_path):
+                os.remove(temp_model_path)
+
+            # Print results table
+            print(f"\n{'Opponent':<15} {'Win Rate':<12} {'Record':<10}")
+            print("-" * 40)
+            for opp_name, stats in results.items():
+                wr = stats['win_rate']
+                record = f"{stats['wins']}/{stats['total']}"
+                if wr >= 70:
+                    wr_str = f"{wr:>5.1f}% ✓"
+                elif wr >= 50:
+                    wr_str = f"{wr:>5.1f}%"
+                else:
+                    wr_str = f"{wr:>5.1f}% ✗"
+                print(f"{opp_name:<15} {wr_str:<12} {record:<10}")
+
+            overall_wr = (total_wins / total_games * 100) if total_games > 0 else 0
+            print("-" * 40)
+            print(f"{'OVERALL':<15} {overall_wr:>5.1f}%     {total_wins}/{total_games}")
+            print(f"{'='*70}\n")
+
+            return results, overall_wr
 
         def _on_step(self):
-            # Get current step infos
-            step_infos = None
-            if hasattr(self, 'locals') and 'infos' in self.locals:
-                step_infos = self.locals['infos']
-
-            # Track wins/losses from step-level infos when episodes end
-            if step_infos is not None:
-                for info in step_infos:
-                    # Check for winner info when episode ends
-                    # In SB3, final episode info might be under 'final_info' key
-                    winner_info = None
-                    if 'winner' in info:
-                        winner_info = info['winner']
-                    elif 'final_info' in info and isinstance(info['final_info'], dict) and 'winner' in info['final_info']:
-                        winner_info = info['final_info']['winner']
-
-                    if winner_info is not None:
-                        is_win = winner_info == 'player'
-                        self.episode_outcomes.append(is_win)
-                        if is_win:
-                            self.win_count += 1
-                        else:
-                            self.loss_count += 1
-
             # Track episode completion from buffer
             if hasattr(self, 'model') and hasattr(self.model, 'ep_info_buffer'):
                 if len(self.model.ep_info_buffer) > 0:
@@ -726,108 +441,24 @@ def train():
                             self.episode_lengths.append(ep_info.get('l', 0))
                             self.episode_count += 1
 
+            # Run evaluation every eval_freq steps
+            if self.num_timesteps >= self.last_eval_step + self.eval_freq and self.num_timesteps > 0:
+                self.last_eval_step = self.num_timesteps
+                self.evaluate_against_all_opponents()
+
             # Print comprehensive update every 1000 steps
             if self.n_calls % 1000 == 0:
                 print(f"\n{'='*70}")
                 print(f"TRAINING UPDATE @ {self.num_timesteps:,} steps")
                 print(f"{'='*70}")
 
-                # === PERFORMANCE METRICS (Most Important) ===
+                # === PERFORMANCE METRICS ===
                 if self.episode_rewards:
                     recent_rewards = self.episode_rewards[-100:]  # Last 100 episodes
                     print(f"\n[PERFORMANCE]")
                     print(f"  Episodes completed: {self.episode_count}")
                     print(f"  Avg Reward (last 100 ep): {np.mean(recent_rewards):.2f}")
                     print(f"  Reward Std: {np.std(recent_rewards):.2f}")
-
-                    # Win/Loss tracking - recent window only (last 100 episodes)
-                    if self.episode_outcomes:
-                        recent_outcomes = self.episode_outcomes[-100:]
-                        recent_wins = sum(recent_outcomes)
-                        recent_total = len(recent_outcomes)
-                        recent_win_rate = (recent_wins / recent_total * 100) if recent_total > 0 else 0
-
-                        print(f"  Win Rate (last {recent_total} ep): {recent_win_rate:.1f}% ({recent_wins}W / {recent_total - recent_wins}L)")
-
-                        # Show opponent distribution
-                        try:
-                            base_env = self.env_ref.envs[0] if hasattr(self.env_ref, 'envs') else self.env_ref
-                            current_env = base_env
-                            while current_env is not None:
-                                if hasattr(current_env, 'opponent_cfg'):
-                                    opponent_cfg = current_env.opponent_cfg
-                                    total = sum(opponent_cfg.opponent_counts.values())
-                                    if total > 0:
-                                        print(f"  Opponents: ", end="")
-                                        counts_str = ", ".join([f"{name}: {count/total*100:.0f}%" for name, count in sorted(opponent_cfg.opponent_counts.items())])
-                                        print(counts_str)
-                                    break
-                                current_env = getattr(current_env, 'env', None)
-                        except:
-                            pass
-                    else:
-                        print(f"  Win Rate: No games completed yet")
-
-                # === ENCODER HEALTH ===
-                encoder = self.model.policy.features_extractor.opponent_encoder
-
-                # 1. Gradient flow
-                grad_norm = 0.0
-                for param in encoder.parameters():
-                    if param.grad is not None:
-                        grad_norm += param.grad.norm().item() ** 2
-                grad_norm = grad_norm ** 0.5
-
-                # 2. Weight changes
-                current_weights = torch.cat([p.flatten() for p in encoder.parameters()])
-                if self.last_encoder_weights is not None:
-                    weight_change = (current_weights - self.last_encoder_weights).norm().item()
-
-                    print(f"\n[ENCODER]")
-                    print(f"  Gradient norm (size of current gradient update): {grad_norm:.6f} {'✓' if grad_norm > 1e-5 else '⚠️ LOW'}")
-                    print(f"  Weight change (How mcuh params moved): {weight_change:.6f} {'✓' if weight_change > 1e-4 else '⚠️ STUCK'}")
-                self.last_encoder_weights = current_weights.clone()
-
-                # 3. Encoding diversity (NEW: no history buffer, just current state)
-                if hasattr(self.model, 'rollout_buffer') and self.model.rollout_buffer.size() > 0:
-                    try:
-                        buffer = self.model.rollout_buffer
-                        sample_size = min(20, buffer.buffer_size)
-                        obs_samples = buffer.observations[:sample_size]
-
-                        base_dim = self.model.policy.features_extractor.base_obs_dim
-                        opponent_obs_dim = self.model.policy.features_extractor.opponent_obs_dim
-
-                        encoder.eval()
-                        with torch.no_grad():
-                            encodings = []
-                            for obs in obs_samples:
-                                # Observation: [player_state, opponent_state]
-                                # Extract opponent state (second half)
-                                if len(obs.shape) == 1:
-                                    opponent_state = obs[base_dim//2:]
-                                else:
-                                    opponent_state = obs[:, base_dim//2:]
-
-                                # Convert to tensor
-                                opponent_t = torch.FloatTensor(opponent_state).to(encoder.device)
-                                if len(opponent_t.shape) == 1:
-                                    opponent_t = opponent_t.unsqueeze(0)
-
-                                # Get encoding (encoder now takes current state only!)
-                                enc = encoder(opponent_t).cpu().numpy()
-                                if len(enc.shape) > 1:
-                                    enc = enc[0]
-                                encodings.append(enc)
-                        encoder.train()
-
-                        if encodings:
-                            encodings = np.array(encodings)
-                            enc_std = encodings.std(axis=0).mean()  # diversity across samples
-                            # With Tanh activation, expect diversity 0.1-0.3
-                            print(f"  Encoding diversity (how much encodings vary): {enc_std:.4f} {'✓' if enc_std > 0.05 else '⚠️ COLLAPSED'}")
-                    except Exception as e:
-                        print(f"  Encoding diversity: [Error: {e}]")
 
                 # === LEARNING STABILITY ===
                 print(f"\n[LEARNING]")
@@ -868,6 +499,8 @@ def train():
 
     training_callback = TrainingMonitor(
         env=env,  # Pass environment reference for opponent tracking
+        eval_freq=10_000,  # Evaluate every 10k steps
+        eval_games=10,  # 10 games per opponent during evaluation
         save_freq=TRAINING_CONFIG["save_freq"],
         save_path=CHECKPOINT_DIR,
         name_prefix="rl_model",
@@ -876,26 +509,11 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 2.1.2 - VALUE FUNCTION FIX (Stable Training)")
+    print("Version 3.0 - LSTM-only RecurrentPPO")
     print("="*70)
-    print("  ✅ Encoder working: Good gradients + diversity!")
-    print("  🔧 Win reward: 100 → 30 (prevents value explosion)")
-    print("  🔧 Knockout: 10 → 5 (more stable)")
-    print("  🔧 Damage/danger weights increased for better shaping")
-    print("  ")
-    print("  📊 REWARD STRUCTURE:")
-    print("  - Win: +30 (still dominates, but stable)")
-    print("  - Knockout: +5")
-    print("  - Damage dealt: ~+0.5 per episode")
-    print("  - Total win episode: ~35-40")
-    print("  - Total loss episode: ~-30")
-    print("  ")
-    print("  🎯 ARCHITECTURE (working!):")
-    print("  - No encoder memory → LSTM handles temporal patterns")
-    print("  - Information bottleneck → LSTM needs encoder")
-    print("  - Moderate diversity loss (1.0) → prevents collapse")
-    print("  - Strategy gating → encoder output modulates actions")
-    print("  - 8 diverse opponents → forces adaptation")
+    print("  - No encoder or history wrapper")
+    print("  - LSTM learns temporal patterns directly from raw obs")
+    print("  - Stable reward shaping (win-focused)")
     print("="*70 + "\n")
 
     # Train!

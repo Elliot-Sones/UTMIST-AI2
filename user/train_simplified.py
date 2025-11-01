@@ -238,7 +238,16 @@ class SimplifiedExtractor(BaseFeaturesExtractor):
             device=self.device
         )
 
-        # Simple fusion - just concatenate!
+        # Strategy-dependent gating: Forces model to use opponent encoding!
+        # The strategy encoding gates the observation features
+        # If encoding is same for all opponents → gating is same → poor performance
+        # This creates strong gradient pressure for diverse encodings
+        self.strategy_gate = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.Tanh()
+        )
+
+        # Fusion layer (now processes gated features)
         self.fusion = nn.Sequential(
             nn.Linear(128 + latent_dim, features_dim),
             nn.LayerNorm(features_dim),
@@ -276,10 +285,17 @@ class SimplifiedExtractor(BaseFeaturesExtractor):
 
         # Encode both parts
         obs_features = self.obs_encoder(base_obs)  # [batch, 128]
-        opponent_features = self.opponent_encoder(history)  # [batch, 128]
+        opponent_features = self.opponent_encoder(history)  # [batch, latent_dim]
 
-        # Simple concatenation and fusion
-        combined = torch.cat([obs_features, opponent_features], dim=-1)
+        # CRITICAL: Strategy-dependent gating!
+        # Use opponent encoding to modulate observation features
+        # If all opponents get same encoding → same gating → poor performance
+        # This forces the encoder to learn diverse representations
+        gate = self.strategy_gate(opponent_features)  # [batch, 128]
+        gated_obs = obs_features * gate  # Element-wise multiplication
+
+        # Fuse gated observations with strategy encoding
+        combined = torch.cat([gated_obs, opponent_features], dim=-1)
         features = self.fusion(combined)
 
         return features
@@ -848,6 +864,7 @@ def train():
             return super()._on_step()
 
     training_callback = TrainingMonitor(
+        env=env,  # Pass environment reference for opponent tracking
         save_freq=TRAINING_CONFIG["save_freq"],
         save_path=CHECKPOINT_DIR,
         name_prefix="rl_model",
@@ -856,7 +873,7 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 1.0.2")
+    print("Version 1.1.0 - Strategy-Gated Architecture (Forces encoder dependency)")
 
     # Train!
     model.learn(

@@ -345,6 +345,7 @@ AGENT_CONFIG = {
     "gae_lambda": 0.95,
     "max_grad_norm": 0.5,        # Prevent exploding gradients
     "vf_coef": 0.5,              # Value function coefficient
+    "clip_range_vf": 10.0,       # Clip value function updates to prevent explosions
 }
 
 # Training settings
@@ -408,12 +409,12 @@ def danger_zone_reward(env: WarehouseBrawl, zone_height: float = 4.2) -> float:
 
 def on_win_reward(env: WarehouseBrawl, agent: str) -> float:
     """Big reward for winning"""
-    return 50.0 if agent == 'player' else -50.0
+    return 10.0 if agent == 'player' else -10.0
 
 
 def on_knockout_reward(env: WarehouseBrawl, agent: str) -> float:
     """Reward knocking out opponent, penalize getting knocked out"""
-    return 8.0 if agent == 'opponent' else -8.0
+    return 2.0 if agent == 'opponent' else -2.0
 
 
 def gen_reward_manager():
@@ -423,8 +424,8 @@ def gen_reward_manager():
         'damage_interaction': RewTerm(func=damage_interaction_reward, weight=1.0),
     }
     signal_subscriptions = {
-        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=50)),
-        'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=8)),
+        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=1.0)),  # Weight=1.0, not 50!
+        'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=1.0)),  # Weight=1.0, not 8!
     }
     return RewardManager(reward_functions, signal_subscriptions)
 
@@ -540,6 +541,7 @@ def train():
         gae_lambda=AGENT_CONFIG["gae_lambda"],
         max_grad_norm=AGENT_CONFIG["max_grad_norm"],
         vf_coef=AGENT_CONFIG["vf_coef"],
+        clip_range_vf=AGENT_CONFIG["clip_range_vf"],
         policy_kwargs=policy_kwargs,
         device=DEVICE,
     )
@@ -608,15 +610,26 @@ def train():
                 if self.episode_rewards:
                     recent_rewards = self.episode_rewards[-100:]  # Last 100 episodes
                     print(f"\n[PERFORMANCE]")
-                    print(f"  Avg Reward (last 100): {np.mean(recent_rewards):.2f}")
-                    print(f"  Reward Std: {np.std(recent_rewards):.2f}")
                     print(f"  Episodes completed: {self.episode_count}")
+                    print(f"  Avg Reward (last 100 ep): {np.mean(recent_rewards):.2f}")
+                    print(f"  Reward Std: {np.std(recent_rewards):.2f}")
 
-                    if self.episode_count >= 10:
-                        total_games = self.win_count + self.loss_count
-                        if total_games > 0:
-                            win_rate = self.win_count / total_games * 100
-                            print(f"  Win Rate: {win_rate:.1f}% ({self.win_count}W / {self.loss_count}L)")
+                    # Win/Loss tracking
+                    total_games = self.win_count + self.loss_count
+                    if total_games > 0:
+                        win_rate = self.win_count / total_games * 100
+                        recent_window = min(100, len(self.episode_rewards))
+                        recent_wins = sum(1 for r in recent_rewards if r > 20)  # Estimate: high reward = likely won
+                        recent_win_rate = (recent_wins / len(recent_rewards) * 100) if recent_rewards else 0
+
+                        print(f"  Total Wins/Losses: {self.win_count}W / {self.loss_count}L")
+                        print(f"  Overall Win Rate: {win_rate:.1f}%")
+                        print(f"  Recent Win Rate (est): {recent_win_rate:.1f}% (last {len(recent_rewards)} ep)")
+                    else:
+                        # Fallback if winner info not available - estimate from rewards
+                        recent_wins = sum(1 for r in recent_rewards if r > 20)
+                        recent_win_rate = (recent_wins / len(recent_rewards) * 100) if recent_rewards else 0
+                        print(f"  Estimated Win Rate: {recent_win_rate:.1f}% (based on reward>20)")
 
                 # === ENCODER HEALTH ===
                 encoder = self.model.policy.features_extractor.opponent_encoder

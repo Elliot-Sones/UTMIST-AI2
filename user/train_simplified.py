@@ -393,7 +393,7 @@ def train():
                     match_stats = run_match(
                         agent_1=eval_agent,
                         agent_2=opp_factory,
-                        max_timesteps=30*90,
+                        max_timesteps=30*60,
                         video_path=None,
                         resolution=TRAINING_CONFIG["resolution"],
                         train_mode=False
@@ -499,8 +499,8 @@ def train():
 
     training_callback = TrainingMonitor(
         env=env,  # Pass environment reference for opponent tracking
-        eval_freq=10_000,  # Evaluate every 10k steps
-        eval_games=10,  # 10 games per opponent during evaluation
+        eval_freq=15_000,  # Evaluate every 15k steps
+        eval_games=3,  # 3 games per opponent during evaluation
         save_freq=TRAINING_CONFIG["save_freq"],
         save_path=CHECKPOINT_DIR,
         name_prefix="rl_model",

@@ -22,54 +22,18 @@ os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # Apple Silicon support
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple, List
 import torch
 import torch.nn as nn
 import numpy as np
 from collections import deque
 from functools import partial
+import gymnasium as gym
 
 from sb3_contrib import RecurrentPPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
-import torch.cuda.amp as amp
-
-
-class AMPRecurrentPPO(RecurrentPPO):
-    """RecurrentPPO with Automatic Mixed Precision (AMP) support for faster GPU training"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.scaler = amp.GradScaler() if self.device.type == "cuda" else None
-
-    def train(self):
-        """AMP-enabled training with automatic mixed precision"""
-        self.policy.train()
-
-        if self.scaler is not None:
-            # Use AMP for GPU training
-            with amp.autocast(device_type="cuda", dtype=torch.float16):
-                loss = self._train_step()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.policy.optimizer)
-            self.scaler.update()
-        else:
-            # Fallback to regular training
-            loss = self._train_step()
-            self.policy.optimizer.zero_grad()
-            loss.backward()
-            # Clip grad norm
-            if self.max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.policy.optimizer.step()
-
-        return loss.detach()
-
-    def _train_step(self):
-        """Single training step (simplified for AMP compatibility)"""
-        # Use parent implementation for now - in production you'd optimize this further
-        # This is a basic AMP wrapper around the existing training
-        return super().train()
-
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor, VecNormalize
+from stable_baselines3.common.utils import safe_mean
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -104,20 +68,70 @@ def linear_schedule(start: float, end: float) -> Callable[[float], float]:
     return schedule
 
 
+class ResidualMLPBlock(nn.Module):
+    """Simple residual MLP block with LayerNorm and GELU activations."""
+
+    def __init__(self, dim: int, expansion: int = 2, dropout: float = 0.05):
+        super().__init__()
+        hidden_dim = dim * expansion
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
+
+class WarehouseFeatureExtractor(BaseFeaturesExtractor):
+    """Feature extractor tailored for the WarehouseBrawl observation vector."""
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Box,
+        feature_dim: int = 512,
+        num_residual_blocks: int = 3,
+        dropout: float = 0.05,
+    ):
+        super().__init__(observation_space, features_dim=feature_dim)
+        input_dim = int(np.prod(observation_space.shape))
+
+        self.preprocess = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, feature_dim),
+            nn.GELU(),
+        )
+        self.residual_stack = nn.Sequential(
+            *[ResidualMLPBlock(feature_dim, expansion=2, dropout=dropout) for _ in range(num_residual_blocks)]
+        )
+        self.output_norm = nn.LayerNorm(feature_dim)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        x = obs.float()
+        x = self.preprocess(x)
+        x = self.residual_stack(x)
+        return self.output_norm(x)
+
+
 seed_everything(GLOBAL_SEED)
+
+if hasattr(torch, "set_float32_matmul_precision"):
+    torch.set_float32_matmul_precision("high")
+if torch.cuda.is_available() and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+    torch.backends.cuda.matmul.allow_tf32 = True
 
 # ============================================================================
 # DEVICE CONFIGURATION
 # ============================================================================
 
 def get_device():
-    """Auto-detect best available device (CUDA > MPS > CPU) - GPU OPTIMIZED"""
+    """Auto-detect best available device (CUDA > MPS > CPU)"""
     if torch.cuda.is_available():
         print(f"✓ Using CUDA GPU: {torch.cuda.get_device_name(0)}")
         torch.backends.cudnn.benchmark = True
-        # Enable CUDA optimizations
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
         return torch.device("cuda")
     elif torch.backends.mps.is_available():
         print("✓ Using Apple Silicon MPS GPU")
@@ -141,43 +155,53 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 TENSORBOARD_DIR = Path(CHECKPOINT_DIR) / "tb_logs"
 TENSORBOARD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Agent hyperparameters - OPTIMIZED FOR STATE-OF-THE-ART PERFORMANCE
+# Agent hyperparameters
 AGENT_CONFIG = {
-    # ADVANCED LSTM ARCHITECTURE
+    # LSTM policy
     "policy_kwargs": {
-        "activation_fn": nn.ReLU,
-        "lstm_hidden_size": 512,                    # Increased from 256 for better capacity
-        "n_lstm_layers": 3,                         # Increased from 2 for deeper temporal understanding
-        "net_arch": dict(
-            pi=[512, 512, 256],                     # Deeper policy network
-            vf=[512, 512, 256]                      # Deeper value network
-        ),
+        "activation_fn": nn.GELU,
+        "lstm_hidden_size": 512,
+        "n_lstm_layers": 3,
+        "net_arch": dict(pi=[512, 256], vf=[512, 256]),
         "shared_lstm": False,
-        "enable_critic_lstm": True,                 # Separate LSTM for critic improves stability
-        "share_features_extractor": False,          # Separate feature extractors for policy/value
-        "lstm_kwargs": {                            # Additional LSTM optimizations
-            "dropout": 0.1,                         # Dropout for regularization
-            "bidirectional": False,                 # Keep unidirectional for causality
-        }
+        "enable_critic_lstm": True,
+        "share_features_extractor": True,
+        "features_extractor_class": WarehouseFeatureExtractor,
+        "features_extractor_kwargs": {
+            "feature_dim": 512,
+            "num_residual_blocks": 3,
+            "dropout": 0.05,
+        },
+        "optimizer_class": torch.optim.AdamW,
+        "optimizer_kwargs": {
+            "weight_decay": 1e-4,
+            "eps": 1e-5,
+        },
+        "ortho_init": False,
+        "log_std_init": -0.5,
+        "lstm_kwargs": {
+            "dropout": 0.1,
+            "layer_norm": True,
+        },
     },
 
-    # STATE-OF-THE-ART PPO HYPERPARAMETERS - GPU OPTIMIZED
-    "n_steps": 4096,                                # Balanced rollouts for GPU utilization without overload
-    "batch_size": 1024,                             # Larger batches (512→1024) for maximum GPU parallelization
-    "n_epochs": 3,                                  # Reduced epochs (4→3) to maintain throughput
-    "learning_rate": 2.5e-4,                       # Balanced LR for stable learning
-    "min_learning_rate": 3e-5,                      # Adjusted minimum LR proportionally
-    "ent_coef": 0.003,                              # Moderate entropy bonus for GPU efficiency
-    "clip_range": 0.2,                              # Standard clip range for stability
-    "clip_range_final": 0.1,                        # Standard final clip range
-    "gamma": 0.995,                                 # Higher discount factor for longer-term credit
-    "gae_lambda": 0.98,                             # Higher GAE lambda for better advantage estimation
-    "max_grad_norm": 1.0,                           # Higher grad clip (0.8→1.0) for GPU efficiency
-    "vf_coef": 0.5,                                 # Balanced value coefficient
-    "clip_range_vf": 0.2,                           # Tighter value clipping prevents explosions
-    "use_sde": False,                               # Disable SDE for GPU efficiency (simpler exploration)
-    "sde_sample_freq": 4,                           # Not used since SDE disabled
-    "target_kl": 0.015,                             # Slightly more aggressive KL target for GPU
+    # PPO training
+    "n_steps": 4096,             # Longer rollouts for deeper credit assignment
+    "batch_size": 512,           # Large batch to stabilize updates with multiple envs
+    "n_epochs": 6,
+    "learning_rate": 3e-4,
+    "min_learning_rate": 1e-5,
+    "ent_coef": 0.005,           # Encourage exploration without overwhelming policy
+    "clip_range": 0.2,
+    "clip_range_final": 0.05,
+    "gamma": 0.995,
+    "gae_lambda": 0.98,
+    "max_grad_norm": 0.5,        # Prevent exploding gradients
+    "vf_coef": 0.5,              # Value function coefficient
+    "clip_range_vf": 0.3,
+    "use_sde": True,
+    "sde_sample_freq": 4,
+    "target_kl": 0.015,
 }
 
 # Training settings
@@ -185,6 +209,7 @@ TRAINING_CONFIG = {
     "total_timesteps": 3_000_000,  # Baseline full training run (~3M steps)
     "save_freq": 50_000,           # Save checkpoint every 50k steps
     "resolution": CameraResolution.LOW,
+    "n_envs": 4,                   # Parallel environments for better GPU utilization
 }
 
 CURRICULUM_CONFIG = {
@@ -294,110 +319,7 @@ print("=" * 70)
 
 
 # ============================================================================
-# ADVANCED EXPLORATION TECHNIQUES
-# ============================================================================
-
-class CuriosityModule:
-    """Batched curiosity-driven exploration with async updates - GPU OPTIMIZED"""
-
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 128, eta: float = 0.01, device: torch.device = None):
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
-        self.eta = eta  # Scaling factor for intrinsic reward
-        self.device = device if device is not None else torch.device('cpu')
-
-        # Forward model: predicts next observation from current obs + action
-        self.forward_model = nn.Sequential(
-            nn.Linear(obs_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, obs_dim)
-        ).to(self.device)
-
-        # Inverse model: predicts action from current and next obs
-        self.inverse_model = nn.Sequential(
-            nn.Linear(obs_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim)
-        ).to(self.device)
-
-        self.optimizer = torch.optim.Adam(
-            list(self.forward_model.parameters()) + list(self.inverse_model.parameters()),
-            lr=1e-4
-        )
-
-        # Experience buffer for batched updates
-        self.buffer = deque(maxlen=5000)
-
-    def push_transition(self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor):
-        """Store transition for later curiosity updates."""
-        self.buffer.append((obs.clone().detach(), next_obs.clone().detach(), action.clone().detach()))
-
-    def compute_intrinsic_reward(self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """Compute intrinsic reward without training - fast inference only."""
-        with torch.no_grad():
-            # Ensure tensors are on correct device
-            obs = obs.to(self.device)
-            next_obs = next_obs.to(self.device)
-            action = action.to(self.device)
-
-            pred_next = self.forward_model(torch.cat([obs, action], dim=-1))
-            error = torch.mean((pred_next - next_obs) ** 2, dim=-1)
-            intrinsic_reward = self.eta * error
-
-            # Return on CPU if needed
-            return intrinsic_reward.cpu() if self.device.type != 'cpu' else intrinsic_reward
-
-    def update(self, batch_size: int = 256, updates: int = 10):
-        """Train curiosity networks asynchronously in batches."""
-        if len(self.buffer) < batch_size:
-            return
-
-        self.forward_model.train()
-        self.inverse_model.train()
-
-        for _ in range(updates):
-            batch = random.sample(self.buffer, batch_size)
-            obs, next_obs, act = [torch.stack(x).to(self.device) for x in zip(*batch)]
-
-            # Forward model loss
-            pred_next = self.forward_model(torch.cat([obs, act], dim=-1))
-            forward_loss = torch.mean((pred_next - next_obs) ** 2)
-
-            # Inverse model loss
-            pred_action = self.inverse_model(torch.cat([obs, next_obs], dim=-1))
-            inverse_loss = torch.mean((pred_action - act) ** 2)
-
-            # Combined loss
-            loss = forward_loss + inverse_loss
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-
-        self.forward_model.eval()
-        self.inverse_model.eval()
-
-
-class ExplorationScheduler:
-    """Adaptive exploration scheduling that decreases entropy bonus over time"""
-
-    def __init__(self, initial_ent_coef: float = 0.005, final_ent_coef: float = 0.001, decay_steps: int = 1_000_000):
-        self.initial_ent_coef = initial_ent_coef
-        self.final_ent_coef = final_ent_coef
-        self.decay_steps = decay_steps
-
-    def get_ent_coef(self, current_step: int) -> float:
-        """Get entropy coefficient for current training step"""
-        progress = min(current_step / self.decay_steps, 1.0)
-        return self.final_ent_coef + (self.initial_ent_coef - self.final_ent_coef) * (1 - progress)
-
-
-# ============================================================================
-# REWARD FUNCTIONS (Enhanced with exploration bonuses)
+# REWARD FUNCTIONS (Same as before - these work great!)
 # ============================================================================
 
 
@@ -453,7 +375,7 @@ def danger_zone_reward(env: WarehouseBrawl, zone_height: float = 4.2) -> float:
 def on_win_reward(env: WarehouseBrawl, agent: str) -> float:
     """Strong reward for winning - dominates other rewards without exploding value function
     Winning needs to be very valuable to force opponent-specific strategies."""
-    return 50.0 if agent == 'player' else -50.0  # Balanced - enough to dominate but not too extreme
+    return 30.0 if agent == 'player' else -30.0  # Reduced from 100 to prevent value explosion
 
 
 def on_knockout_reward(env: WarehouseBrawl, agent: str) -> float:
@@ -478,224 +400,128 @@ def action_sparsity_reward(env: WarehouseBrawl, max_active: int = 2, penalty_per
     return penalty
 
 
-def intrinsic_curiosity_reward(env: WarehouseBrawl, curiosity_module: CuriosityModule = None) -> float:
-    """Add intrinsic curiosity reward for exploration - ASYNC BATCHED"""
-    if curiosity_module is None:
-        return 0.0
-
-    # Get the raw environment if this is a wrapper
-    raw_env = getattr(env, 'raw_env', env)
-
-    # Get current observation using the correct method
-    if hasattr(raw_env, 'observe'):
-        # For WarehouseBrawl environment, observe player 0 (the learning agent)
-        obs_array = raw_env.observe(0)
-        obs = torch.tensor(obs_array, dtype=torch.float32, device='cpu').unsqueeze(0)  # Start on CPU
-    else:
-        # Fallback for other environments
-        obs = torch.tensor(raw_env._get_obs() if hasattr(raw_env, '_get_obs') else np.zeros(44), dtype=torch.float32, device='cpu').unsqueeze(0)
-
-    action = torch.tensor(getattr(env, "cur_action", {}).get(0, np.zeros(env.action_space.shape[0])), dtype=torch.float32, device='cpu').unsqueeze(0)
-
-    # Store for next step computation
-    if not hasattr(env, '_prev_obs'):
-        env._prev_obs = obs
-        env._prev_action = action
-        return 0.0
-
-    # Compute intrinsic reward (fast inference only - no training)
-    intrinsic_reward = curiosity_module.compute_intrinsic_reward(env._prev_obs, obs, env._prev_action)
-
-    # Store transition for async batched updates
-    curiosity_module.push_transition(env._prev_obs, obs, env._prev_action)
-
-    # Update stored observations
-    env._prev_obs = obs
-    env._prev_action = action
-
-    # Convert to float for reward system
-    reward_value = float(intrinsic_reward.item()) if isinstance(intrinsic_reward, torch.Tensor) else float(intrinsic_reward)
-
-    stats = _get_diag_stats(env)
-    stats['intrinsic_reward'] = reward_value
-
-    return reward_value
-
-
-def gen_reward_manager(curiosity_module: CuriosityModule = None):
-    """Create reward manager with WIN-FOCUSED rewards + exploration bonuses
+def gen_reward_manager():
+    """Create reward manager with WIN-FOCUSED rewards
 
     Philosophy: Winning must be very valuable to force the model to
     learn opponent-specific strategies, but not so large it breaks value function.
-    Exploration bonuses help discover winning strategies.
-
-    NOTE: Training uses shaped rewards with penalties, but evaluation measures pure win rate.
-    This creates apparent discrepancy but is actually correct - agent learns efficient winning.
     """
     reward_functions = {
-        'danger_zone': RewTerm(func=danger_zone_reward, weight=0.1),        # Reduced from 0.2
-        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.5), # Reduced from 0.75
-        'action_sparsity': RewTerm(func=action_sparsity_reward, weight=0.5),      # Reduced from 1.0
-        'intrinsic_curiosity': RewTerm(
-            func=partial(intrinsic_curiosity_reward, curiosity_module=curiosity_module),
-            weight=0.05  # Reduced from 0.1
-        ),
+        'danger_zone': RewTerm(func=danger_zone_reward, weight=0.2),
+        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.75),
+        'action_sparsity': RewTerm(func=action_sparsity_reward, weight=1.0),
     }
     signal_subscriptions = {
-        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=3.0)),  # Increased to 150 points total!
-        'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=2.0)),  # Increased to 10 points
+        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=1.0)),  # 30 points!
+        'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=1.0)),  # 5 points
     }
     return RewardManager(reward_functions, signal_subscriptions)
-
-
-class WarmupScheduler:
-    """Learning rate warmup scheduler for stable training start"""
-
-    def __init__(self, warmup_steps: int, base_lr: float):
-        self.warmup_steps = warmup_steps
-        self.base_lr = base_lr
-
-    def get_lr(self, current_step: int) -> float:
-        """Get learning rate with warmup"""
-        if current_step < self.warmup_steps:
-            return self.base_lr * (current_step / self.warmup_steps)
-        return self.base_lr
-
-
-def create_adaptive_lr_schedule(base_lr: float, min_lr: float, warmup_steps: int = 10000):
-    """Create learning rate schedule with warmup and decay"""
-    def schedule(progress_remaining: float) -> float:
-        # Linear decay from base_lr to min_lr
-        lr = min_lr + (base_lr - min_lr) * progress_remaining
-
-        # Add warmup for first warmup_steps
-        if hasattr(schedule, '_warmup_scheduler'):
-            current_step = int((1 - progress_remaining) * 3_000_000)  # Approximate total steps
-            warmup_factor = schedule._warmup_scheduler.get_lr(current_step) / base_lr
-            lr *= warmup_factor
-
-        return lr
-
-    # Attach warmup scheduler
-    schedule._warmup_scheduler = WarmupScheduler(warmup_steps, base_lr)
-    return schedule
 
 
 # ============================================================================
 # SELF-PLAY HANDLER (Trains vs past checkpoints)
 # ============================================================================
 
-class MetaSelfPlayHandler:
-    """Advanced self-play with opponent skill assessment and meta-learning"""
-
-    def __init__(self, ckpt_dir: str, skill_assessment_window: int = 5):
+class SimpleSelfPlayHandler:
+    """Loads random past checkpoint as opponent"""
+    def __init__(self, ckpt_dir: str):
         self.ckpt_dir = ckpt_dir
         self.env = None
-        self.skill_assessment_window = skill_assessment_window
 
-        # Track opponent performance for meta-learning
-        self.opponent_performance = {}  # checkpoint_path -> [win_rates]
-        self.opponent_last_used = {}    # checkpoint_path -> last_used_step
-        self.current_skill_level = 0.5  # Start at medium difficulty
-
-        # Meta-learning: adapt selection based on recent performance
-        self.recent_performance = deque(maxlen=20)  # Track last 20 evaluations
-
-    def assess_opponent_skill(self, checkpoint_path: str) -> float:
-        """Assess opponent skill level based on historical performance"""
-        if checkpoint_path not in self.opponent_performance:
-            return 0.5  # Default medium skill
-
-        performances = self.opponent_performance[checkpoint_path]
-        if len(performances) < self.skill_assessment_window:
-            return np.mean(performances)
-
-        # Use recent performances for assessment
-        recent = performances[-self.skill_assessment_window:]
-        skill = np.mean(recent)
-
-        # Add recency weighting (more recent performances matter more)
-        if len(recent) > 1:
-            weights = np.linspace(0.5, 1.0, len(recent))
-            skill = np.average(recent, weights=weights)
-
-        return skill
-
-    def update_performance(self, checkpoint_path: str, win_rate: float):
-        """Update performance tracking for meta-learning"""
-        if checkpoint_path not in self.opponent_performance:
-            self.opponent_performance[checkpoint_path] = []
-
-        self.opponent_performance[checkpoint_path].append(win_rate)
-        self.recent_performance.append(win_rate)
-
-        # Keep only last N performances per opponent
-        if len(self.opponent_performance[checkpoint_path]) > 20:
-            self.opponent_performance[checkpoint_path] = self.opponent_performance[checkpoint_path][-20:]
-
-    def select_opponent_by_skill(self, target_skill: float) -> str:
-        """Select opponent closest to target skill level"""
+    def get_opponent(self) -> Agent:
         import glob
+        import random
 
         zips = glob.glob(os.path.join(self.ckpt_dir, "rl_model_*.zip"))
         if not zips:
-            return None
-
-        # Assess skill of all available opponents
-        opponent_skills = {}
-        for path in zips:
-            skill = self.assess_opponent_skill(path)
-            opponent_skills[path] = skill
-
-        # Select opponent closest to target skill
-        best_path = min(opponent_skills.keys(),
-                       key=lambda p: abs(opponent_skills[p] - target_skill))
-
-        # Update usage tracking
-        self.opponent_last_used[best_path] = getattr(self, 'current_step', 0)
-
-        return best_path
-
-    def adapt_skill_target(self) -> float:
-        """Meta-learning: adapt target skill based on recent performance"""
-        if len(self.recent_performance) < 5:
-            return self.current_skill_level
-
-        recent_avg = np.mean(list(self.recent_performance))
-
-        # If winning too easily, increase difficulty
-        if recent_avg > 0.7:
-            self.current_skill_level = min(1.0, self.current_skill_level + 0.1)
-        # If losing too much, decrease difficulty
-        elif recent_avg < 0.3:
-            self.current_skill_level = max(0.0, self.current_skill_level - 0.1)
-        # Otherwise, fine-tune based on exact performance
-        else:
-            adjustment = (0.5 - recent_avg) * 0.05  # Small adjustments
-            self.current_skill_level = np.clip(self.current_skill_level + adjustment, 0.0, 1.0)
-
-        return self.current_skill_level
-
-    def get_opponent(self) -> Agent:
-        """Get opponent with meta-learning skill adaptation"""
-        # Adapt target skill based on recent performance
-        target_skill = self.adapt_skill_target()
-
-        # Select opponent matching target skill
-        checkpoint_path = self.select_opponent_by_skill(target_skill)
-
-        if checkpoint_path is None:
             return ConstantAgent()  # Fallback if no checkpoints yet
 
-        opponent = RecurrentPPOAgent(file_path=checkpoint_path)
+        path = random.choice(zips)
+        opponent = RecurrentPPOAgent(file_path=path)
         if self.env:
             opponent.get_env_info(self.env)
-
-        # Store current step for usage tracking
-        if hasattr(self, 'env') and hasattr(self.env, 'steps'):
-            self.current_step = self.env.steps
-
         return opponent
+
+
+def _make_self_play_env(seed: int, env_index: int) -> SelfPlayWarehouseBrawl:
+    """Factory helper that constructs a fully configured self-play environment."""
+    seed_everything(seed)
+
+    reward_manager = gen_reward_manager()
+
+    self_play_handler = SimpleSelfPlayHandler(CHECKPOINT_DIR)
+    opponents_dict = {**OPPONENT_MIX}
+    opponents_dict["self_play"] = (CURRICULUM_CONFIG["self_play_weight"], self_play_handler)
+
+    opponent_cfg = OpponentsCfg(opponents={
+        k: (prob, agent_partial) for k, (prob, agent_partial) in opponents_dict.items()
+    })
+
+    env = SelfPlayWarehouseBrawl(
+        reward_manager=reward_manager,
+        opponent_cfg=opponent_cfg,
+        save_handler=None,
+        resolution=TRAINING_CONFIG["resolution"],
+    )
+
+    env.action_space.seed(seed)
+    env.reset(seed=seed)
+
+    # Attach handler references
+    self_play_handler.env = env
+    reward_manager.subscribe_signals(env.raw_env)
+    opponent_cfg.base_probabilities = {
+        name: (value if isinstance(value, float) else value[0])
+        for name, value in opponent_cfg.opponents.items()
+    }
+
+    # Book-keeping for downstream utilities
+    env.self_play_handler = self_play_handler
+    env.env_index = env_index
+    return env
+
+
+def _make_vec_env(num_envs: int) -> Tuple[VecNormalize, List[SelfPlayWarehouseBrawl]]:
+    """Create a vectorized self-play environment with normalization."""
+
+    def make_thunk(rank: int) -> Callable[[], SelfPlayWarehouseBrawl]:
+        def _init():
+            # Offset seeds to guarantee decorrelated rollouts
+            env_seed = GLOBAL_SEED + rank * 9973
+            return _make_self_play_env(env_seed, rank)
+        return _init
+
+    env_fns = [make_thunk(i) for i in range(num_envs)]
+
+    # Prefer SubprocVecEnv for parallelism, but gracefully fall back
+    try:
+        vec_env = SubprocVecEnv(env_fns, start_method="spawn")
+        print(f"✓ SubprocVecEnv initialized with {num_envs} workers")
+    except Exception as exc:
+        print(f"⚠ SubprocVecEnv creation failed ({exc}). Falling back to DummyVecEnv.")
+        vec_env = DummyVecEnv(env_fns)
+
+    vec_env = VecMonitor(vec_env)
+    vec_env = VecNormalize(
+        vec_env,
+        norm_obs=True,
+        norm_reward=True,
+        clip_obs=5.0,
+        clip_reward=10.0,
+        gamma=AGENT_CONFIG["gamma"],
+    )
+
+    # Unwrap to access the underlying env instances for curriculum control
+    base_envs: List[SelfPlayWarehouseBrawl] = []
+    unwrap_ptr = vec_env
+    while hasattr(unwrap_ptr, "venv"):
+        unwrap_ptr = unwrap_ptr.venv
+    if hasattr(unwrap_ptr, "envs"):
+        base_envs = unwrap_ptr.envs  # type: ignore[assignment]
+    else:
+        base_envs = [unwrap_ptr]  # type: ignore[list-item]
+
+    return vec_env, base_envs
 
 
 # ============================================================================
@@ -703,101 +529,36 @@ class MetaSelfPlayHandler:
 # ============================================================================
 
 def train():
-    """Main training loop - STATE-OF-THE-ART PPO with advanced techniques!"""
+    """Main training loop - just run this!"""
 
     print("\n" + "=" * 70)
-    print("🚀 STARTING STATE-OF-THE-ART PPO TRAINING")
-    print("=" * 70)
-    print("✨ Advanced LSTM Architecture")
-    print("🧠 Curiosity-Driven Exploration")
-    print("📈 Adaptive Learning Rate Scheduling")
-    print("🎯 Advantage Normalization")
-    print("🏆 Enhanced Curriculum Learning")
+    print("STARTING SIMPLIFIED TRAINING")
     print("=" * 70 + "\n")
 
-    # Initialize exploration scheduler (curiosity module needs env first)
-    exploration_scheduler = ExplorationScheduler(
-        initial_ent_coef=0.005,
-        final_ent_coef=0.001,
-        decay_steps=1_000_000
-    )
+    vec_env, env_instances = _make_vec_env(TRAINING_CONFIG["n_envs"])
+    primary_env = env_instances[0]
 
-    # Setup ADVANCED self-play opponents with meta-learning
-    self_play_handler = MetaSelfPlayHandler(CHECKPOINT_DIR, skill_assessment_window=5)
-    opponents_dict = {**OPPONENT_MIX}  # Scripted opponents
-    opponents_dict["self_play"] = (CURRICULUM_CONFIG["self_play_weight"], self_play_handler)
-
-    opponent_cfg = OpponentsCfg(opponents={
-        k: (prob, agent_partial) for k, (prob, agent_partial) in opponents_dict.items()
-    })
-
-    # Create single environment first to get dimensions for curiosity module
-    temp_env = SelfPlayWarehouseBrawl(
-        reward_manager=None,
-        opponent_cfg=opponent_cfg,
-        save_handler=None,
-        resolution=TRAINING_CONFIG["resolution"],
-    )
-
-    # Now initialize curiosity module with correct dimensions - GPU ACCELERATED
-    print("🔧 Initializing curiosity module on GPU...")
-    obs_dim = temp_env.observation_space.shape[0]
-    action_dim = temp_env.action_space.shape[0]
-    curiosity_module = CuriosityModule(obs_dim, action_dim, eta=0.01, device=DEVICE)
-
-    # Create reward manager with curiosity
-    reward_manager = gen_reward_manager(curiosity_module)
-
-    def make_env(rank):
-        """Create environment for vectorized setup"""
-        def _init():
-            env = SelfPlayWarehouseBrawl(
-                reward_manager=reward_manager,
-                opponent_cfg=opponent_cfg,
-                save_handler=None,
-                resolution=TRAINING_CONFIG["resolution"],
-            )
-            env.action_space.seed(GLOBAL_SEED + rank)
-            return env
-        return _init
-
-    # Create vectorized environments for parallel rollouts (DummyVecEnv for compatibility)
-    num_envs = 2  # Conservative number for custom environment compatibility
-    print(f"🎯 Creating {num_envs} parallel environments for faster training...")
-    env_fns = [make_env(i) for i in range(num_envs)]
-    vec_env = DummyVecEnv(env_fns)
-    vec_env = VecMonitor(vec_env)
-
-    # Attach self-play handler to first environment (for evaluation)
-    self_play_handler.env = vec_env.envs[0]  # Access first sub-env
-    opponent_cfg.base_probabilities = {
-        name: (value if isinstance(value, float) else value[0])
-        for name, value in opponent_cfg.opponents.items()
-    }
-
-    print(f"✓ Vectorized environment created")
-    print(f"  Number of envs: {num_envs}")
-    print(f"  Observation dim: {vec_env.observation_space.shape[0]}")
+    print(f"✓ Environment created ({len(env_instances)} parallel arenas)")
+    print(f"  Observation dim: {primary_env.observation_space.shape[0]}")
     print(f"  LSTM handles temporal patterns over raw obs\n")
 
-    # Create policy kwargs with advanced architecture
+    # Create policy kwargs (no custom feature extractor)
     policy_kwargs = {
         **AGENT_CONFIG["policy_kwargs"],
     }
 
-    # Build ADVANCED schedules: adaptive LR with warmup + exploration scheduling
-    lr_schedule = create_adaptive_lr_schedule(
+    # Build schedules for learning rate and clipping
+    lr_schedule = linear_schedule(
         AGENT_CONFIG["learning_rate"],
         AGENT_CONFIG["min_learning_rate"],
-        warmup_steps=20000  # 20k steps warmup
     )
     clip_schedule = linear_schedule(
         AGENT_CONFIG["clip_range"],
         AGENT_CONFIG["clip_range_final"],
     )
 
-    # Create ADVANCED AMP-ENABLED RecurrentPPO model with state-of-the-art features
-    model = AMPRecurrentPPO(
+    # Create RecurrentPPO model
+    model = RecurrentPPO(
         "MlpLstmPolicy",
         vec_env,
         verbose=1,
@@ -805,57 +566,46 @@ def train():
         batch_size=AGENT_CONFIG["batch_size"],
         n_epochs=AGENT_CONFIG["n_epochs"],
         learning_rate=lr_schedule,
-        ent_coef=AGENT_CONFIG["ent_coef"],  # Will be dynamically updated
+        ent_coef=AGENT_CONFIG["ent_coef"],
         clip_range=clip_schedule,
         gamma=AGENT_CONFIG["gamma"],
         gae_lambda=AGENT_CONFIG["gae_lambda"],
         max_grad_norm=AGENT_CONFIG["max_grad_norm"],
         vf_coef=AGENT_CONFIG["vf_coef"],
-        clip_range_vf=AGENT_CONFIG["clip_range_vf"],  # Tighter value clipping
+        clip_range_vf=AGENT_CONFIG["clip_range_vf"],
         target_kl=AGENT_CONFIG["target_kl"],
         use_sde=AGENT_CONFIG["use_sde"],
         sde_sample_freq=AGENT_CONFIG["sde_sample_freq"],
         policy_kwargs=policy_kwargs,
         device=DEVICE,
-        tensorboard_log=None,  # Disable tensorboard logging to avoid dependency issues
+        tensorboard_log=str(TENSORBOARD_DIR),
         seed=GLOBAL_SEED,
     )
-
-    # Add advantage normalization for more stable learning
-    if hasattr(model, 'normalize_advantage'):
-        model.normalize_advantage = True
 
     print(f"✓ RecurrentPPO model created on {DEVICE}\n")
 
     # Create checkpoint callback
     from stable_baselines3.common.callbacks import CheckpointCallback
 
-    checkpoint_callback = CheckpointCallback(
-        save_freq=TRAINING_CONFIG["save_freq"],
-        save_path=CHECKPOINT_DIR,
-        name_prefix="rl_model",
-        save_replay_buffer=False,
-        save_vecnormalize=False,
-    )
-
-    # ADVANCED training monitor with dynamic exploration scheduling
+    # Lightweight training monitor - tracks essential metrics
     class TrainingMonitor(CheckpointCallback):
-        def __init__(self, *args, env=None, eval_freq=10000, eval_games=10, exploration_scheduler=None, curiosity_module=None, **kwargs):
-            self.env_ref = env  # Store env reference before calling super
-            self.exploration_scheduler = exploration_scheduler
-            self.curiosity_module = curiosity_module
+        def __init__(self, *args, env=None, env_instances=None, eval_freq=20_000, eval_games=5, **kwargs):
+            self.env_group = list(env_instances) if env_instances else []
+            if env is not None and (not self.env_group or env is not self.env_group[0]):
+                self.env_group.insert(0, env)
+            self.primary_env = self.env_group[0] if self.env_group else env
+            self.env_ref = self.primary_env
             super().__init__(*args, **kwargs)
             self.episode_rewards = []
             self.episode_lengths = []
             self.episode_count = 0
-            self.eval_freq = eval_freq  # Evaluate every N steps
-            self.eval_games = eval_games  # Games per opponent during eval
+            self.eval_freq = eval_freq
+            self.eval_games = eval_games
             self.last_eval_step = 0
             self._seen_ep_ids = deque()
             self._seen_ep_id_set = set()
             self.last_episode_summary = None
             self.last_opponent_probs = None
-            self.intrinsic_rewards = []  # Track intrinsic reward bonuses
 
         def evaluate_against_all_opponents(self):
             """Run evaluation games against all opponent types and return win rates"""
@@ -926,30 +676,32 @@ def train():
             print(f"{'OVERALL':<15} {overall_wr:>5.1f}%     {total_wins}/{total_games}")
             print(f"{'='*70}\n")
 
+            if hasattr(self.model, "logger") and self.model.logger:
+                for opp_name, stats in results.items():
+                    self.model.logger.record(
+                        f"eval/win_rate/{opp_name}",
+                        stats['win_rate'] / 100.0,
+                        exclude=("stdout",),
+                    )
+                self.model.logger.record(
+                    "eval/overall_win_rate",
+                    overall_wr / 100.0,
+                    exclude=("stdout",),
+                )
+
             self._update_curriculum(results)
 
-            # META-LEARNING: Update self-play handler with performance data
-            if hasattr(self, 'env_ref') and hasattr(self.env_ref, 'opponent_cfg'):
-                for name, value in self.env_ref.opponent_cfg.opponents.items():
-                    if name == "self_play" and isinstance(value[1], MetaSelfPlayHandler):
-                        # For self-play opponents, we need to track which checkpoint was actually used
-                        # This is approximated by the most recent checkpoint
-                        import glob
-                        zips = glob.glob(os.path.join(CHECKPOINT_DIR, "rl_model_*.zip"))
-                        if zips:
-                            # Use the most recent checkpoint as approximation
-                            latest_checkpoint = max(zips, key=os.path.getctime)
-                            value[1].update_performance(latest_checkpoint, overall_wr / 100.0)
-                        break
+            if hasattr(self.model, "logger") and self.model.logger:
+                self.model.logger.dump(self.num_timesteps)
 
             return results, overall_wr
 
         def _update_curriculum(self, eval_results: dict) -> None:
             """Dynamically adjust opponent sampling based on evaluation results."""
-            if self.env_ref is None:
+            if self.primary_env is None:
                 return
 
-            cfg = getattr(self.env_ref, "opponent_cfg", None)
+            cfg = getattr(self.primary_env, "opponent_cfg", None)
             if cfg is None or not hasattr(cfg, "opponents"):
                 return
 
@@ -967,6 +719,7 @@ def train():
             }
 
             new_opponents: Dict[str, Tuple[float, Any]] = {}
+            updated_probabilities: Dict[str, float] = {}
             for name, value in cfg.opponents.items():
                 if isinstance(value, tuple):
                     current_prob, agent_factory = value
@@ -989,6 +742,7 @@ def train():
                     adjusted_prob = max(CURRICULUM_CONFIG["min_probability"], base_prob + adjustment)
 
                 new_opponents[name] = (adjusted_prob, agent_factory)
+                updated_probabilities[name] = adjusted_prob
 
             cfg.opponents = new_opponents
             cfg.validate_probabilities()
@@ -1002,21 +756,47 @@ def train():
                 for name in cfg.opponents
             )
 
+            if len(self.env_group) > 1:
+                for env_instance in self.env_group[1:]:
+                    other_cfg = getattr(env_instance, "opponent_cfg", None)
+                    if other_cfg is None or not hasattr(other_cfg, "opponents"):
+                        continue
+                    aligned: Dict[str, Tuple[float, Any]] = {}
+                    for name, value in other_cfg.opponents.items():
+                        if isinstance(value, tuple):
+                            _, agent_factory = value
+                        else:
+                            agent_factory = None
+
+                        prob_value = updated_probabilities.get(
+                            name,
+                            value[0] if isinstance(value, tuple) else value
+                        )
+                        if name == "self_play" and hasattr(env_instance, "self_play_handler"):
+                            agent_factory = env_instance.self_play_handler
+                        aligned[name] = (prob_value, agent_factory)
+                    other_cfg.opponents = aligned
+                    other_cfg.validate_probabilities()
+                    other_cfg.base_probabilities = {
+                        name: val[0] if isinstance(val, tuple) else val
+                        for name, val in other_cfg.opponents.items()
+                    }
+
             if updated:
                 print("[CURRICULUM] Opponent probabilities (normalized):")
                 for name, (prob, _) in cfg.opponents.items():
                     print(f"  - {name}: {prob:.3f}")
                 self.last_opponent_probs = {name: prob for name, (prob, _) in cfg.opponents.items()}
 
-            # Logger calls are disabled when tensorboard_log=None
+            if hasattr(self.model, "logger") and self.model.logger:
+                for name, (prob, _) in cfg.opponents.items():
+                    self.model.logger.record(
+                        f"curriculum/opponent_prob/{name}",
+                        prob,
+                        exclude=("stdout",),
+                    )
 
         def _on_step(self):
-            # DYNAMIC EXPLORATION SCHEDULING: Update entropy coefficient
-            if self.exploration_scheduler is not None:
-                new_ent_coef = self.exploration_scheduler.get_ent_coef(self.num_timesteps)
-                if hasattr(self.model, 'ent_coef'):
-                    self.model.ent_coef = new_ent_coef
-
             # Track episode completion from buffer
             if hasattr(self, 'model') and hasattr(self.model, 'ep_info_buffer'):
                 buffer = list(self.model.ep_info_buffer)
@@ -1041,24 +821,14 @@ def train():
                         summary = getattr(self.env_ref.raw_env, '_diag_last_episode', None)
                         if summary is not None:
                             self.last_episode_summary = summary
-                            # Track intrinsic rewards
-                            intrinsic_reward = summary.get('intrinsic_reward', 0.0)
-                            if intrinsic_reward != 0.0:
-                                self.intrinsic_rewards.append(intrinsic_reward)
-
-            # Logger calls are disabled when tensorboard_log=None
-
-            # Async curiosity updates every 2000 steps
-            if self.curiosity_module is not None and self.num_timesteps % 2000 == 0:
-                self.curiosity_module.update()
 
             # Run evaluation every eval_freq steps
             if self.num_timesteps >= self.last_eval_step + self.eval_freq and self.num_timesteps > 0:
                 self.last_eval_step = self.num_timesteps
                 self.evaluate_against_all_opponents()
 
-            # Print comprehensive update every 2000 steps (reduced frequency for GPU focus)
-            if self.n_calls % 2000 == 0:
+            # Print comprehensive update every 1000 steps
+            if self.n_calls % 1000 == 0:
                 print(f"\n{'='*70}")
                 print(f"TRAINING UPDATE @ {self.num_timesteps:,} steps")
                 print(f"{'='*70}")
@@ -1068,7 +838,7 @@ def train():
                     recent_rewards = self.episode_rewards[-100:]  # Last 100 episodes
                     print(f"\n[PERFORMANCE]")
                     print(f"  Episodes completed: {self.episode_count}")
-                    print(f"  Avg Reward (last 100 ep): {np.mean(recent_rewards):.2f}")
+                    print(f"  Avg Reward (last 100 ep): {safe_mean(recent_rewards):.2f}")
                     print(f"  Reward Std: {np.std(recent_rewards):.2f}")
 
                 if self.last_episode_summary:
@@ -1078,34 +848,40 @@ def train():
                     print(f"  Damage taken: {stats.get('damage_taken', 0):.1f}")
                     print(f"  Time in danger zone (s): {stats.get('zone_time', 0):.1f}")
                     print(f"  Sparsity penalty: {stats.get('sparsity_penalty', 0):.2f}")
-                    print(f"  Intrinsic reward: {stats.get('intrinsic_reward', 0):.3f}")
                     print(f"  Episode reward: {stats.get('reward', 0):.2f}")
-                    print(f"  Episode length: {self.episode_lengths[-1] if self.episode_lengths else 0} steps")
-
-                # Add exploration metrics
-                if self.exploration_scheduler is not None:
-                    current_ent_coef = self.exploration_scheduler.get_ent_coef(self.num_timesteps)
-                    print(f"  Current entropy coef: {current_ent_coef:.4f}")
-
-                if self.intrinsic_rewards:
-                    recent_intrinsic = np.mean(self.intrinsic_rewards[-20:])  # Last 20 intrinsic rewards
-                    print(f"  Recent intrinsic reward: {recent_intrinsic:.4f}")
-
-                # Add curriculum info
-                if hasattr(self, 'env_ref') and hasattr(self.env_ref, 'opponent_cfg'):
-                    current_opponent = getattr(self.env_ref.opponent_cfg, 'current_opponent_name', 'unknown')
-                    print(f"  Current opponent type: {current_opponent}")
 
                 # === LEARNING STABILITY ===
                 print(f"\n[LEARNING]")
 
-                # GPU Memory usage (if available)
-                if torch.cuda.is_available():
+                if hasattr(self.model, "ent_coef"):
+                    progress_remaining = max(
+                        0.0, 1.0 - (self.num_timesteps / TRAINING_CONFIG["total_timesteps"])
+                    )
+                    target_ent = float(np.clip(
+                        AGENT_CONFIG["ent_coef"] * (0.3 + 0.7 * progress_remaining),
+                        5e-4,
+                        AGENT_CONFIG["ent_coef"],
+                    ))
+                    if abs(float(getattr(self.model, "ent_coef", target_ent)) - target_ent) > 1e-6:
+                        self.model.ent_coef = target_ent
+                    print(f"  Entropy Coef: {float(self.model.ent_coef):.5f}")
+
+                # Policy loss (from logger if available)
+                if hasattr(self.model, 'logger') and self.model.logger:
                     try:
-                        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-                        gpu_allocated = torch.cuda.memory_allocated(0) / 1024**3
-                        gpu_reserved = torch.cuda.memory_reserved(0) / 1024**3
-                        print(f"  GPU Memory: {gpu_allocated:.1f}GB used / {gpu_reserved:.1f}GB reserved / {gpu_memory:.1f}GB total")
+                        # Access recent logged values
+                        if hasattr(self.model.logger, 'name_to_value'):
+                            if 'train/policy_loss' in self.model.logger.name_to_value:
+                                policy_loss = self.model.logger.name_to_value['train/policy_loss']
+                                print(f"  Policy Loss: {policy_loss:.4f}")
+                            if 'train/value_loss' in self.model.logger.name_to_value:
+                                value_loss = self.model.logger.name_to_value['train/value_loss']
+                                print(f"  Value Loss: {value_loss:.4f}")
+                            if 'train/entropy_loss' in self.model.logger.name_to_value:
+                                entropy_loss = self.model.logger.name_to_value['train/entropy_loss']
+                                # Entropy loss is negative (we want to maximize entropy)
+                                # More negative = higher actual entropy (good!)
+                                print(f"  Entropy Loss: {entropy_loss:.4f} {'✓' if entropy_loss < -0.01 else '⚠️ LOW exploration'}")
                     except:
                         pass
 
@@ -1125,32 +901,23 @@ def train():
             return super()._on_step()
 
     training_callback = TrainingMonitor(
-        env=vec_env,  # Pass vectorized environment reference for opponent tracking
-        exploration_scheduler=exploration_scheduler,  # Dynamic exploration scheduling
-        curiosity_module=curiosity_module,  # For async curiosity updates
-        eval_freq=25_000,  # Evaluate every 25k steps (more frequent to track progress)
-        eval_games=3,  # 3 games per opponent during evaluation (better statistics)
+        env=primary_env,
+        env_instances=env_instances,
+        eval_freq=20_000,  # Evaluate every 20k steps
+        eval_games=5,  # 5 games per opponent during evaluation
         save_freq=TRAINING_CONFIG["save_freq"],
         save_path=CHECKPOINT_DIR,
         name_prefix="rl_model",
         save_replay_buffer=False,
-        save_vecnormalize=False,
+        save_vecnormalize=True,
     )
 
-    print("🚀 HYPER-OPTIMIZED ADVANCED TRAINING STARTED\n")
-    print("Version 4.2 - STATE-OF-THE-ART RecurrentPPO + MAXIMUM PERFORMANCE")
+    print("🚀 Training started\n")
+    print("Version 3.0 - LSTM-only RecurrentPPO")
     print("="*70)
-    print("  🔥 GPU ACCELERATED: Curiosity models on GPU, CUDA optimizations")
-    print("  ⚡ ASYNC CURIOSITY: Batched updates every 2000 steps")
-    print("  🎯 VECTORIZED ENVS: 2 parallel environments for 2x throughput")
-    print("  🏃‍♂️ AMP TRAINING: Automatic Mixed Precision for 2x speed")
-    print("  ✨ ADVANCED LSTM: 512 hidden, 3 layers, dropout")
-    print("  🧠 CURIOSITY EXPLORATION: GPU-accelerated intrinsic motivation")
-    print("  📈 HYPERPARAMETERS: Optimized for GPU (4096 steps, 1024 batch)")
-    print("  🎯 ADVANTAGE NORMALIZATION: Stable policy updates")
-    print("  🔄 DYNAMIC ENTROPY: Exploration scheduling")
-    print("  🏆 ENHANCED CURRICULUM: Progressive opponent difficulty")
-    print("  ⚡ REDUCED CPU LOAD: Less frequent evaluation and logging")
+    print("  - No encoder or history wrapper")
+    print("  - LSTM learns temporal patterns directly from raw obs")
+    print("  - Stable reward shaping (win-focused)")
     print("="*70 + "\n")
 
     # Train!
@@ -1163,14 +930,19 @@ def train():
     # Save final model
     final_path = os.path.join(CHECKPOINT_DIR, "final_model.zip")
     model.save(final_path)
+    vecnorm_path = os.path.join(CHECKPOINT_DIR, "vecnormalize_final.pkl")
+    vec_env.save(vecnorm_path)
 
     print("\n" + "=" * 70)
     print("✅ TRAINING COMPLETE!")
     print("=" * 70)
     print(f"Final model saved to: {final_path}")
     print(f"Checkpoints saved in: {CHECKPOINT_DIR}")
+    print(f"VecNormalize stats saved to: {vecnorm_path}")
     print("\nTo continue training, load the checkpoint and resume!")
     print("=" * 70 + "\n")
+
+    vec_env.close()
 
 
 # ============================================================================

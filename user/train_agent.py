@@ -3130,13 +3130,12 @@ class PerformanceBenchmark:
             # Record latent vector and transformer health after match
             self.record_latent_vector(agent)
 
-            results.append({
-                'won': match_stats.player1_result == Result.WIN,
-                # 🔧 FIXED: Changed total_damage → damage_taken (correct attribute)
-                'damage_dealt': match_stats.player2.damage_taken,  # Damage we dealt
-                'damage_taken': match_stats.player1.damage_taken   # Damage we took
-            })
-
+                    results.append({
+                        'won': match_stats.player1_result == Result.WIN,
+                        # 🔧 FIXED: Changed total_damage → damage_taken (correct attribute)
+                        'damage_dealt': match_stats.player2.total_damage,  # Damage we dealt
+                        'damage_taken': match_stats.player1.total_damage   # Damage we took
+                    })
         return results
     
     def _calculate_strategy_diversity(self, agent: Agent) -> float:

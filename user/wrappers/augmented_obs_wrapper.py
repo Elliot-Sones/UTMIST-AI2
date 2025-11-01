@@ -112,6 +112,28 @@ class AugmentedObservationWrapper(VecEnvWrapper):
         # Augment observations with opponent history
         augmented_obs = self._augment_observations(obs, infos)
 
+        # IMPORTANT: Also augment terminal_observation in infos if present
+        # VecNormalize expects terminal observations to have the same shape
+        for env_idx in range(self.num_envs):
+            if infos[env_idx] is not None and 'terminal_observation' in infos[env_idx]:
+                terminal_obs = infos[env_idx]['terminal_observation']
+
+                # Get opponent history for this terminal observation
+                if 'opponent_history' in infos[env_idx]:
+                    opponent_history = infos[env_idx]['opponent_history']
+                else:
+                    # Use last known history
+                    opponent_history = self.last_opponent_histories[env_idx]
+
+                # Flatten and concatenate
+                opponent_history_flat = opponent_history.flatten()
+                augmented_terminal_obs = np.concatenate([
+                    terminal_obs,
+                    opponent_history_flat
+                ])
+
+                infos[env_idx]['terminal_observation'] = augmented_terminal_obs
+
         return augmented_obs, rewards, dones, infos
 
     def reset(self) -> np.ndarray:

@@ -309,11 +309,21 @@ def gen_reward_manager():
 def _make_self_play_env(
     seed: int,
     env_index: int,
-    diverse_opponent_sampler: DiverseOpponentSampler
+    population_manager: PopulationManager
 ) -> SelfPlayWarehouseBrawl:
     seed_everything(seed)
 
     reward_manager = gen_reward_manager()
+
+    # Create a NEW DiverseOpponentSampler for this environment
+    # This avoids pickle issues with shared state
+    diverse_opponent_sampler = DiverseOpponentSampler(
+        checkpoint_dir=CHECKPOINT_DIR,
+        population_manager=population_manager,
+        noise_probability=POPULATION_CONFIG["noise_probability"],
+        use_population_prob=POPULATION_CONFIG["use_population_prob"],
+        verbose=False,  # Suppress output for each environment
+    )
 
     # Create opponent configuration with diverse sampler + scripted mix
     opponents_dict = {**OPPONENT_MIX}
@@ -350,22 +360,19 @@ def _make_self_play_env(
 
 def _make_vec_env(
     num_envs: int,
-    diverse_opponent_sampler: DiverseOpponentSampler
+    population_manager: PopulationManager
 ) -> Tuple[VecNormalize, List[SelfPlayWarehouseBrawl]]:
     def make_thunk(rank: int) -> Callable[[], SelfPlayWarehouseBrawl]:
         def _init():
             env_seed = GLOBAL_SEED + rank * 9973
-            return _make_self_play_env(env_seed, rank, diverse_opponent_sampler)
+            return _make_self_play_env(env_seed, rank, population_manager)
         return _init
 
     env_fns = [make_thunk(i) for i in range(num_envs)]
 
-    try:
-        vec_env = SubprocVecEnv(env_fns, start_method="spawn")
-        print(f"✓ SubprocVecEnv initialized with {num_envs} workers")
-    except Exception as exc:
-        print(f"⚠ SubprocVecEnv creation failed ({exc}). Falling back to DummyVecEnv.")
-        vec_env = DummyVecEnv(env_fns)
+    # Use DummyVecEnv to avoid multiprocessing pickle issues with CUDA models
+    vec_env = DummyVecEnv(env_fns)
+    print(f"✓ DummyVecEnv initialized with {num_envs} workers")
 
     vec_env = VecMonitor(vec_env)
 
@@ -416,25 +423,23 @@ def train():
     print("STRATEGY-CONDITIONED TRAINING WITH POPULATION-BASED SELF-PLAY")
     print("=" * 70 + "\n")
 
-    # Create population manager
+    # Create population manager (shared across all environments)
     population_manager = PopulationManager(
         checkpoint_dir=CHECKPOINT_DIR,
         max_population_size=POPULATION_CONFIG["max_population_size"],
         num_weak_agents=POPULATION_CONFIG["num_weak_agents"],
     )
 
-    # Create diverse opponent sampler
-    diverse_opponent_sampler = DiverseOpponentSampler(
-        checkpoint_dir=CHECKPOINT_DIR,
-        population_manager=population_manager,
-        noise_probability=POPULATION_CONFIG["noise_probability"],
-        use_population_prob=POPULATION_CONFIG["use_population_prob"],
-    )
+    print(f"✓ Population-based self-play configured:")
+    print(f"  - Each environment creates its own opponent sampler")
+    print(f"  - Shared population: {POPULATION_CONFIG['max_population_size']} max agents")
+    print(f"  - Population sampling: {POPULATION_CONFIG['use_population_prob']:.0%} of episodes")
+    print(f"  - Noise injection: {POPULATION_CONFIG['noise_probability']:.0%} of episodes\n")
 
     # Create environment
     vec_env, env_instances = _make_vec_env(
         TRAINING_CONFIG["n_envs"],
-        diverse_opponent_sampler
+        population_manager
     )
     primary_env = env_instances[0]
 
@@ -524,7 +529,10 @@ def train():
     print(f"\n✓ Training complete!")
     print(f"  Final model saved: {final_path}")
     print(f"  Population size: {len(population_manager)}")
-    print(f"  Sampler stats: {diverse_opponent_sampler.get_stats()}")
+
+    # Get sampler stats from first environment
+    if hasattr(env_instances[0], 'diverse_opponent_sampler'):
+        print(f"  Sampler stats (env 0): {env_instances[0].diverse_opponent_sampler.get_stats()}")
 
 
 if __name__ == "__main__":

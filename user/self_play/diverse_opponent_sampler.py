@@ -46,12 +46,14 @@ class DiverseOpponentSampler:
         population_manager: PopulationManager,
         noise_probability: float = 0.10,
         use_population_prob: float = 0.70,
+        verbose: bool = True,
     ):
         self.checkpoint_dir = checkpoint_dir
         self.population_manager = population_manager
         self.noise_probability = noise_probability
         self.use_population_prob = use_population_prob
         self.env = None  # Set by environment
+        self.verbose = verbose
 
         # Statistics tracking
         self.stats = {
@@ -61,10 +63,20 @@ class DiverseOpponentSampler:
             'weak_sampled': 0,
         }
 
-        print(f"✓ DiverseOpponentSampler initialized:")
-        print(f"  - Population size: {len(population_manager)}")
-        print(f"  - Use population prob: {use_population_prob:.1%}")
-        print(f"  - Noise prob: {noise_probability:.1%}")
+        if verbose:
+            print(f"✓ DiverseOpponentSampler initialized:")
+            print(f"  - Population size: {len(population_manager)}")
+            print(f"  - Use population prob: {use_population_prob:.1%}")
+            print(f"  - Noise prob: {noise_probability:.1%}")
+
+    def __call__(self) -> Agent:
+        """
+        Make sampler callable (required by environment).
+
+        Returns:
+            Agent instance to use as opponent
+        """
+        return self.get_opponent()
 
     def get_opponent(self) -> Agent:
         """
@@ -210,6 +222,7 @@ def create_diverse_opponent_sampler(
     num_weak_agents: int = 3,
     noise_probability: float = 0.10,
     use_population_prob: float = 0.70,
+    verbose: bool = True,
 ) -> DiverseOpponentSampler:
     """
     Factory function to create DiverseOpponentSampler with PopulationManager.
@@ -220,6 +233,7 @@ def create_diverse_opponent_sampler(
         num_weak_agents: Number of weak agents to keep
         noise_probability: Prob of adding noise
         use_population_prob: Prob of using population vs scripted
+        verbose: Whether to print initialization messages
 
     Returns:
         DiverseOpponentSampler instance
@@ -235,6 +249,7 @@ def create_diverse_opponent_sampler(
         population_manager=population_manager,
         noise_probability=noise_probability,
         use_population_prob=use_population_prob,
+        verbose=verbose,
     )
 
 

@@ -141,6 +141,12 @@ class SimpleOpponentEncoder(nn.Module):
             nn.Tanh()  # Bounded outputs prevent explosion
         )
 
+        # Orthogonal initialization prevents early collapse
+        for layer in self.encoder:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=1.0)
+                nn.init.constant_(layer.bias, 0.0)
+
         self.to(self.device)
 
     def forward(self, opponent_history):

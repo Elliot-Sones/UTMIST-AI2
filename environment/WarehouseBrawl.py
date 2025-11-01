@@ -222,6 +222,22 @@ class WarehouseBrawl(MalachiteEnv[np.ndarray, np.ndarray, int]):
 
         truncated = self.steps >= self.max_timesteps
 
+        # Determine winner if episode timed out
+        if truncated and winner is None:
+            # Winner = player with more stocks (or less damage if tied)
+            player_0 = self.players[0]
+            player_1 = self.players[1]
+            if player_1.stocks > player_0.stocks:
+                winner = 'player'  # Player 1 is the learning agent
+            elif player_0.stocks > player_1.stocks:
+                winner = 'opponent'
+            else:
+                # Tied on stocks - use damage taken as tiebreaker
+                if player_1.damage_taken_total < player_0.damage_taken_total:
+                    winner = 'player'
+                else:
+                    winner = 'opponent'
+
         # Collect observations
         observations = {agent: self.observe(agent) for agent in self.agents}
 

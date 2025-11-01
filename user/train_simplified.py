@@ -532,30 +532,29 @@ def danger_zone_reward(env: WarehouseBrawl, zone_height: float = 4.2) -> float:
 
 
 def on_win_reward(env: WarehouseBrawl, agent: str) -> float:
-    """MASSIVE reward for winning - this should dominate all other rewards!
-    Winning needs to be so valuable that distinguishing opponent strategies
-    and adapting to beat them is the only path to high reward."""
-    return 100.0 if agent == 'player' else -100.0  # 10x increase!
+    """Strong reward for winning - dominates other rewards without exploding value function
+    Winning needs to be very valuable to force opponent-specific strategies."""
+    return 30.0 if agent == 'player' else -30.0  # Reduced from 100 to prevent value explosion
 
 
 def on_knockout_reward(env: WarehouseBrawl, agent: str) -> float:
     """Reward knocking out opponent, penalize getting knocked out"""
-    return 10.0 if agent == 'opponent' else -10.0  # 5x increase!
+    return 5.0 if agent == 'opponent' else -5.0  # Reduced from 10
 
 
 def gen_reward_manager():
     """Create reward manager with WIN-FOCUSED rewards
 
-    Philosophy: Winning must be SO valuable that the model is forced to
-    learn opponent-specific strategies. Generic play won't cut it anymore.
+    Philosophy: Winning must be very valuable to force the model to
+    learn opponent-specific strategies, but not so large it breaks value function.
     """
     reward_functions = {
-        'danger_zone': RewTerm(func=danger_zone_reward, weight=0.1),  # Reduced importance
-        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.2),  # Reduced importance
+        'danger_zone': RewTerm(func=danger_zone_reward, weight=0.2),
+        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.5),
     }
     signal_subscriptions = {
-        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=1.0)),  # MASSIVE: 100 points!
-        'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=1.0)),  # 10 points
+        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=1.0)),  # 30 points!
+        'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=1.0)),  # 5 points
     }
     return RewardManager(reward_functions, signal_subscriptions)
 
@@ -877,23 +876,26 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 2.1.1 - GRADIENT FIX (Let Encoder Learn!)")
+    print("Version 2.1.2 - VALUE FUNCTION FIX (Stable Training)")
     print("="*70)
-    print("  🔧 FIXED: Encoder gradients now flow properly")
-    print("  🔧 Diversity loss: 10.0 → 1.0 (allows learning)")
-    print("  🔧 Removed permanent noise (was masking learning)")
-    print("  🔧 Emergency noise only if diversity < 0.02")
+    print("  ✅ Encoder working: Good gradients + diversity!")
+    print("  🔧 Win reward: 100 → 30 (prevents value explosion)")
+    print("  🔧 Knockout: 10 → 5 (more stable)")
+    print("  🔧 Damage/danger weights increased for better shaping")
     print("  ")
-    print("  🎯 WIN REWARD: 100 (10x higher than before)")
-    print("  🎯 KNOCKOUT: 10 (5x higher)")
-    print("  🎯 Damage/danger: 0.1-0.2x (winning matters most)")
+    print("  📊 REWARD STRUCTURE:")
+    print("  - Win: +30 (still dominates, but stable)")
+    print("  - Knockout: +5")
+    print("  - Damage dealt: ~+0.5 per episode")
+    print("  - Total win episode: ~35-40")
+    print("  - Total loss episode: ~-30")
     print("  ")
-    print("  WHY THIS WORKS:")
-    print("  - Massive win rewards → must beat opponents consistently")
-    print("  - Information bottleneck → LSTM needs encoder to see opponent")
-    print("  - Moderate diversity loss → prevents collapse, allows learning")
-    print("  - 8 diverse opponents → forces strategy-specific adaptations")
-    print("  - Strategy gating → encoder output directly modulates actions")
+    print("  🎯 ARCHITECTURE (working!):")
+    print("  - No encoder memory → LSTM handles temporal patterns")
+    print("  - Information bottleneck → LSTM needs encoder")
+    print("  - Moderate diversity loss (1.0) → prevents collapse")
+    print("  - Strategy gating → encoder output modulates actions")
+    print("  - 8 diverse opponents → forces adaptation")
     print("="*70 + "\n")
 
     # Train!

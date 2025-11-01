@@ -566,6 +566,7 @@ def train():
             self.last_encoder_weights = None
             self.episode_rewards = []
             self.episode_lengths = []
+            self.episode_outcomes = []  # Track win/loss for each episode (True=win, False=loss)
             self.win_count = 0
             self.loss_count = 0
             self.episode_count = 0
@@ -595,7 +596,9 @@ def train():
 
                         # Track wins/losses if available
                         if 'winner' in info:
-                            if info['winner'] == 'player':
+                            is_win = info['winner'] == 'player'
+                            self.episode_outcomes.append(is_win)
+                            if is_win:
                                 self.win_count += 1
                             else:
                                 self.loss_count += 1
@@ -614,22 +617,16 @@ def train():
                     print(f"  Avg Reward (last 100 ep): {np.mean(recent_rewards):.2f}")
                     print(f"  Reward Std: {np.std(recent_rewards):.2f}")
 
-                    # Win/Loss tracking
-                    total_games = self.win_count + self.loss_count
-                    if total_games > 0:
-                        win_rate = self.win_count / total_games * 100
-                        recent_window = min(100, len(self.episode_rewards))
-                        recent_wins = sum(1 for r in recent_rewards if r > 20)  # Estimate: high reward = likely won
-                        recent_win_rate = (recent_wins / len(recent_rewards) * 100) if recent_rewards else 0
+                    # Win/Loss tracking - recent window only (last 100 episodes)
+                    if self.episode_outcomes:
+                        recent_outcomes = self.episode_outcomes[-100:]
+                        recent_wins = sum(recent_outcomes)
+                        recent_total = len(recent_outcomes)
+                        recent_win_rate = (recent_wins / recent_total * 100) if recent_total > 0 else 0
 
-                        print(f"  Total Wins/Losses: {self.win_count}W / {self.loss_count}L")
-                        print(f"  Overall Win Rate: {win_rate:.1f}%")
-                        print(f"  Recent Win Rate (est): {recent_win_rate:.1f}% (last {len(recent_rewards)} ep)")
+                        print(f"  Win Rate (last {recent_total} ep): {recent_win_rate:.1f}% ({recent_wins}W / {recent_total - recent_wins}L)")
                     else:
-                        # Fallback if winner info not available - estimate from rewards
-                        recent_wins = sum(1 for r in recent_rewards if r > 20)
-                        recent_win_rate = (recent_wins / len(recent_rewards) * 100) if recent_rewards else 0
-                        print(f"  Estimated Win Rate: {recent_win_rate:.1f}% (based on reward>20)")
+                        print(f"  Win Rate: No games completed yet")
 
                 # === ENCODER HEALTH ===
                 encoder = self.model.policy.features_extractor.opponent_encoder
@@ -647,8 +644,8 @@ def train():
                     weight_change = (current_weights - self.last_encoder_weights).norm().item()
 
                     print(f"\n[ENCODER]")
-                    print(f"  Gradient norm: {grad_norm:.6f} {'✓' if grad_norm > 1e-5 else '⚠️ LOW'}")
-                    print(f"  Weight change: {weight_change:.6f} {'✓' if weight_change > 1e-4 else '⚠️ STUCK'}")
+                    print(f"  Gradient norm (size of current gradient update): {grad_norm:.6f} {'✓' if grad_norm > 1e-5 else '⚠️ LOW'}")
+                    print(f"  Weight change (How mcuh params moved): {weight_change:.6f} {'✓' if weight_change > 1e-4 else '⚠️ STUCK'}")
                 self.last_encoder_weights = current_weights.clone()
 
                 # 3. Encoding diversity
@@ -696,7 +693,7 @@ def train():
                             encodings = np.array(encodings)
                             enc_std = encodings.std(axis=0).mean()  # diversity across samples
                             # With Tanh activation, expect diversity 0.1-0.3
-                            print(f"  Encoding diversity: {enc_std:.4f} {'✓' if enc_std > 0.05 else '⚠️ COLLAPSED'}")
+                            print(f"  Encoding diversity(how much the encoding varies between samples): {enc_std:.4f} {'✓' if enc_std > 0.05 else '⚠️ COLLAPSED'}")
                     except Exception as e:
                         print(f"  Encoding diversity: [Error: {e}]")
 

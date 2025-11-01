@@ -197,16 +197,19 @@ class WarehouseBrawl(MalachiteEnv[np.ndarray, np.ndarray, int]):
             player.pre_process()
 
         # Process player step
+        # Track winner for info dict
+        winner = None
         for agent in self.agents:
             player = self.players[agent]
             player.process(action[agent])
             if player.stocks <= 0:
                 self.terminated = True
-                self.win_signal.emit(agent='player' if agent == 1 else 'opponent')
+                winner = 'player' if agent == 1 else 'opponent'
+                self.win_signal.emit(agent=winner)
             if player.on_platform is not None:
                 platform_vel = player.on_platform.velocity
                 player.body.velocity += pymunk.Vec2d(platform_vel.x, platform_vel.y)
-            
+
 
 
         # Process physics info
@@ -222,7 +225,10 @@ class WarehouseBrawl(MalachiteEnv[np.ndarray, np.ndarray, int]):
         # Collect observations
         observations = {agent: self.observe(agent) for agent in self.agents}
 
-        return observations, self.rewards, self.terminated, truncated, {}
+        # Add winner to info dict if episode ended
+        info = {'winner': winner} if (self.terminated or truncated) and winner else {}
+
+        return observations, self.rewards, self.terminated, truncated, info
 
     def add_reward(self, agent: int, reward: float) -> None:
         # Not really in use

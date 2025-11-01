@@ -622,26 +622,51 @@ def train():
 
                 # 3. Encoding diversity
                 if hasattr(self.model, 'rollout_buffer') and self.model.rollout_buffer.size() > 0:
-                    buffer = self.model.rollout_buffer
-                    sample_size = min(20, buffer.buffer_size)
-                    obs_samples = buffer.observations[:sample_size]
+                    try:
+                        buffer = self.model.rollout_buffer
+                        sample_size = min(20, buffer.buffer_size)
+                        obs_samples = buffer.observations[:sample_size]
 
-                    encoder.eval()
-                    with torch.no_grad():
-                        encodings = []
-                        for obs in obs_samples:
-                            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(encoder.device)
-                            base_dim = self.model.policy.features_extractor.base_obs_dim
-                            history_dim = self.model.policy.features_extractor.history_dim
-                            history_flat = obs_t[:, base_dim:base_dim + history_dim]
-                            history = history_flat.view(1, encoder.history_length, encoder.opponent_obs_dim)
-                            enc = encoder(history).cpu().numpy()[0]
-                            encodings.append(enc)
-                    encoder.train()
+                        base_dim = self.model.policy.features_extractor.base_obs_dim
+                        history_dim = self.model.policy.features_extractor.history_dim
 
-                    encodings = np.array(encodings)
-                    enc_std = encodings.std(axis=0).mean()  # diversity across samples
-                    print(f"  Encoding diversity: {enc_std:.4f} {'✓' if enc_std > 0.01 else '⚠️ COLLAPSED'}")
+                        encoder.eval()
+                        with torch.no_grad():
+                            encodings = []
+                            for obs in obs_samples:
+                                # Observation is already a flat array
+                                if len(obs.shape) == 1:
+                                    # Extract history portion from end of observation
+                                    history_flat = obs[base_dim:]
+                                else:
+                                    # Already batched
+                                    history_flat = obs[:, base_dim:]
+
+                                # Ensure we have the right size
+                                if history_flat.shape[-1] != history_dim:
+                                    continue
+
+                                # Convert to tensor
+                                history_t = torch.FloatTensor(history_flat).to(encoder.device)
+                                if len(history_t.shape) == 1:
+                                    history_t = history_t.unsqueeze(0)
+
+                                # Reshape to [batch, seq_len, obs_dim]
+                                history = history_t.view(-1, encoder.history_length, encoder.opponent_obs_dim)
+
+                                # Get encoding
+                                enc = encoder(history).cpu().numpy()
+                                if len(enc.shape) > 1:
+                                    enc = enc[0]
+                                encodings.append(enc)
+                        encoder.train()
+
+                        if encodings:
+                            encodings = np.array(encodings)
+                            enc_std = encodings.std(axis=0).mean()  # diversity across samples
+                            print(f"  Encoding diversity: {enc_std:.4f} {'✓' if enc_std > 0.01 else '⚠️ COLLAPSED'}")
+                    except Exception as e:
+                        print(f"  Encoding diversity: [Error: {e}]")
 
                 # === LEARNING STABILITY ===
                 print(f"\n[LEARNING]")

@@ -58,36 +58,39 @@ class EnhancedRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
         observation_space,
         action_space,
         lr_schedule,
+        lstm_hidden_size=384,
+        n_lstm_layers=3,
+        net_arch=None,
+        activation_fn=nn.ReLU,
+        shared_lstm=False,
+        enable_critic_lstm=True,
+        share_features_extractor=True,
+        dropout=0.1,
         **kwargs
     ):
-        # Get LSTM parameters from policy_kwargs, with defaults
-        policy_kwargs = kwargs.get('policy_kwargs', {})
-        lstm_hidden_size = policy_kwargs.get('lstm_hidden_size', 384)
-        n_lstm_layers = policy_kwargs.get('n_lstm_layers', 3)
-        dropout = policy_kwargs.get('dropout', 0.1)
+        # Store our custom dropout parameter
+        self.dropout_rate = dropout
 
-        # Override policy_kwargs with enhanced architecture
-        enhanced_policy_kwargs = {
-            "lstm_hidden_size": lstm_hidden_size,
-            "n_lstm_layers": n_lstm_layers,
-            "net_arch": {
-                "pi": [lstm_hidden_size, lstm_hidden_size],  # Match LSTM hidden size
-                "vf": [lstm_hidden_size, lstm_hidden_size],
-            },
-            "activation_fn": nn.ReLU,
-            "shared_lstm": False,
-            "enable_critic_lstm": True,
-            "share_features_extractor": True,
+        # Override the architecture parameters with our enhanced settings
+        enhanced_net_arch = {
+            "pi": [lstm_hidden_size, lstm_hidden_size],
+            "vf": [lstm_hidden_size, lstm_hidden_size],
         }
 
-        # Merge with existing policy_kwargs
-        enhanced_policy_kwargs.update(policy_kwargs)
-        kwargs['policy_kwargs'] = enhanced_policy_kwargs
-
-        super().__init__(observation_space, action_space, lr_schedule, **kwargs)
-
-        # Store dropout for later use
-        self.dropout_rate = dropout
+        # Call parent with enhanced parameters
+        super().__init__(
+            observation_space=observation_space,
+            action_space=action_space,
+            lr_schedule=lr_schedule,
+            lstm_hidden_size=lstm_hidden_size,
+            n_lstm_layers=n_lstm_layers,
+            net_arch=enhanced_net_arch,
+            activation_fn=activation_fn,
+            shared_lstm=shared_lstm,
+            enable_critic_lstm=enable_critic_lstm,
+            share_features_extractor=share_features_extractor,
+            **kwargs
+        )
 
     def _build_mlp_extractor(self) -> None:
         """Override to add layer normalization and dropout"""
@@ -661,11 +664,20 @@ def train():
 
     # Create Enhanced RecurrentPPO model with advanced architecture
     # For our custom policy class, we need to pass LSTM parameters via policy_kwargs
+    # SB3 will extract these and pass them as direct arguments to the policy constructor
     if policy_class == EnhancedRecurrentActorCriticPolicy:
         policy_kwargs = {
             "lstm_hidden_size": AGENT_CONFIG["lstm_hidden_size"],
             "n_lstm_layers": AGENT_CONFIG["n_lstm_layers"],
             "dropout": AGENT_CONFIG["dropout"],
+            "net_arch": {
+                "pi": [AGENT_CONFIG["lstm_hidden_size"], AGENT_CONFIG["lstm_hidden_size"]],
+                "vf": [AGENT_CONFIG["lstm_hidden_size"], AGENT_CONFIG["lstm_hidden_size"]],
+            },
+            "activation_fn": nn.ReLU,
+            "shared_lstm": False,
+            "enable_critic_lstm": True,
+            "share_features_extractor": True,
         }
     else:
         # For default policy, use standard policy_kwargs

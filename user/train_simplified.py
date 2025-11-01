@@ -171,27 +171,26 @@ class SimpleOpponentEncoder(nn.Module):
         # Encode current state to latent space (no flattening needed)
         encoding = self.encoder(opponent_state)
 
-        # CRITICAL: MASSIVE diversity loss to FORCE diversity
+        # Moderate diversity loss - balance diversity with learning
         if self.training and batch_size > 1:
             # Compute batch-wise standard deviation per dimension
             encoding_std = encoding.std(dim=0).mean()  # Higher = more diverse
 
-            # MASSIVE diversity loss - make it hurt to collapse!
-            # Increased from 0.5 to 10.0 (20x stronger!)
-            # This should create enormous gradient pressure for diversity
-            diversity_loss = -encoding_std * 10.0
+            # Moderate diversity loss (reduced from 10.0 to 1.0)
+            # Strong enough to prevent collapse but allows gradients to flow
+            diversity_loss = -encoding_std * 1.0
 
             # Inject into computational graph without changing forward output
             # During forward: diversity_loss - diversity_loss.detach() = 0
             # During backward: gradients flow through diversity_loss
             encoding = encoding + (diversity_loss - diversity_loss.detach())
 
-            # PERMANENT noise injection to prevent any collapse
-            # Always add noise in training, not just when below threshold
+            # NO MORE PERMANENT NOISE - let encoder learn real patterns!
+            # Only inject small noise if diversity collapses completely
             with torch.no_grad():
-                # Add moderate random noise to every encoding during training
-                noise = torch.randn_like(encoding) * 0.3
-                encoding = encoding + noise
+                if encoding_std < 0.02:  # Emergency only
+                    noise = torch.randn_like(encoding) * 0.05
+                    encoding = encoding + noise
 
         return encoding
 
@@ -878,23 +877,23 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 2.1.0 - WIN-FOCUSED REWARDS (Motivation Fix!)")
+    print("Version 2.1.1 - GRADIENT FIX (Let Encoder Learn!)")
     print("="*70)
-    print("  🎯 WIN REWARD: 10 → 100 (10x increase!)")
-    print("  🎯 KNOCKOUT: 2 → 10 (5x increase!)")
-    print("  🎯 Damage rewards: Reduced to 0.2x (now less important)")
+    print("  🔧 FIXED: Encoder gradients now flow properly")
+    print("  🔧 Diversity loss: 10.0 → 1.0 (allows learning)")
+    print("  🔧 Removed permanent noise (was masking learning)")
+    print("  🔧 Emergency noise only if diversity < 0.02")
     print("  ")
-    print("  WHY THIS MATTERS:")
-    print("  - Old: Model could get good rewards without winning much")
-    print("  - New: Winning is EVERYTHING - must beat opponents consistently")
-    print("  - Generic play won't work - MUST learn opponent-specific strategies")
-    print("  - This creates HUGE pressure to use encoder for adaptation")
+    print("  🎯 WIN REWARD: 100 (10x higher than before)")
+    print("  🎯 KNOCKOUT: 10 (5x higher)")
+    print("  🎯 Damage/danger: 0.1-0.2x (winning matters most)")
     print("  ")
-    print("  Architecture:")
-    print("  - No encoder memory (LSTM handles temporal patterns)")
-    print("  - Information bottleneck (LSTM can't see raw opponent state)")
-    print("  - Massive diversity loss (10x strength) + Permanent noise")
-    print("  - Strategy gating + 8 diverse opponents")
+    print("  WHY THIS WORKS:")
+    print("  - Massive win rewards → must beat opponents consistently")
+    print("  - Information bottleneck → LSTM needs encoder to see opponent")
+    print("  - Moderate diversity loss → prevents collapse, allows learning")
+    print("  - 8 diverse opponents → forces strategy-specific adaptations")
+    print("  - Strategy gating → encoder output directly modulates actions")
     print("="*70 + "\n")
 
     # Train!

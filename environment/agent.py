@@ -726,7 +726,11 @@ class ConstantAgent(Agent):
         super().__init__(*args, **kwargs)
 
     def predict(self, obs):
-        action = np.zeros_like(self.action_space.sample())
+        if hasattr(self, 'action_space') and self.action_space is not None:
+            action = np.zeros_like(self.action_space.sample())
+        else:
+            # Fallback: assume 10-dimensional action space (w,a,s,d,space,h,l,j,k,g)
+            action = np.zeros(10)
         return action
 
 class RandomAgent(Agent):
@@ -739,7 +743,11 @@ class RandomAgent(Agent):
         super().__init__(*args, **kwargs)
 
     def predict(self, obs):
-        action = self.action_space.sample()
+        if hasattr(self, 'action_space') and self.action_space is not None:
+            action = self.action_space.sample()
+        else:
+            # Fallback: assume 10-dimensional action space with values in [0,1]
+            action = np.random.random(10)
         return action
 
 

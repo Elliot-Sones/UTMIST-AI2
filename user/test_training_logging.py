@@ -81,7 +81,7 @@ model = RecurrentPPO(
     env=vec_env,
     verbose=1,  # Enable verbose logging
     device=DEVICE,
-    tensorboard_log=None,  # Disable tensorboard for test
+    tensorboard_log=None,  # Disable tensorboard for quick test
 )
 print("✓ Model created\n")
 

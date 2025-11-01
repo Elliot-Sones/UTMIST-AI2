@@ -31,17 +31,28 @@ class PopulationUpdateCallback(BaseCallback):
 
     def __init__(
         self,
-        population_manager: PopulationManager,
+        population_manager: Optional[PopulationManager] = None,
         update_frequency: int = 100_000,
         save_checkpoints: bool = True,
         checkpoint_dir: str = "checkpoints",
-        min_timesteps_before_add: int = 200_000,
+        max_population_size: int = 15,
+        num_weak_agents: int = 3,
+        min_timesteps_before_add: int = 100_000,  # Reduced from 200K
         weak_agent_timesteps: list = None,
         verbose: int = 0,
     ):
         super().__init__(verbose)
 
-        self.population_manager = population_manager
+        # Create own PopulationManager if not provided
+        if population_manager is None:
+            self.population_manager = PopulationManager(
+                checkpoint_dir=checkpoint_dir,
+                max_population_size=max_population_size,
+                num_weak_agents=num_weak_agents,
+            )
+        else:
+            self.population_manager = population_manager
+
         self.update_frequency = update_frequency
         self.save_checkpoints = save_checkpoints
         self.checkpoint_dir = checkpoint_dir
@@ -49,7 +60,7 @@ class PopulationUpdateCallback(BaseCallback):
 
         # Timesteps at which to force-add weak agents
         if weak_agent_timesteps is None:
-            weak_agent_timesteps = [50_000, 150_000, 300_000]
+            weak_agent_timesteps = [25_000, 75_000, 150_000]  # Earlier weak agents
         self.weak_agent_timesteps = set(weak_agent_timesteps)
         self.weak_agents_added = set()
 
@@ -58,7 +69,7 @@ class PopulationUpdateCallback(BaseCallback):
         print(f"✓ PopulationUpdateCallback initialized:")
         print(f"  - Update every: {update_frequency:,} steps")
         print(f"  - Min steps before add: {min_timesteps_before_add:,}")
-        print(f"  - Weak agent timesteps: {weak_agent_timesteps}")
+        print(f"  - Weak agent timesteps: {sorted(weak_agent_timesteps)}")
 
     def _on_step(self) -> bool:
         """Called at each training step."""

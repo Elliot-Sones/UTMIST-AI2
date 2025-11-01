@@ -18,7 +18,7 @@ class StrategyEncoder(nn.Module):
 
     Architecture:
         - 3 Conv1D layers with increasing channels (64, 128, 128)
-        - Batch normalization for stable training
+        - Layer normalization for stable training (better than BatchNorm for RL)
         - Global average pooling to handle variable-length sequences
         - Final linear projection to strategy embedding space
 
@@ -51,7 +51,8 @@ class StrategyEncoder(nn.Module):
             stride=1,
             padding=2
         )
-        self.bn1 = nn.BatchNorm1d(64)
+        # LayerNorm over (channels, time) - more stable for RL than BatchNorm
+        self.ln1 = nn.LayerNorm([64, history_length])
 
         self.conv2 = nn.Conv1d(
             in_channels=64,
@@ -60,7 +61,8 @@ class StrategyEncoder(nn.Module):
             stride=2,
             padding=2
         )
-        self.bn2 = nn.BatchNorm1d(128)
+        # After stride=2, time dimension is halved
+        self.ln2 = nn.LayerNorm([128, history_length // 2])
 
         self.conv3 = nn.Conv1d(
             in_channels=128,
@@ -69,7 +71,8 @@ class StrategyEncoder(nn.Module):
             stride=2,
             padding=1
         )
-        self.bn3 = nn.BatchNorm1d(128)
+        # After another stride=2, time dimension is quartered
+        self.ln3 = nn.LayerNorm([128, history_length // 4])
 
         # Global pooling to aggregate temporal information
         self.global_pool = nn.AdaptiveAvgPool1d(1)
@@ -97,19 +100,19 @@ class StrategyEncoder(nn.Module):
 
         # Conv block 1: Extract low-level temporal patterns
         x = self.conv1(x)
-        x = self.bn1(x)
+        x = self.ln1(x)
         x = self.relu(x)
         x = self.dropout(x)
 
         # Conv block 2: Mid-level pattern aggregation
         x = self.conv2(x)
-        x = self.bn2(x)
+        x = self.ln2(x)
         x = self.relu(x)
         x = self.dropout(x)
 
         # Conv block 3: High-level strategy features
         x = self.conv3(x)
-        x = self.bn3(x)
+        x = self.ln3(x)
         x = self.relu(x)
 
         # Global pooling: Aggregate across time

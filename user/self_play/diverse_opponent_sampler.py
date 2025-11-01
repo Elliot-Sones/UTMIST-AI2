@@ -43,17 +43,32 @@ class DiverseOpponentSampler:
     def __init__(
         self,
         checkpoint_dir: str,
-        population_manager: PopulationManager,
+        population_manager: Optional[PopulationManager] = None,
+        max_population_size: int = 15,
+        num_weak_agents: int = 3,
         noise_probability: float = 0.10,
         use_population_prob: float = 0.70,
         verbose: bool = True,
     ):
         self.checkpoint_dir = checkpoint_dir
-        self.population_manager = population_manager
+        self.max_population_size = max_population_size
+        self.num_weak_agents = num_weak_agents
         self.noise_probability = noise_probability
         self.use_population_prob = use_population_prob
         self.env = None  # Set by environment
         self.verbose = verbose
+
+        # Create own PopulationManager if not provided (for multiprocessing compatibility)
+        if population_manager is None:
+            self.population_manager = PopulationManager(
+                checkpoint_dir=checkpoint_dir,
+                max_population_size=max_population_size,
+                num_weak_agents=num_weak_agents,
+            )
+            self._owns_population_manager = True
+        else:
+            self.population_manager = population_manager
+            self._owns_population_manager = False
 
         # Statistics tracking
         self.stats = {
@@ -65,9 +80,11 @@ class DiverseOpponentSampler:
 
         if verbose:
             print(f"✓ DiverseOpponentSampler initialized:")
-            print(f"  - Population size: {len(population_manager)}")
+            print(f"  - Population size: {len(self.population_manager)}")
             print(f"  - Use population prob: {use_population_prob:.1%}")
             print(f"  - Noise prob: {noise_probability:.1%}")
+            if self._owns_population_manager:
+                print(f"  - Created own PopulationManager (multiprocessing mode)")
 
     def __call__(self) -> Agent:
         """

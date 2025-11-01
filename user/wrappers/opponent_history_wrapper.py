@@ -63,14 +63,16 @@ class OpponentHistoryBuffer(VecEnvWrapper):
         # Calculate total feature dimension
         self.opponent_feature_dim = self._calculate_feature_dim()
 
-        # Initialize history buffers (one per parallel environment)
-        self.history_buffers = [
-            deque(maxlen=history_length)
-            for _ in range(self.num_envs)
-        ]
+        # Initialize history buffers as pre-allocated numpy arrays (much faster!)
+        # Shape: (num_envs, history_length, opponent_feature_dim)
+        self.history_buffers = np.zeros(
+            (self.num_envs, history_length, self.opponent_feature_dim),
+            dtype=np.float32
+        )
 
-        # Fill buffers with zeros initially
-        self._initialize_buffers()
+        # Track current position in circular buffer for each env
+        self.buffer_positions = np.zeros(self.num_envs, dtype=np.int32)
+        self.buffer_filled = np.zeros(self.num_envs, dtype=bool)  # Has buffer been filled once?
 
     def _get_obs_helper(self):
         """Extract obs_helper from the base environment."""
@@ -112,14 +114,6 @@ class OpponentHistoryBuffer(VecEnvWrapper):
                     total_dim += 1
 
         return total_dim
-
-    def _initialize_buffers(self):
-        """Initialize history buffers with zeros."""
-        zero_features = np.zeros(self.opponent_feature_dim, dtype=np.float32)
-
-        for env_idx in range(self.num_envs):
-            for _ in range(self.history_length):
-                self.history_buffers[env_idx].append(zero_features.copy())
 
     def _extract_opponent_features(self, obs: np.ndarray, env_idx: int) -> np.ndarray:
         """
@@ -163,20 +157,35 @@ class OpponentHistoryBuffer(VecEnvWrapper):
         """
         obs, rewards, dones, infos = self.venv.step_wait()
 
-        # Update history for each environment
+        # Update history for each environment (optimized circular buffer)
         for env_idx in range(self.num_envs):
             # Extract opponent features from current observation
             opponent_features = self._extract_opponent_features(obs[env_idx], env_idx)
 
-            # Add to history buffer (automatically drops oldest if full)
-            self.history_buffers[env_idx].append(opponent_features)
+            # Write to circular buffer at current position
+            pos = self.buffer_positions[env_idx]
+            self.history_buffers[env_idx, pos, :] = opponent_features
 
-            # Convert history to numpy array and add to info
-            # Shape: (history_length, opponent_feature_dim)
-            opponent_history = np.array(
-                list(self.history_buffers[env_idx]),
-                dtype=np.float32
-            )
+            # Update position (circular)
+            self.buffer_positions[env_idx] = (pos + 1) % self.history_length
+
+            # Mark as filled after first complete pass
+            if pos == self.history_length - 1:
+                self.buffer_filled[env_idx] = True
+
+            # Get history in correct temporal order (no array copy needed - just view!)
+            # If buffer is filled, reorder to get oldest->newest
+            # Otherwise, just use the filled portion
+            if self.buffer_filled[env_idx]:
+                # Reorder: from current position to end, then from start to current position
+                current_pos = self.buffer_positions[env_idx]
+                opponent_history = np.concatenate([
+                    self.history_buffers[env_idx, current_pos:, :],
+                    self.history_buffers[env_idx, :current_pos, :]
+                ], axis=0)
+            else:
+                # Buffer not yet filled - just use what we have (zero-padded)
+                opponent_history = self.history_buffers[env_idx]
 
             # Add to info dict
             if infos[env_idx] is None:
@@ -194,18 +203,16 @@ class OpponentHistoryBuffer(VecEnvWrapper):
         """
         obs = self.venv.reset()
 
-        # Reset all history buffers
+        # Reset all history buffers (zero them out, much faster!)
+        self.history_buffers[:] = 0
+        self.buffer_positions[:] = 0
+        self.buffer_filled[:] = False
+
+        # Initialize first frame with current opponent features
         for env_idx in range(self.num_envs):
-            self.history_buffers[env_idx].clear()
-
-            # Refill with zeros
-            zero_features = np.zeros(self.opponent_feature_dim, dtype=np.float32)
-            for _ in range(self.history_length):
-                self.history_buffers[env_idx].append(zero_features.copy())
-
-            # Also extract current opponent features and add to history
             opponent_features = self._extract_opponent_features(obs[env_idx], env_idx)
-            self.history_buffers[env_idx].append(opponent_features)
+            self.history_buffers[env_idx, 0, :] = opponent_features
+            self.buffer_positions[env_idx] = 1
 
         return obs
 

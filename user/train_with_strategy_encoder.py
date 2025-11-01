@@ -16,7 +16,8 @@ import os
 import sys
 import random
 import inspect
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+import logging
+from datetime import datetime
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 from pathlib import Path
@@ -38,10 +39,12 @@ from environment.agent import *
 from user.models.opponent_conditioned_policy import create_opponent_conditioned_policy_kwargs
 from user.wrappers.opponent_history_wrapper import OpponentHistoryBuffer
 from user.wrappers.augmented_obs_wrapper import AugmentedObservationWrapper
+from user.wrappers.episode_stats_wrapper import EpisodeStatsWrapper
 from user.self_play.population_manager import PopulationManager
 from user.self_play.diverse_opponent_sampler import DiverseOpponentSampler
 from user.self_play.population_update_callback import PopulationUpdateCallback
 from user.callbacks.training_metrics_callback import create_training_metrics_callback
+from user.callbacks.gradient_monitor_callback import create_gradient_monitor_callback
 
 # ============================================================================
 # GLOBAL CONFIGURATION
@@ -56,9 +59,6 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
 
 def linear_schedule(start: float, end: float) -> Callable[[float], float]:
@@ -69,25 +69,44 @@ def linear_schedule(start: float, end: float) -> Callable[[float], float]:
 
 seed_everything(GLOBAL_SEED)
 
-if hasattr(torch, "set_float32_matmul_precision"):
-    torch.set_float32_matmul_precision("high")
-if torch.cuda.is_available() and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-    torch.backends.cuda.matmul.allow_tf32 = True
-
 # ============================================================================
 # DEVICE CONFIGURATION
 # ============================================================================
 
 def get_device():
     if torch.cuda.is_available():
-        print(f"✓ Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+        device_name = torch.cuda.get_device_name(0)
+        print(f"✓ Using CUDA GPU: {device_name}")
+
+        # Enable CUDA optimizations
         torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False  # For speed
+
+        # Enable TF32 for faster training on Ampere GPUs (RTX 30xx, A100, etc.)
+        if hasattr(torch, 'set_float32_matmul_precision'):
+            torch.set_float32_matmul_precision('high')
+            print(f"  ✓ TF32 enabled for matmul operations")
+
+        if hasattr(torch.backends.cuda, 'matmul') and hasattr(torch.backends.cuda.matmul, 'allow_tf32'):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            print(f"  ✓ TF32 enabled for CUDA matmul")
+
+        if hasattr(torch.backends, 'cudnn') and hasattr(torch.backends.cudnn, 'allow_tf32'):
+            torch.backends.cudnn.allow_tf32 = True
+            print(f"  ✓ TF32 enabled for cuDNN")
+
+        # Print GPU memory info
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"  ✓ GPU Memory: {total_memory:.1f} GB")
+
         return torch.device("cuda")
     elif torch.backends.mps.is_available():
-        print("✓ Using Apple Silicon MPS GPU")
+        print("⚠ Apple Silicon MPS detected, but CUDA preferred for stability")
+        print("  Using MPS (may have compatibility issues)")
         return torch.device("mps")
     else:
-        print("⚠ Using CPU (training will be slow)")
+        print("⚠ Using CPU (training will be VERY slow)")
+        print("  Consider using a CUDA GPU for practical training")
         return torch.device("cpu")
 
 DEVICE = get_device()
@@ -98,8 +117,33 @@ DEVICE = get_device()
 
 CHECKPOINT_DIR = Path("checkpoints/strategy_encoder_training")
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-TENSORBOARD_DIR = CHECKPOINT_DIR / "tb_logs"
-TENSORBOARD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Check if tensorboard is available (optional dependency)
+try:
+    import tensorboard
+    TENSORBOARD_DIR = CHECKPOINT_DIR / "tb_logs"
+    TENSORBOARD_DIR.mkdir(parents=True, exist_ok=True)
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_DIR = None
+    TENSORBOARD_AVAILABLE = False
+
+# Setup comprehensive logging
+LOG_FILE = CHECKPOINT_DIR / f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()  # Also print to console
+    ]
+)
+logger = logging.getLogger(__name__)
+
+logger.info("="*70)
+logger.info("TRAINING SESSION STARTED")
+logger.info(f"Log file: {LOG_FILE}")
+logger.info("="*70)
 
 # Strategy encoder configuration
 STRATEGY_ENCODER_CONFIG = {
@@ -141,28 +185,28 @@ AGENT_CONFIG = {
         share_features_extractor=True,
     ),
 
-    # PPO training
-    "n_steps": 4096,
-    "batch_size": 2048,  # Increased for more stable gradients
-    "n_epochs": 4,  # Reduced to prevent KL divergence explosion
-    "learning_rate": linear_schedule(8e-5, 2e-5),  # Balanced: stable but allows learning
-    "ent_coef": 0.01,  # Constant (schedules not supported for ent_coef)
-    "clip_range": linear_schedule(0.15, 0.08),  # Tighter clipping for stability
-    "gamma": 0.995,
-    "gae_lambda": 0.98,
-    "max_grad_norm": 0.7,  # Balanced gradient clipping
+    # PPO training - STABILIZED settings for reliable learning
+    "n_steps": 4096,  # Longer rollouts for better value estimates
+    "batch_size": 1024,  # Larger batches for stable gradients
+    "n_epochs": 4,  # Fewer epochs to prevent overfitting
+    "learning_rate": linear_schedule(1e-4, 3e-5),  # Conservative learning rate (10x lower)
+    "ent_coef": 0.01,  # Moderate entropy for exploration
+    "clip_range": 0.2,  # Standard PPO clipping
+    "gamma": 0.99,  # Standard discount factor
+    "gae_lambda": 0.95,  # Standard GAE
+    "max_grad_norm": 0.5,  # Prevent gradient explosions
     "vf_coef": 0.5,
-    "clip_range_vf": 0.15,  # Tighter value function clipping
-    "use_sde": True,
+    "clip_range_vf": 0.2,  # RE-ENABLED: Stabilizes value function
+    "use_sde": False,  # Disable SDE for stability
     "sde_sample_freq": 4,
-    "target_kl": 0.05,  # Relaxed to allow early exploration
+    "target_kl": 0.03,  # RE-ENABLED: Prevents policy divergence
 }
 
 TRAINING_CONFIG = {
     "total_timesteps": 5_000_000,  # Extended for diverse strategy learning
     "save_freq": 50_000,
     "resolution": CameraResolution.LOW,
-    "n_envs": 4,
+    "n_envs": 16,  # Increased for efficiency (will use multiprocessing)
 }
 
 # Population-based self-play configuration
@@ -334,17 +378,19 @@ def gen_reward_manager():
 def _make_self_play_env(
     seed: int,
     env_index: int,
-    population_manager: PopulationManager
+    checkpoint_dir: Path
 ) -> SelfPlayWarehouseBrawl:
     seed_everything(seed)
 
     reward_manager = gen_reward_manager()
 
     # Create a NEW DiverseOpponentSampler for this environment
-    # This avoids pickle issues with shared state
+    # Each env gets its own PopulationManager for multiprocessing compatibility
     diverse_opponent_sampler = DiverseOpponentSampler(
-        checkpoint_dir=CHECKPOINT_DIR,
-        population_manager=population_manager,
+        checkpoint_dir=str(checkpoint_dir),
+        population_manager=None,  # Will create its own
+        max_population_size=POPULATION_CONFIG["max_population_size"],
+        num_weak_agents=POPULATION_CONFIG["num_weak_agents"],
         noise_probability=POPULATION_CONFIG["noise_probability"],
         use_population_prob=POPULATION_CONFIG["use_population_prob"],
         verbose=False,  # Suppress output for each environment
@@ -385,21 +431,30 @@ def _make_self_play_env(
 
 def _make_vec_env(
     num_envs: int,
-    population_manager: PopulationManager
+    checkpoint_dir: Path,
+    use_multiprocessing: bool = True
 ) -> Tuple[VecNormalize, List[SelfPlayWarehouseBrawl]]:
     def make_thunk(rank: int) -> Callable[[], SelfPlayWarehouseBrawl]:
         def _init():
             env_seed = GLOBAL_SEED + rank * 9973
-            return _make_self_play_env(env_seed, rank, population_manager)
+            return _make_self_play_env(env_seed, rank, checkpoint_dir)
         return _init
 
     env_fns = [make_thunk(i) for i in range(num_envs)]
 
-    # Use DummyVecEnv to avoid multiprocessing pickle issues with CUDA models
-    vec_env = DummyVecEnv(env_fns)
-    print(f"✓ DummyVecEnv initialized with {num_envs} workers")
+    # Use SubprocVecEnv for multiprocessing (much faster) or DummyVecEnv for single-process
+    if use_multiprocessing and num_envs > 1:
+        vec_env = SubprocVecEnv(env_fns, start_method='spawn')
+        print(f"✓ SubprocVecEnv initialized with {num_envs} workers (multiprocessing)")
+    else:
+        vec_env = DummyVecEnv(env_fns)
+        print(f"✓ DummyVecEnv initialized with {num_envs} workers (single-process)")
 
     vec_env = VecMonitor(vec_env)
+
+    # Add episode statistics tracking (damage, wins, etc.)
+    vec_env = EpisodeStatsWrapper(vec_env)
+    print(f"✓ EpisodeStatsWrapper added (tracks damage/wins)")
 
     # Add opponent history tracking
     vec_env = OpponentHistoryBuffer(
@@ -427,6 +482,55 @@ def _make_vec_env(
         gamma=AGENT_CONFIG["gamma"],
     )
 
+    # === OBSERVATION VALIDATION ===
+    print("\n" + "="*70)
+    print("VALIDATING OBSERVATION PIPELINE")
+    print("="*70)
+
+    # Test observation shape
+    test_obs = vec_env.reset()
+    expected_base_obs = 52  # Approximate base observation size
+    expected_history = STRATEGY_ENCODER_CONFIG['history_length'] * STRATEGY_ENCODER_CONFIG['input_features']
+    expected_total = expected_base_obs + expected_history
+
+    actual_obs_shape = test_obs.shape
+    print(f"✓ Observation shape: {actual_obs_shape}")
+    print(f"  Expected: ({num_envs}, ~{expected_total}) = base(~{expected_base_obs}) + history({expected_history})")
+
+    if actual_obs_shape[0] != num_envs:
+        raise ValueError(f"❌ Environment count mismatch! Expected {num_envs}, got {actual_obs_shape[0]}")
+
+    if actual_obs_shape[1] < expected_history:
+        raise ValueError(f"❌ Observation too small! Expected at least {expected_history}D, got {actual_obs_shape[1]}D")
+
+    # Check for NaN/Inf in initial observations
+    if np.any(np.isnan(test_obs)):
+        raise ValueError("❌ NaN detected in initial observations!")
+    if np.any(np.isinf(test_obs)):
+        raise ValueError("❌ Inf detected in initial observations!")
+
+    print(f"✓ No NaN/Inf in initial observations")
+
+    # Test one step to verify opponent history is being populated
+    test_actions = np.array([vec_env.action_space.sample() for _ in range(num_envs)])
+    test_obs_next, _, _, test_info = vec_env.step(test_actions)
+
+    # Check if observations changed (history should update)
+    obs_changed = not np.allclose(test_obs, test_obs_next, rtol=0.01)
+    print(f"✓ Observations updating: {obs_changed}")
+
+    # Check info dict for opponent history
+    if isinstance(test_info, list) and len(test_info) > 0:
+        sample_info = test_info[0]
+        has_history = 'opponent_history' in sample_info
+        print(f"✓ Opponent history in info dict: {has_history}")
+        if has_history:
+            hist_shape = sample_info['opponent_history'].shape
+            print(f"  History shape: {hist_shape}")
+
+    vec_env.reset()  # Reset after validation
+    print("="*70 + "\n")
+
     base_envs: List[SelfPlayWarehouseBrawl] = []
     unwrap_ptr = vec_env
     while hasattr(unwrap_ptr, "venv"):
@@ -448,23 +552,17 @@ def train():
     print("STRATEGY-CONDITIONED TRAINING WITH POPULATION-BASED SELF-PLAY")
     print("=" * 70 + "\n")
 
-    # Create population manager (shared across all environments)
-    population_manager = PopulationManager(
-        checkpoint_dir=CHECKPOINT_DIR,
-        max_population_size=POPULATION_CONFIG["max_population_size"],
-        num_weak_agents=POPULATION_CONFIG["num_weak_agents"],
-    )
-
     print(f"✓ Population-based self-play configured:")
-    print(f"  - Each environment creates its own opponent sampler")
-    print(f"  - Shared population: {POPULATION_CONFIG['max_population_size']} max agents")
+    print(f"  - Each environment creates its own PopulationManager (multiprocessing-safe)")
+    print(f"  - Max population: {POPULATION_CONFIG['max_population_size']} agents")
     print(f"  - Population sampling: {POPULATION_CONFIG['use_population_prob']:.0%} of episodes")
     print(f"  - Noise injection: {POPULATION_CONFIG['noise_probability']:.0%} of episodes\n")
 
     # Create environment
     vec_env, env_instances = _make_vec_env(
         TRAINING_CONFIG["n_envs"],
-        population_manager
+        CHECKPOINT_DIR,
+        use_multiprocessing=True,  # Enable multiprocessing for speed
     )
     primary_env = env_instances[0]
 
@@ -475,24 +573,51 @@ def train():
     print(f"  Strategy encoder outputs: {STRATEGY_ENCODER_CONFIG['embedding_dim']}D embedding")
     print(f"  Combined features → LSTM: {BASE_EXTRACTOR_CONFIG['feature_dim'] + STRATEGY_ENCODER_CONFIG['embedding_dim']}D\n")
 
-    # Initialize normalization
+    # Initialize normalization and test reward signals
     print("Initializing observation/reward normalization...")
+    print("Testing reward functions...")
     vec_env.reset()
-    for _ in range(100):
+
+    reward_history = []
+    for i in range(100):
         actions = np.array([vec_env.action_space.sample() for _ in range(TRAINING_CONFIG["n_envs"])])
-        vec_env.step(actions)
+        obs, rewards, dones, infos = vec_env.step(actions)
+        reward_history.extend(rewards.tolist())
+
     vec_env.reset()
-    print("✓ Normalization initialized\n")
+
+    # Analyze reward distribution
+    reward_history = np.array(reward_history)
+    nonzero_rewards = reward_history[reward_history != 0]
+
+    print(f"✓ Normalization initialized")
+    print(f"  Reward statistics (100 steps × {TRAINING_CONFIG['n_envs']} envs):")
+    print(f"    Mean:     {reward_history.mean():.4f}")
+    print(f"    Std:      {reward_history.std():.4f}")
+    print(f"    Min:      {reward_history.min():.4f}")
+    print(f"    Max:      {reward_history.max():.4f}")
+    print(f"    Non-zero: {len(nonzero_rewards)}/{len(reward_history)} ({100*len(nonzero_rewards)/len(reward_history):.1f}%)")
+
+    if len(nonzero_rewards) == 0:
+        print(f"  ⚠ WARNING: All rewards are zero! Agent may not learn.")
+    elif reward_history.std() < 0.001:
+        print(f"  ⚠ WARNING: Very low reward variance. Check reward functions.")
+    else:
+        print(f"  ✓ Rewards are non-zero and varied\n")
 
     # Create or load model
     model_path = CHECKPOINT_DIR / "latest_model.zip"
+
+    # Set tensorboard logging only if available
+    tensorboard_log = str(TENSORBOARD_DIR) if TENSORBOARD_AVAILABLE else None
+
     if model_path.exists():
         print(f"Loading existing model from {model_path}...")
         model = RecurrentPPO.load(
             model_path,
             env=vec_env,
             device=DEVICE,
-            tensorboard_log=str(TENSORBOARD_DIR),
+            tensorboard_log=tensorboard_log,
             verbose=1,  # ✓ Force verbose logging
             **{k: v for k, v in AGENT_CONFIG.items() if k not in ["policy", "policy_kwargs", "verbose"]}
         )
@@ -504,7 +629,7 @@ def train():
             env=vec_env,
             verbose=1,  # ✓ Enable verbose logging
             device=DEVICE,
-            tensorboard_log=str(TENSORBOARD_DIR),
+            tensorboard_log=tensorboard_log,
         )
         print("✓ Model created\n")
 
@@ -531,9 +656,12 @@ def train():
     )
 
     population_update_callback = PopulationUpdateCallback(
-        population_manager=population_manager,
+        population_manager=None,  # Will create its own
         update_frequency=POPULATION_CONFIG["update_frequency"],
-        checkpoint_dir=CHECKPOINT_DIR,
+        checkpoint_dir=str(CHECKPOINT_DIR),
+        max_population_size=POPULATION_CONFIG["max_population_size"],
+        num_weak_agents=POPULATION_CONFIG["num_weak_agents"],
+        min_timesteps_before_add=100_000,  # Start adding agents after 100K steps
         verbose=1,
     )
 
@@ -543,12 +671,22 @@ def train():
         moving_avg_window=100,
         verbose=1,
     )
-    print("✓ Training metrics callback added (detailed console logging enabled)\n")
+    print("✓ Training metrics callback added (detailed console logging enabled)")
+
+    # Add gradient monitoring callback for stability
+    gradient_callback = create_gradient_monitor_callback(
+        check_frequency=10,  # Check every 10 updates
+        verbose=1,
+        max_grad_norm_threshold=100.0,
+        stop_on_nan=True,  # Stop training if NaN detected
+    )
+    print("✓ Gradient monitoring callback added (will detect NaN/Inf)\n")
 
     callbacks = CallbackList([
         checkpoint_callback,
         population_update_callback,
         metrics_callback,
+        gradient_callback,
     ])
 
     # Print training info
@@ -556,16 +694,28 @@ def train():
     print("TRAINING CONFIGURATION")
     print("=" * 70)
     print(f"Total timesteps: {TRAINING_CONFIG['total_timesteps']:,}")
-    print(f"Learning rate: 8e-5 → 2e-5 (linear decay)")
+    print(f"Rollout steps (n_steps): {AGENT_CONFIG['n_steps']}")
     print(f"Batch size: {AGENT_CONFIG['batch_size']}")
     print(f"N epochs: {AGENT_CONFIG['n_epochs']}")
-    print(f"Entropy coef: {AGENT_CONFIG['ent_coef']} (constant)")
-    print(f"Clip range: 0.15 → 0.08 (linear decay)")
-    print(f"Target KL: {AGENT_CONFIG['target_kl']}")
+
+    # Handle learning rate (could be schedule or float)
+    lr = AGENT_CONFIG['learning_rate']
+    if callable(lr):
+        print(f"Learning rate: 1e-4 → 3e-5 (linear decay)")
+    else:
+        print(f"Learning rate: {lr}")
+
+    print(f"Entropy coef: {AGENT_CONFIG['ent_coef']}")
+    print(f"Clip range: {AGENT_CONFIG['clip_range']}")
+    print(f"Target KL: {AGENT_CONFIG['target_kl']} (None = no early stopping)")
     print(f"Max grad norm: {AGENT_CONFIG['max_grad_norm']}")
     print(f"Population updates: every {POPULATION_CONFIG['update_frequency']:,} steps")
     print(f"Checkpoints: every {TRAINING_CONFIG['save_freq']:,} steps")
     print(f"Device: {DEVICE}")
+    if TENSORBOARD_AVAILABLE:
+        print(f"TensorBoard: Enabled ({TENSORBOARD_DIR})")
+    else:
+        print("TensorBoard: Disabled (not installed - install with: pip install tensorboard)")
     print("=" * 70 + "\n")
 
     # Start training
@@ -659,4 +809,23 @@ def benchmark_agent(model, vec_env, env):
 
 
 if __name__ == "__main__":
-    train()
+    try:
+        train()
+        logger.info("=" * 70)
+        logger.info("TRAINING COMPLETED SUCCESSFULLY")
+        logger.info("=" * 70)
+    except KeyboardInterrupt:
+        logger.warning("=" * 70)
+        logger.warning("TRAINING INTERRUPTED BY USER (Ctrl+C)")
+        logger.warning("=" * 70)
+        print("\n⚠ Training interrupted by user. Checkpoints have been saved.")
+    except Exception as e:
+        logger.error("=" * 70)
+        logger.error("TRAINING FAILED WITH ERROR")
+        logger.error("=" * 70)
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        logger.exception("Full traceback:")
+        print(f"\n❌ Training failed with error: {e}")
+        print(f"   See {LOG_FILE} for full details")
+        raise

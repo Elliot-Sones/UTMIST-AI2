@@ -914,8 +914,8 @@ def train():
     training_callback = TrainingMonitor(
         env=primary_env,
         env_instances=env_instances,
-        eval_freq=20_000,
-        eval_games=10,  # INCREASED from 5
+        eval_freq=25_000,
+        eval_games=5,  # INCREASED from 5
         save_freq=TRAINING_CONFIG["save_freq"],
         save_path=CHECKPOINT_DIR,
         name_prefix="rl_model",

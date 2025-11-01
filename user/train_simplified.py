@@ -17,10 +17,12 @@ Run:
 
 import os
 import sys
+import random
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # Apple Silicon support
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 from pathlib import Path
+from typing import Any, Callable, Dict, Tuple
 import torch
 import torch.nn as nn
 import numpy as np
@@ -35,6 +37,34 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from environment.agent import *
+
+# ============================================================================
+# GLOBAL CONFIGURATION
+# ============================================================================
+
+GLOBAL_SEED = int(os.environ.get("UTMIST_RL_SEED", "42"))
+
+
+def seed_everything(seed: int) -> None:
+    """Seed every library we depend on for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def linear_schedule(start: float, end: float) -> Callable[[float], float]:
+    """Linear schedule compatible with SB3 progress_remaining callback."""
+    def schedule(progress_remaining: float) -> float:
+        return end + (start - end) * progress_remaining
+    return schedule
+
+
+seed_everything(GLOBAL_SEED)
 
 # ============================================================================
 # DEVICE CONFIGURATION
@@ -65,37 +95,64 @@ DEVICE = get_device()
 # Where to save checkpoints
 CHECKPOINT_DIR = "checkpoints/simplified_training"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+TENSORBOARD_DIR = Path(CHECKPOINT_DIR) / "tb_logs"
+TENSORBOARD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Agent hyperparameters
 AGENT_CONFIG = {
     # LSTM policy
     "policy_kwargs": {
         "activation_fn": nn.ReLU,
-        "lstm_hidden_size": 512,
-        "net_arch": dict(pi=[96, 96], vf=[96, 96]),
-        "shared_lstm": True,
-        "enable_critic_lstm": False,
+        "lstm_hidden_size": 256,
+        "n_lstm_layers": 2,
+        "net_arch": dict(pi=[256, 256], vf=[256, 256]),
+        "shared_lstm": False,
+        "enable_critic_lstm": True,
+        "share_features_extractor": True,
     },
 
     # PPO training
-    "n_steps": 512,              # Rollout buffer size
-    "batch_size": 64,            # Mini-batch size
-    "n_epochs": 10,              # Gradient epochs per update
-    "learning_rate": 2.5e-4,
-    "ent_coef": 0.002,           # Reduced entropy to limit random key spam
+    "n_steps": 2048,             # Longer rollouts for better credit assignment
+    "batch_size": 256,           # Larger batches stabilize updates
+    "n_epochs": 5,               # Fewer epochs to reduce overfitting on buffers
+    "learning_rate": 3e-4,
+    "min_learning_rate": 3e-5,
+    "ent_coef": 0.001,           # Encourage exploration without spamming inputs
     "clip_range": 0.2,
+    "clip_range_final": 0.05,
     "gamma": 0.99,
-    "gae_lambda": 0.95,
+    "gae_lambda": 0.97,
     "max_grad_norm": 0.5,        # Prevent exploding gradients
     "vf_coef": 0.5,              # Value function coefficient
     "clip_range_vf": 10.0,       # Clip value function updates to prevent explosions
+    "use_sde": True,
+    "sde_sample_freq": 4,
+    "target_kl": 0.04,
 }
 
 # Training settings
 TRAINING_CONFIG = {
-    "total_timesteps": 100_000,  # Quick test (increase for real training)
-    "save_freq": 10_000,         # Save checkpoint every 10k steps
+    "total_timesteps": 3_000_000,  # Baseline full training run (~3M steps)
+    "save_freq": 50_000,           # Save checkpoint every 50k steps
     "resolution": CameraResolution.LOW,
+}
+
+CURRICULUM_CONFIG = {
+    "target_win_rate": 0.75,   # Aim for 75% win rate before down-weighting
+    "min_probability": 0.05,   # Never let an opponent vanish from the curriculum
+    "adaptation_strength": 0.6,
+    "self_play_weight": 0.2,
+}
+
+EVAL_TO_TRAIN_KEY = {
+    "Constant": "constant_agent",
+    "Based": "based_agent",
+    "Random": "random_agent",
+    "Aggressive": "aggressive_clockwork",
+    "Defensive": "defensive_clockwork",
+    "Hit&Run": "hitrun_clockwork",
+    "Aerial": "aerial_clockwork",
+    "SpecialSpam": "special_clockwork",
 }
 
 # Action sheets for ClockworkAgent opponents with distinct strategies
@@ -178,6 +235,7 @@ print("SIMPLIFIED TRAINING CONFIGURATION")
 print("=" * 70)
 print(f"Architecture: LSTM-only RecurrentPPO (MlpLstmPolicy)")
 print(f"Training steps: {TRAINING_CONFIG['total_timesteps']:,}")
+print(f"Global seed: {GLOBAL_SEED}")
 print(f"Checkpoint dir: {CHECKPOINT_DIR}")
 print(f"Opponent diversity: {len(OPPONENT_MIX)} distinct agent types")
 for name, (prob, _) in OPPONENT_MIX.items():
@@ -327,7 +385,7 @@ def train():
     # Setup self-play opponents
     self_play_handler = SimpleSelfPlayHandler(CHECKPOINT_DIR)
     opponents_dict = {**OPPONENT_MIX}  # Scripted opponents
-    # Note: Self-play will be added after first checkpoint
+    opponents_dict["self_play"] = (CURRICULUM_CONFIG["self_play_weight"], self_play_handler)
 
     opponent_cfg = OpponentsCfg(opponents={
         k: (prob, agent_partial) for k, (prob, agent_partial) in opponents_dict.items()
@@ -340,10 +398,16 @@ def train():
         save_handler=None,
         resolution=TRAINING_CONFIG["resolution"],
     )
+    env.action_space.seed(GLOBAL_SEED)
+    env.reset(seed=GLOBAL_SEED)
 
     # Attach self-play handler
     self_play_handler.env = env
     reward_manager.subscribe_signals(env.raw_env)
+    opponent_cfg.base_probabilities = {
+        name: (value if isinstance(value, float) else value[0])
+        for name, value in opponent_cfg.opponents.items()
+    }
 
     print(f"✓ Environment created")
     print(f"  Observation dim: {env.observation_space.shape[0]}")
@@ -354,6 +418,16 @@ def train():
         **AGENT_CONFIG["policy_kwargs"],
     }
 
+    # Build schedules for learning rate and clipping
+    lr_schedule = linear_schedule(
+        AGENT_CONFIG["learning_rate"],
+        AGENT_CONFIG["min_learning_rate"],
+    )
+    clip_schedule = linear_schedule(
+        AGENT_CONFIG["clip_range"],
+        AGENT_CONFIG["clip_range_final"],
+    )
+
     # Create RecurrentPPO model
     model = RecurrentPPO(
         "MlpLstmPolicy",
@@ -362,16 +436,21 @@ def train():
         n_steps=AGENT_CONFIG["n_steps"],
         batch_size=AGENT_CONFIG["batch_size"],
         n_epochs=AGENT_CONFIG["n_epochs"],
-        learning_rate=AGENT_CONFIG["learning_rate"],
+        learning_rate=lr_schedule,
         ent_coef=AGENT_CONFIG["ent_coef"],
-        clip_range=AGENT_CONFIG["clip_range"],
+        clip_range=clip_schedule,
         gamma=AGENT_CONFIG["gamma"],
         gae_lambda=AGENT_CONFIG["gae_lambda"],
         max_grad_norm=AGENT_CONFIG["max_grad_norm"],
         vf_coef=AGENT_CONFIG["vf_coef"],
         clip_range_vf=AGENT_CONFIG["clip_range_vf"],
+        target_kl=AGENT_CONFIG["target_kl"],
+        use_sde=AGENT_CONFIG["use_sde"],
+        sde_sample_freq=AGENT_CONFIG["sde_sample_freq"],
         policy_kwargs=policy_kwargs,
         device=DEVICE,
+        tensorboard_log=str(TENSORBOARD_DIR),
+        seed=GLOBAL_SEED,
     )
 
     print(f"✓ RecurrentPPO model created on {DEVICE}\n")
@@ -401,6 +480,7 @@ def train():
             self._seen_ep_ids = deque()
             self._seen_ep_id_set = set()
             self.last_episode_summary = None
+            self.last_opponent_probs = None
 
         def evaluate_against_all_opponents(self):
             """Run evaluation games against all opponent types and return win rates"""
@@ -471,7 +551,97 @@ def train():
             print(f"{'OVERALL':<15} {overall_wr:>5.1f}%     {total_wins}/{total_games}")
             print(f"{'='*70}\n")
 
+            if hasattr(self.model, "logger") and self.model.logger:
+                for opp_name, stats in results.items():
+                    self.model.logger.record(
+                        f"eval/win_rate/{opp_name}",
+                        stats['win_rate'] / 100.0,
+                        exclude=("stdout",),
+                    )
+                self.model.logger.record(
+                    "eval/overall_win_rate",
+                    overall_wr / 100.0,
+                    exclude=("stdout",),
+                )
+
+            self._update_curriculum(results)
+
+            if hasattr(self.model, "logger") and self.model.logger:
+                self.model.logger.dump(self.num_timesteps)
+
             return results, overall_wr
+
+        def _update_curriculum(self, eval_results: dict) -> None:
+            """Dynamically adjust opponent sampling based on evaluation results."""
+            if self.env_ref is None:
+                return
+
+            cfg = getattr(self.env_ref, "opponent_cfg", None)
+            if cfg is None or not hasattr(cfg, "opponents"):
+                return
+
+            base_probs = getattr(cfg, "base_probabilities", None)
+            if base_probs is None:
+                base_probs = {
+                    name: value[0] if isinstance(value, tuple) else value
+                    for name, value in cfg.opponents.items()
+                }
+                cfg.base_probabilities = base_probs
+
+            prev_probs = {
+                name: value[0] if isinstance(value, tuple) else value
+                for name, value in cfg.opponents.items()
+            }
+
+            new_opponents: Dict[str, Tuple[float, Any]] = {}
+            for name, value in cfg.opponents.items():
+                if isinstance(value, tuple):
+                    current_prob, agent_factory = value
+                else:
+                    current_prob, agent_factory = value, None
+                base_prob = base_probs.get(name, current_prob)
+
+                adjustment = 0.0
+                for eval_name, stats in eval_results.items():
+                    mapped_name = EVAL_TO_TRAIN_KEY.get(eval_name)
+                    if mapped_name == name:
+                        win_rate = stats['win_rate'] / 100.0
+                        deficit = max(0.0, CURRICULUM_CONFIG["target_win_rate"] - win_rate)
+                        adjustment = deficit * CURRICULUM_CONFIG["adaptation_strength"]
+                        break
+
+                if name == "self_play":
+                    adjusted_prob = max(base_prob, CURRICULUM_CONFIG["min_probability"])
+                else:
+                    adjusted_prob = max(CURRICULUM_CONFIG["min_probability"], base_prob + adjustment)
+
+                new_opponents[name] = (adjusted_prob, agent_factory)
+
+            cfg.opponents = new_opponents
+            cfg.validate_probabilities()
+            cfg.base_probabilities = {
+                name: value[0] if isinstance(value, tuple) else value
+                for name, value in cfg.opponents.items()
+            }
+
+            updated = any(
+                abs(cfg.opponents[name][0] - prev_probs.get(name, 0.0)) > 1e-5
+                for name in cfg.opponents
+            )
+
+            if updated:
+                print("[CURRICULUM] Opponent probabilities (normalized):")
+                for name, (prob, _) in cfg.opponents.items():
+                    print(f"  - {name}: {prob:.3f}")
+                self.last_opponent_probs = {name: prob for name, (prob, _) in cfg.opponents.items()}
+
+            if hasattr(self.model, "logger") and self.model.logger:
+                for name, (prob, _) in cfg.opponents.items():
+                    self.model.logger.record(
+                        f"curriculum/opponent_prob/{name}",
+                        prob,
+                        exclude=("stdout",),
+                    )
 
         def _on_step(self):
             # Track episode completion from buffer

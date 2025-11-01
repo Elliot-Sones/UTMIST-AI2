@@ -25,11 +25,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Tuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from collections import deque
 from functools import partial
 
 from sb3_contrib import RecurrentPPO
+from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -37,6 +39,111 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from environment.agent import *
+
+# ============================================================================
+# ADVANCED LSTM POLICY WITH ENHANCED ARCHITECTURE
+# ============================================================================
+
+class EnhancedRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
+    """
+    Enhanced RecurrentPPO policy with advanced LSTM architecture:
+    - Layer normalization for stable training
+    - Dropout for regularization
+    - Optimized hidden dimensions
+    - Better gradient flow
+    """
+
+    def __init__(
+        self,
+        observation_space,
+        action_space,
+        lr_schedule,
+        lstm_hidden_size=384,  # Increased from 256 for better capacity
+        n_lstm_layers=3,        # Increased from 2 for deeper temporal modeling
+        dropout=0.1,           # Dropout for regularization
+        **kwargs
+    ):
+        # Override policy_kwargs with enhanced architecture
+        policy_kwargs = kwargs.get('policy_kwargs', {})
+        policy_kwargs.update({
+            "lstm_hidden_size": lstm_hidden_size,
+            "n_lstm_layers": n_lstm_layers,
+            "net_arch": {
+                "pi": [lstm_hidden_size, lstm_hidden_size],  # Match LSTM hidden size
+                "vf": [lstm_hidden_size, lstm_hidden_size],
+            },
+            "activation_fn": nn.ReLU,
+            "shared_lstm": False,
+            "enable_critic_lstm": True,
+            "share_features_extractor": True,
+        })
+
+        kwargs['policy_kwargs'] = policy_kwargs
+        super().__init__(observation_space, action_space, lr_schedule, **kwargs)
+
+        # Store dropout for later use
+        self.dropout_rate = dropout
+
+    def _build_mlp_extractor(self) -> None:
+        """Override to add layer normalization and dropout"""
+        super()._build_mlp_extractor()
+
+        # Add layer normalization to MLP layers for stable training
+        self.mlp_extractor.policy_net = nn.Sequential(
+            nn.Linear(self.features_dim, self.net_arch["pi"][0]),
+            nn.LayerNorm(self.net_arch["pi"][0]),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(self.net_arch["pi"][0], self.net_arch["pi"][1]),
+            nn.LayerNorm(self.net_arch["pi"][1]),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_rate),
+        )
+
+        self.mlp_extractor.value_net = nn.Sequential(
+            nn.Linear(self.features_dim, self.net_arch["vf"][0]),
+            nn.LayerNorm(self.net_arch["vf"][0]),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(self.net_arch["vf"][0], self.net_arch["vf"][1]),
+            nn.LayerNorm(self.net_arch["vf"][1]),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_rate),
+        )
+
+    def _build_lstm(self) -> None:
+        """Override to add layer normalization to LSTM"""
+        super()._build_lstm()
+
+        # Add layer normalization after LSTM for better gradient flow
+        if hasattr(self, 'lstm_actor'):
+            self.lstm_actor_norm = nn.LayerNorm(self.lstm_hidden_size)
+        if hasattr(self, 'lstm_critic'):
+            self.lstm_critic_norm = nn.LayerNorm(self.lstm_hidden_size)
+
+    def forward(self, obs, lstm_states, episode_starts, deterministic=False):
+        """Override forward to apply layer norm after LSTM"""
+        features = self.extract_features(obs, lstm_states[:, :self.lstm_hidden_size], episode_starts)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        latent_pi = self._apply_lstm_norm(latent_pi, "actor")
+        latent_vf = self._apply_lstm_norm(latent_vf, "critic")
+
+        values = self.value_net(latent_vf)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        actions = actions.reshape((-1, *self.action_space.shape))
+
+        return actions, values, log_prob, lstm_states
+
+    def _apply_lstm_norm(self, latent, net_type):
+        """Apply layer normalization after LSTM processing"""
+        if net_type == "actor" and hasattr(self, 'lstm_actor_norm'):
+            return self.lstm_actor_norm(latent)
+        elif net_type == "critic" and hasattr(self, 'lstm_critic_norm'):
+            return self.lstm_critic_norm(latent)
+        return latent
+
 
 # ============================================================================
 # GLOBAL CONFIGURATION
@@ -61,6 +168,41 @@ def linear_schedule(start: float, end: float) -> Callable[[float], float]:
     """Linear schedule compatible with SB3 progress_remaining callback."""
     def schedule(progress_remaining: float) -> float:
         return end + (start - end) * progress_remaining
+    return schedule
+
+
+def cosine_schedule(start: float, end: float, warmup_fraction: float = 0.1) -> Callable[[float], float]:
+    """Cosine annealing schedule with warmup for better convergence."""
+    import math
+
+    def schedule(progress_remaining: float) -> float:
+        progress = 1.0 - progress_remaining
+
+        if progress < warmup_fraction:
+            # Linear warmup
+            return start + (end - start) * (progress / warmup_fraction)
+        else:
+            # Cosine annealing
+            cosine_progress = (progress - warmup_fraction) / (1.0 - warmup_fraction)
+            return end + 0.5 * (start - end) * (1 + math.cos(math.pi * cosine_progress))
+
+    return schedule
+
+
+def adaptive_entropy_schedule(initial_ent_coef: float, final_ent_coef: float,
+                             exploration_phase: float = 0.3) -> Callable[[float], float]:
+    """Adaptive entropy schedule: high exploration early, then anneal."""
+    def schedule(progress_remaining: float) -> float:
+        progress = 1.0 - progress_remaining
+
+        if progress < exploration_phase:
+            # High entropy for exploration
+            return initial_ent_coef
+        else:
+            # Linear anneal to final value
+            anneal_progress = (progress - exploration_phase) / (1.0 - exploration_phase)
+            return initial_ent_coef + (final_ent_coef - initial_ent_coef) * anneal_progress
+
     return schedule
 
 
@@ -98,42 +240,40 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 TENSORBOARD_DIR = Path(CHECKPOINT_DIR) / "tb_logs"
 TENSORBOARD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Agent hyperparameters
+# Enhanced Agent hyperparameters - OPTIMIZED FOR STATE-OF-THE-ART PERFORMANCE
 AGENT_CONFIG = {
-    # LSTM policy
-    "policy_kwargs": {
-        "activation_fn": nn.ReLU,
-        "lstm_hidden_size": 256,
-        "n_lstm_layers": 2,
-        "net_arch": dict(pi=[256, 256], vf=[256, 256]),
-        "shared_lstm": False,
-        "enable_critic_lstm": True,
-        "share_features_extractor": True,
-    },
+    # Enhanced LSTM policy with advanced architecture
+    "policy_class": EnhancedRecurrentActorCriticPolicy,  # Use our enhanced policy
+    "lstm_hidden_size": 384,     # Increased capacity for better temporal modeling
+    "n_lstm_layers": 3,          # Deeper LSTM for complex pattern recognition
+    "dropout": 0.1,              # Regularization to prevent overfitting
 
-    # PPO training
-    "n_steps": 2048,             # Longer rollouts for better credit assignment
-    "batch_size": 256,           # Larger batches stabilize updates
-    "n_epochs": 5,               # Fewer epochs to reduce overfitting on buffers
-    "learning_rate": 3e-4,
-    "min_learning_rate": 3e-5,
-    "ent_coef": 0.001,           # Encourage exploration without spamming inputs
-    "clip_range": 0.2,
-    "clip_range_final": 0.05,
-    "gamma": 0.99,
-    "gae_lambda": 0.97,
-    "max_grad_norm": 0.5,        # Prevent exploding gradients
-    "vf_coef": 0.5,              # Value function coefficient
-    "clip_range_vf": 10.0,       # Clip value function updates to prevent explosions
-    "use_sde": True,
-    "sde_sample_freq": 4,
-    "target_kl": 0.04,
+    # Optimized PPO training parameters
+    "n_steps": 4096,             # Longer rollouts for better temporal credit assignment
+    "batch_size": 512,           # Larger batches for more stable gradient estimates
+    "n_epochs": 6,               # Slightly more epochs for better sample utilization
+    "learning_rate": 2.5e-4,     # Slightly lower for stability with larger architecture
+    "min_learning_rate": 1e-5,   # More aggressive annealing
+    "ent_coef": 0.005,           # Higher entropy bonus for better exploration early on
+    "ent_coef_final": 0.001,     # Anneal entropy coefficient
+    "clip_range": 0.25,          # Slightly higher initial clip for more aggressive updates
+    "clip_range_final": 0.02,    # More conservative final clip range
+    "gamma": 0.995,              # Slightly higher discount for longer-term planning
+    "gae_lambda": 0.98,          # Higher GAE lambda for better bias-variance tradeoff
+    "max_grad_norm": 0.75,       # Slightly higher grad clipping for larger model
+    "vf_coef": 0.6,              # Slightly higher value function weight
+    "clip_range_vf": 5.0,        # Tighter value function clipping
+    "use_sde": True,             # State-dependent exploration
+    "sde_sample_freq": 8,        # Less frequent SDE updates for stability
+    "target_kl": 0.02,           # More conservative KL target
 }
 
-# Training settings
+# Enhanced Training settings - AGGRESSIVE TRAINING FOR STATE-OF-THE-ART RESULTS
 TRAINING_CONFIG = {
-    "total_timesteps": 3_000_000,  # Baseline full training run (~3M steps)
-    "save_freq": 50_000,           # Save checkpoint every 50k steps
+    "total_timesteps": 5_000_000,  # Extended training for better convergence
+    "save_freq": 25_000,           # More frequent checkpoints for better self-play
+    "eval_freq": 50_000,           # Evaluate every 50k steps
+    "eval_games": 5,               # More games per evaluation for stable metrics
     "resolution": CameraResolution.LOW,
 }
 
@@ -325,19 +465,97 @@ def action_sparsity_reward(env: WarehouseBrawl, max_active: int = 2, penalty_per
     return penalty
 
 
-def gen_reward_manager():
-    """Create reward manager with WIN-FOCUSED rewards
+def position_control_reward(env: WarehouseBrawl) -> float:
+    """Reward for maintaining advantageous positions and punishing disadvantageous ones."""
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
 
-    Philosophy: Winning must be very valuable to force the model to
-    learn opponent-specific strategies, but not so large it breaks value function.
+    # Horizontal position advantage (prefer center control)
+    player_x = abs(player.body.position.x)
+    opponent_x = abs(opponent.body.position.x)
+
+    # Vertical position advantage (higher is generally better, but not too high)
+    player_y = player.body.position.y
+    opponent_y = opponent.body.position.y
+
+    # Distance-based advantage
+    distance = abs(player.body.position.x - opponent.body.position.x)
+
+    # Reward being closer horizontally (better positioning)
+    distance_reward = max(0.0, (10.0 - distance) / 100.0)  # Small reward for proximity
+
+    # Reward for height advantage (but penalize being too high)
+    height_advantage = (player_y - opponent_y) / 10.0
+    height_penalty = -0.01 if player_y > 5.0 else 0.0  # Small penalty for being too high
+
+    return distance_reward + height_advantage + height_penalty
+
+
+def combo_incentive_reward(env: WarehouseBrawl) -> float:
+    """Reward building and maintaining combo pressure."""
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+
+    # Reward for consecutive hits (combo building)
+    if hasattr(opponent, 'hit_stun_frames') and opponent.hit_stun_frames > 0:
+        combo_reward = min(0.1, opponent.hit_stun_frames / 100.0)  # Small reward for combos
+        return combo_reward
+
+    return 0.0
+
+
+def timing_reward(env: WarehouseBrawl) -> float:
+    """Reward for good timing (attacks during opponent recovery, movement during stun)."""
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+
+    # Reward attacking when opponent is in hit stun
+    if hasattr(opponent, 'hit_stun_frames') and opponent.hit_stun_frames > 0:
+        action = getattr(env, "cur_action", {}).get(0)
+        if action is not None:
+            # Check if attacking (j or k pressed)
+            attacking = action[7] > 0.5 or action[8] > 0.5  # j and k indices
+            if attacking:
+                return 0.05  # Reward for timing attacks well
+
+    return 0.0
+
+
+def momentum_reward(env: WarehouseBrawl) -> float:
+    """Reward maintaining and using momentum effectively."""
+    player = env.objects["player"]
+
+    # Reward horizontal momentum (speed in x direction)
+    momentum_x = abs(player.body.velocity.x)
+    momentum_reward = min(0.02, momentum_x / 200.0)  # Small reward for maintaining speed
+
+    # Penalize being stuck/not moving
+    if momentum_x < 0.1:
+        momentum_reward -= 0.005
+
+    return momentum_reward
+
+
+def gen_reward_manager():
+    """Create enhanced reward manager with sophisticated learning signals
+
+    Enhanced reward structure for state-of-the-art RecurrentPPO:
+    - Win-focused rewards for opponent-specific strategies
+    - Position and momentum control for better game understanding
+    - Combo and timing incentives for aggressive play
+    - Balanced weights to prevent reward hacking
     """
     reward_functions = {
-        'danger_zone': RewTerm(func=danger_zone_reward, weight=0.2),
-        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.75),
-        'action_sparsity': RewTerm(func=action_sparsity_reward, weight=1.0),
+        'danger_zone': RewTerm(func=danger_zone_reward, weight=0.15),        # Reduced weight
+        'damage_interaction': RewTerm(func=damage_interaction_reward, weight=0.6),  # Core damage reward
+        'position_control': RewTerm(func=position_control_reward, weight=0.1),     # New: position advantage
+        'combo_incentive': RewTerm(func=combo_incentive_reward, weight=0.1),       # New: combo building
+        'timing': RewTerm(func=timing_reward, weight=0.15),                       # New: attack timing
+        'momentum': RewTerm(func=momentum_reward, weight=0.05),                   # New: movement efficiency
+        'action_sparsity': RewTerm(func=action_sparsity_reward, weight=0.8),      # Reduced weight
     }
     signal_subscriptions = {
-        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=1.0)),  # 30 points!
+        'on_win': ('win_signal', RewTerm(func=on_win_reward, weight=1.0)),        # 30 points - primary objective
         'on_knockout': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=1.0)),  # 5 points
     }
     return RewardManager(reward_functions, signal_subscriptions)
@@ -413,31 +631,35 @@ def train():
     print(f"  Observation dim: {env.observation_space.shape[0]}")
     print(f"  LSTM handles temporal patterns over raw obs\n")
 
-    # Create policy kwargs (no custom feature extractor)
-    policy_kwargs = {
-        **AGENT_CONFIG["policy_kwargs"],
-    }
+    # Use enhanced policy class
+    policy_class = AGENT_CONFIG.get("policy_class", RecurrentPPO.policy_class)
 
-    # Build schedules for learning rate and clipping
-    lr_schedule = linear_schedule(
+    # Build advanced schedules for better convergence
+    lr_schedule = cosine_schedule(
         AGENT_CONFIG["learning_rate"],
         AGENT_CONFIG["min_learning_rate"],
+        warmup_fraction=0.05  # 5% warmup period
     )
     clip_schedule = linear_schedule(
         AGENT_CONFIG["clip_range"],
         AGENT_CONFIG["clip_range_final"],
     )
+    ent_schedule = adaptive_entropy_schedule(
+        AGENT_CONFIG["ent_coef"],
+        AGENT_CONFIG.get("ent_coef_final", AGENT_CONFIG["ent_coef"] * 0.2),
+        exploration_phase=0.3  # 30% exploration phase
+    )
 
-    # Create RecurrentPPO model
+    # Create Enhanced RecurrentPPO model with advanced architecture
     model = RecurrentPPO(
-        "MlpLstmPolicy",
+        policy_class,  # Use our enhanced policy class
         env,
         verbose=1,
         n_steps=AGENT_CONFIG["n_steps"],
         batch_size=AGENT_CONFIG["batch_size"],
         n_epochs=AGENT_CONFIG["n_epochs"],
         learning_rate=lr_schedule,
-        ent_coef=AGENT_CONFIG["ent_coef"],
+        ent_coef=ent_schedule,  # Use adaptive entropy schedule
         clip_range=clip_schedule,
         gamma=AGENT_CONFIG["gamma"],
         gae_lambda=AGENT_CONFIG["gae_lambda"],
@@ -447,10 +669,13 @@ def train():
         target_kl=AGENT_CONFIG["target_kl"],
         use_sde=AGENT_CONFIG["use_sde"],
         sde_sample_freq=AGENT_CONFIG["sde_sample_freq"],
-        policy_kwargs=policy_kwargs,
         device=DEVICE,
         tensorboard_log=str(TENSORBOARD_DIR),
         seed=GLOBAL_SEED,
+        # Enhanced LSTM parameters
+        lstm_hidden_size=AGENT_CONFIG["lstm_hidden_size"],
+        n_lstm_layers=AGENT_CONFIG["n_lstm_layers"],
+        dropout=AGENT_CONFIG["dropout"],
     )
 
     print(f"✓ RecurrentPPO model created on {DEVICE}\n")
@@ -736,8 +961,8 @@ def train():
 
     training_callback = TrainingMonitor(
         env=env,  # Pass environment reference for opponent tracking
-        eval_freq=20_000,  # Evaluate every 20k steps
-        eval_games=3,  # 3 games per opponent during evaluation
+        eval_freq=TRAINING_CONFIG["eval_freq"],  # Use config-based evaluation frequency
+        eval_games=TRAINING_CONFIG["eval_games"],  # Use config-based games per evaluation
         save_freq=TRAINING_CONFIG["save_freq"],
         save_path=CHECKPOINT_DIR,
         name_prefix="rl_model",
@@ -746,11 +971,13 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 3.0 - LSTM-only RecurrentPPO")
+    print("Version 4.0 - ENHANCED STATE-OF-THE-ART RecurrentPPO")
     print("="*70)
-    print("  - No encoder or history wrapper")
-    print("  - LSTM learns temporal patterns directly from raw obs")
-    print("  - Stable reward shaping (win-focused)")
+    print("  - Advanced LSTM: 3-layer, 384-hidden with LayerNorm + Dropout")
+    print("  - Enhanced rewards: Position control, combos, timing, momentum")
+    print("  - Adaptive schedules: Cosine LR, entropy annealing")
+    print("  - Aggressive curriculum: Extended training with frequent eval")
+    print("  - Optimized PPO: Better credit assignment and stability")
     print("="*70 + "\n")
 
     # Train!

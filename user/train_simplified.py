@@ -749,7 +749,7 @@ def train():
         save_vecnormalize=False,
     )
 
-    print("🚀 Training started!\n")
+    print("🚀 Training started!!!!!!\n")
     print("Version")
 
     # Train!

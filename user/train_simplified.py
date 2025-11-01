@@ -749,6 +749,7 @@ def train():
     )
 
     print("🚀 Training started!\n")
+    print("Version")
 
     # Train!
     model.learn(

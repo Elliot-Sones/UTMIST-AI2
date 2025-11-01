@@ -130,16 +130,15 @@ class SimpleOpponentEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.device = device if device is not None else DEVICE
 
-        # Simple 2-layer MLP with dropout to prevent collapse
+        # Simple 2-layer MLP with strong dropout to prevent collapse
         input_dim = opponent_obs_dim * history_length
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
-            nn.Dropout(0.1),  # Prevent encoder collapse
+            nn.Dropout(0.5),  # Strong dropout forces encoder to maintain diversity
             nn.Linear(256, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.Tanh()  # Bounded outputs prevent explosion
+            nn.Tanh()  # Bounded outputs prevent explosion (removed LayerNorm before Tanh)
         )
 
         # Orthogonal initialization prevents early collapse
@@ -596,6 +595,10 @@ def train():
             # Track wins/losses from step-level infos (separate from episode tracking)
             if step_infos is not None:
                 for info in step_infos:
+                    # DEBUG: Print info to see what we're getting
+                    if self.n_calls < 100 and info:  # Only print first 100 steps when info exists
+                        print(f"[DEBUG] Info dict: {info}")
+
                     # Check for winner info at step level
                     if 'winner' in info:
                         is_win = info['winner'] == 'player'
@@ -604,6 +607,7 @@ def train():
                             self.win_count += 1
                         else:
                             self.loss_count += 1
+                        print(f"[WIN TRACKED] Winner: {info['winner']}, Total outcomes: {len(self.episode_outcomes)}")
 
             # Print comprehensive update every 1000 steps
             if self.n_calls % 1000 == 0:
@@ -745,7 +749,7 @@ def train():
     )
 
     print("🚀 Training started!!!!!!\n")
-    print("Version 1.0.0")
+    print("Version 1.0.1")
 
     # Train!
     model.learn(

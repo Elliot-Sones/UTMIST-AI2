@@ -22,9 +22,9 @@ pygame.init()
 # Pick how each side should behave: "human", "rules", "rl", or "random".
 # Supply a checkpoint path only when using the RL controller.
 # ---------------------------------------------------------------------------
-AGENT_1_TYPE = "rules"
-AGENT_1_MODEL_PATH = None
-AGENT_2_TYPE = "random"
+AGENT_1_TYPE = "rl"
+AGENT_1_MODEL_PATH = "/rl_model_700000_steps.zip"
+AGENT_2_TYPE = "rules"
 AGENT_2_MODEL_PATH = None
 
 

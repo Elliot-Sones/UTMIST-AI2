@@ -970,6 +970,14 @@ class RecurrentPPOAgent(Agent):
         self.episode_starts = True
 
     def predict(self, obs):
+        expected_shape = self.model.observation_space.shape
+        if obs.shape != expected_shape:
+            raw_obs_len = obs.shape[0]
+            padding_len = expected_shape[0] - raw_obs_len
+            if padding_len > 0:
+                padding = np.zeros(padding_len,)
+                obs = np.concatenate([obs, padding])
+
         action, self.lstm_states = self.model.predict(obs, state=self.lstm_states, episode_start=self.episode_starts, deterministic=True)
         if self.episode_starts: self.episode_starts = False
         return action

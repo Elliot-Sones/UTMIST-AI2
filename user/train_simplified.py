@@ -579,36 +579,31 @@ def train():
             self.episode_count = 0
 
         def _on_step(self):
-            # Track episode outcomes - try multiple ways to get the data
-            infos = None
+            # Track episode outcomes - get step-level infos
+            step_infos = None
             if hasattr(self, 'locals') and 'infos' in self.locals:
-                infos = self.locals['infos']
-            elif hasattr(self, 'model') and hasattr(self.model, 'ep_info_buffer'):
-                # Alternative: use model's episode info buffer
+                step_infos = self.locals['infos']
+
+            # Track episode completion from buffer
+            if hasattr(self, 'model') and hasattr(self.model, 'ep_info_buffer'):
                 if len(self.model.ep_info_buffer) > 0:
                     for ep_info in self.model.ep_info_buffer:
                         if 'r' in ep_info and ep_info['r'] not in [r for r in self.episode_rewards[-10:]]:
                             self.episode_rewards.append(ep_info['r'])
                             self.episode_lengths.append(ep_info.get('l', 0))
                             self.episode_count += 1
-                    infos = []  # Prevent double counting below
 
-            if infos is not None:
-                for info in infos:
-                    if 'episode' in info:
-                        # Episode finished - track reward and length
-                        self.episode_rewards.append(info['episode']['r'])
-                        self.episode_lengths.append(info['episode']['l'])
-                        self.episode_count += 1
-
-                        # Track wins/losses if available
-                        if 'winner' in info:
-                            is_win = info['winner'] == 'player'
-                            self.episode_outcomes.append(is_win)
-                            if is_win:
-                                self.win_count += 1
-                            else:
-                                self.loss_count += 1
+            # Track wins/losses from step-level infos (separate from episode tracking)
+            if step_infos is not None:
+                for info in step_infos:
+                    # Check for winner info at step level
+                    if 'winner' in info:
+                        is_win = info['winner'] == 'player'
+                        self.episode_outcomes.append(is_win)
+                        if is_win:
+                            self.win_count += 1
+                        else:
+                            self.loss_count += 1
 
             # Print comprehensive update every 1000 steps
             if self.n_calls % 1000 == 0:
@@ -750,7 +745,7 @@ def train():
     )
 
     print("🚀 Training started!!!!!!\n")
-    print("Version")
+    print("Version 1.0.0")
 
     # Train!
     model.learn(

@@ -385,11 +385,79 @@ TRAINING_CONFIG = {
     "resolution": CameraResolution.LOW,
 }
 
-# Self-play opponent mix
+# Action sheets for ClockworkAgent opponents with distinct strategies
+# Format: (duration_in_steps, [keys_to_press])
+
+# Aggressive rusher - constantly approaches and attacks
+AGGRESSIVE_PATTERN = [
+    (15, ['d']),           # Move right (approach)
+    (3, ['d', 'j']),       # Attack while moving
+    (2, []),               # Brief pause
+    (3, ['d', 'j']),       # Attack again
+    (15, ['d']),           # Continue approaching
+    (5, ['d', 'l']),       # Special attack
+    (10, ['d']),           # Keep pressure
+    (3, ['j']),            # Quick attack
+]
+
+# Defensive blocker - stays back, counters when approached
+DEFENSIVE_PATTERN = [
+    (20, []),              # Wait/observe
+    (5, ['a']),            # Back off slightly
+    (15, []),              # Wait more
+    (3, ['j']),            # Quick counter attack
+    (10, []),              # Back to defensive
+    (4, ['l']),            # Special counter
+    (25, []),              # Long wait
+]
+
+# Hit-and-run - quick attacks then retreat
+HIT_AND_RUN_PATTERN = [
+    (12, ['d']),           # Dash in
+    (2, ['j']),            # Quick hit
+    (10, ['a']),           # Retreat
+    (5, []),               # Wait
+    (10, ['d']),           # Dash in again
+    (3, ['d', 'l']),       # Special while moving
+    (15, ['a']),           # Retreat again
+    (8, []),               # Wait
+]
+
+# Aerial attacker - uses jumps and air attacks
+AERIAL_PATTERN = [
+    (5, ['d']),            # Approach
+    (15, ['space']),       # Jump
+    (3, ['j']),            # Air attack
+    (8, []),               # Land
+    (10, ['d']),           # Approach more
+    (15, ['space']),       # Jump again
+    (3, ['l']),            # Air special
+    (10, []),              # Land and wait
+]
+
+# Special spammer - focuses on special moves
+SPECIAL_SPAM_PATTERN = [
+    (8, ['d']),            # Approach
+    (5, ['l']),            # Special attack
+    (5, []),               # Wait
+    (5, ['l']),            # Another special
+    (10, ['d']),           # Move closer
+    (5, ['l']),            # More specials
+    (8, []),               # Wait
+    (3, ['j']),            # Mix in normal attack
+    (5, ['l']),            # Back to specials
+]
+
+# Self-play opponent mix (now with 8 diverse opponents)
 OPPONENT_MIX = {
-    "constant_agent": (0.4, partial(ConstantAgent)),  # 40% stationary
-    "based_agent": (0.4, partial(BasedAgent)),        # 40% scripted AI
-    "random_agent": (0.2, partial(RandomAgent)),      # 20% random
+    "constant_agent": (0.15, partial(ConstantAgent)),                                    # 15% stationary
+    "based_agent": (0.20, partial(BasedAgent)),                                          # 20% scripted AI
+    "random_agent": (0.10, partial(RandomAgent)),                                        # 10% random
+    "aggressive_clockwork": (0.15, partial(ClockworkAgent, action_sheet=AGGRESSIVE_PATTERN)),      # 15% aggressive
+    "defensive_clockwork": (0.10, partial(ClockworkAgent, action_sheet=DEFENSIVE_PATTERN)),        # 10% defensive
+    "hitrun_clockwork": (0.10, partial(ClockworkAgent, action_sheet=HIT_AND_RUN_PATTERN)),         # 10% hit-and-run
+    "aerial_clockwork": (0.10, partial(ClockworkAgent, action_sheet=AERIAL_PATTERN)),              # 10% aerial
+    "special_clockwork": (0.10, partial(ClockworkAgent, action_sheet=SPECIAL_SPAM_PATTERN)),       # 10% special spam
 }
 
 print("=" * 70)
@@ -400,6 +468,9 @@ print(f"Opponent encoding: {AGENT_CONFIG['latent_dim']}-dim latent")
 print(f"Sequence length: {AGENT_CONFIG['sequence_length']} frames")
 print(f"Training steps: {TRAINING_CONFIG['total_timesteps']:,}")
 print(f"Checkpoint dir: {CHECKPOINT_DIR}")
+print(f"Opponent diversity: {len(OPPONENT_MIX)} distinct agent types")
+for name, (prob, _) in OPPONENT_MIX.items():
+    print(f"  - {name}: {prob*100:.0f}%")
 print("=" * 70)
 
 
@@ -650,6 +721,23 @@ def train():
                         recent_win_rate = (recent_wins / recent_total * 100) if recent_total > 0 else 0
 
                         print(f"  Win Rate (last {recent_total} ep): {recent_win_rate:.1f}% ({recent_wins}W / {recent_total - recent_wins}L)")
+
+                        # Show opponent distribution
+                        try:
+                            base_env = self.training_env.envs[0]
+                            current_env = base_env
+                            while current_env is not None:
+                                if hasattr(current_env, 'opponent_cfg'):
+                                    opponent_cfg = current_env.opponent_cfg
+                                    total = sum(opponent_cfg.opponent_counts.values())
+                                    if total > 0:
+                                        print(f"  Opponents: ", end="")
+                                        counts_str = ", ".join([f"{name}: {count/total*100:.0f}%" for name, count in sorted(opponent_cfg.opponent_counts.items())])
+                                        print(counts_str)
+                                    break
+                                current_env = getattr(current_env, 'env', None)
+                        except:
+                            pass
                     else:
                         print(f"  Win Rate: No games completed yet")
 
@@ -767,7 +855,7 @@ def train():
         save_vecnormalize=False,
     )
 
-    print("🚀 Training started!!!!!!\n")
+    print("🚀 Training started\n")
     print("Version 1.0.2")
 
     # Train!

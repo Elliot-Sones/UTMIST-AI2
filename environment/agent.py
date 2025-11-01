@@ -432,6 +432,10 @@ class OpponentsCfg():
                 #'recurrent_agent': (0.1, partial(RecurrentPPOAgent, file_path='skibidi')),
             })
 
+    # Tracking fields (not set by user)
+    current_opponent_name: str = field(default=None, init=False)
+    opponent_counts: dict[str, int] = field(default_factory=dict, init=False)
+
     def validate_probabilities(self) -> None:
         total_prob = sum(prob if isinstance(prob, float) else prob[0] for prob in self.opponents.values())
 
@@ -441,6 +445,9 @@ class OpponentsCfg():
                 key: (value / total_prob if isinstance(value, float) else (value[0] / total_prob, value[1]))
                 for key, value in self.opponents.items()
             }
+
+        # Initialize opponent counts
+        self.opponent_counts = {key: 0 for key in self.opponents.keys()}
 
     def process(self) -> None:
         pass
@@ -452,8 +459,11 @@ class OpponentsCfg():
             weights=[prob if isinstance(prob, float) else prob[0] for prob in self.opponents.values()]
         )[0]
 
+        # Track which opponent was selected
+        self.current_opponent_name = agent_name
+        self.opponent_counts[agent_name] = self.opponent_counts.get(agent_name, 0) + 1
+
         # If self-play is selected, return the trained model
-        print(f'Selected {agent_name}')
         if agent_name == "self_play":
             selfplay_handler: SelfPlayHandler = self.opponents[agent_name][1]
             return selfplay_handler.get_opponent()

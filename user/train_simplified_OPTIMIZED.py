@@ -509,8 +509,8 @@ def _make_vec_env(num_envs: int) -> Tuple[VecNormalize, List[SelfPlayWarehouseBr
         vec_env,
         norm_obs=True,
         norm_reward=True,
-        clip_obs=5.0,
-        clip_reward=10.0,
+        clip_obs=10.0,  # Increased for more observation range
+        clip_reward=150.0,  # CRITICAL FIX: Don't clip win rewards (100)!
         gamma=AGENT_CONFIG["gamma"],
     )
 
@@ -541,6 +541,18 @@ def train():
     print(f"✓ Environment created ({len(env_instances)} parallel arenas)")
     print(f"  Observation dim: {primary_env.observation_space.shape[0]}")
     print(f"  LSTM handles temporal patterns over raw obs\n")
+
+    # CRITICAL: Initialize VecNormalize statistics with random samples
+    print("Initializing observation/reward normalization...")
+    vec_env.reset()
+    for _ in range(1000):  # Collect 1000 random steps
+        random_actions = np.array([vec_env.action_space.sample() for _ in range(vec_env.num_envs)])
+        vec_env.step(random_actions)
+    vec_env.reset()
+    print(f"✓ Normalization initialized")
+    print(f"  Obs mean: {vec_env.obs_rms.mean[:5]} ...")
+    print(f"  Obs std: {np.sqrt(vec_env.obs_rms.var[:5])} ...")
+    print()
 
     policy_kwargs = {
         **AGENT_CONFIG["policy_kwargs"],

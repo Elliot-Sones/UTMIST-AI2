@@ -147,6 +147,11 @@ class SimpleOpponentEncoder(nn.Module):
                 nn.init.orthogonal_(layer.weight, gain=1.0)
                 nn.init.constant_(layer.bias, 0.0)
 
+        # Diversity regularization: track recent outputs to promote variance
+        self.register_buffer('output_buffer', torch.zeros(100, latent_dim))
+        self.register_buffer('buffer_idx', torch.tensor(0))
+        self.diversity_strength = 0.1  # How much noise to add when diversity is low
+
         self.to(self.device)
 
     def forward(self, opponent_history):
@@ -168,7 +173,26 @@ class SimpleOpponentEncoder(nn.Module):
         flat_history = opponent_history.reshape(batch_size, -1)
 
         # Encode to latent space
-        return self.encoder(flat_history)
+        encoding = self.encoder(flat_history)
+
+        # Diversity regularization: maintain varied outputs
+        if self.training:
+            # Store outputs in buffer
+            with torch.no_grad():
+                for i in range(min(batch_size, encoding.shape[0])):
+                    idx = int(self.buffer_idx.item()) % 100
+                    self.output_buffer[idx] = encoding[i].detach()
+                    self.buffer_idx += 1
+
+                # Check diversity: compute std across buffer
+                buffer_std = self.output_buffer.std(dim=0).mean()
+
+                # If diversity too low, add noise to force variation
+                if buffer_std < 0.05:  # Threshold: diversity should be > 0.05
+                    noise = torch.randn_like(encoding) * self.diversity_strength
+                    encoding = encoding + noise
+
+        return encoding
 
 
 class SimplifiedExtractor(BaseFeaturesExtractor):
@@ -578,10 +602,22 @@ def train():
             self.episode_count = 0
 
         def _on_step(self):
-            # Track episode outcomes - get step-level infos
+            # Get current step infos
             step_infos = None
             if hasattr(self, 'locals') and 'infos' in self.locals:
                 step_infos = self.locals['infos']
+
+            # Track wins/losses from step-level infos when episodes end
+            if step_infos is not None:
+                for info in step_infos:
+                    # Check for winner info when episode ends
+                    if 'winner' in info:
+                        is_win = info['winner'] == 'player'
+                        self.episode_outcomes.append(is_win)
+                        if is_win:
+                            self.win_count += 1
+                        else:
+                            self.loss_count += 1
 
             # Track episode completion from buffer
             if hasattr(self, 'model') and hasattr(self.model, 'ep_info_buffer'):
@@ -591,23 +627,6 @@ def train():
                             self.episode_rewards.append(ep_info['r'])
                             self.episode_lengths.append(ep_info.get('l', 0))
                             self.episode_count += 1
-
-            # Track wins/losses from step-level infos (separate from episode tracking)
-            if step_infos is not None:
-                for info in step_infos:
-                    # DEBUG: Print info to see what we're getting
-                    if self.n_calls < 100 and info:  # Only print first 100 steps when info exists
-                        print(f"[DEBUG] Info dict: {info}")
-
-                    # Check for winner info at step level
-                    if 'winner' in info:
-                        is_win = info['winner'] == 'player'
-                        self.episode_outcomes.append(is_win)
-                        if is_win:
-                            self.win_count += 1
-                        else:
-                            self.loss_count += 1
-                        print(f"[WIN TRACKED] Winner: {info['winner']}, Total outcomes: {len(self.episode_outcomes)}")
 
             # Print comprehensive update every 1000 steps
             if self.n_calls % 1000 == 0:
@@ -749,7 +768,7 @@ def train():
     )
 
     print("🚀 Training started!!!!!!\n")
-    print("Version 1.0.1")
+    print("Version 1.0.2")
 
     # Train!
     model.learn(

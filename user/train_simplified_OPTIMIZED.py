@@ -331,7 +331,7 @@ def damage_interaction_reward(env: WarehouseBrawl, mode: int = 1) -> float:
     stats['damage_dealt'] += delta_dealt
     stats['damage_taken'] += delta_taken
 
-    return (delta_dealt - delta_dealt) / 140
+    return (delta_dealt - delta_taken) / 140
 
 
 def danger_zone_reward(env: WarehouseBrawl, zone_height: float = 4.2) -> float:
@@ -436,7 +436,11 @@ class SimpleSelfPlayHandler:
 
         zips = glob.glob(os.path.join(self.ckpt_dir, "rl_model_*.zip"))
         if not zips:
-            return ConstantAgent()
+            # Fallback if no checkpoints yet - MUST call get_env_info!
+            opponent = ConstantAgent()
+            if self.env:
+                opponent.get_env_info(self.env)
+            return opponent
 
         path = random.choice(zips)
         opponent = RecurrentPPOAgent(file_path=path)

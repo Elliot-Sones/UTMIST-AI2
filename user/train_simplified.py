@@ -440,7 +440,11 @@ class SimpleSelfPlayHandler:
 
         zips = glob.glob(os.path.join(self.ckpt_dir, "rl_model_*.zip"))
         if not zips:
-            return ConstantAgent()  # Fallback if no checkpoints yet
+            # Fallback if no checkpoints yet - MUST call get_env_info!
+            opponent = ConstantAgent()
+            if self.env:
+                opponent.get_env_info(self.env)
+            return opponent
 
         path = random.choice(zips)
         opponent = RecurrentPPOAgent(file_path=path)
@@ -909,8 +913,8 @@ def train():
     training_callback = TrainingMonitor(
         env=primary_env,
         env_instances=env_instances,
-        eval_freq=20_000,  # Evaluate every 20k steps
-        eval_games=5,  # 5 games per opponent during evaluation
+        eval_freq=25_000,  # Evaluate every 20k steps
+        eval_games=3,  # 5 games per opponent during evaluation
         save_freq=TRAINING_CONFIG["save_freq"],
         save_path=CHECKPOINT_DIR,
         name_prefix="rl_model",

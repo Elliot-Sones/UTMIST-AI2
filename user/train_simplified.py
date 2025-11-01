@@ -552,12 +552,146 @@ def train():
         save_vecnormalize=False,
     )
 
+    # Lightweight training monitor - tracks essential metrics
+    class TrainingMonitor(CheckpointCallback):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.last_encoder_weights = None
+            self.episode_rewards = []
+            self.episode_lengths = []
+            self.win_count = 0
+            self.loss_count = 0
+            self.episode_count = 0
+
+        def _on_step(self):
+            # Track episode outcomes
+            if hasattr(self.locals, 'infos'):
+                for info in self.locals.get('infos', []):
+                    if 'episode' in info:
+                        # Episode finished - track reward and length
+                        self.episode_rewards.append(info['episode']['r'])
+                        self.episode_lengths.append(info['episode']['l'])
+                        self.episode_count += 1
+
+                        # Track wins/losses if available
+                        if 'winner' in info:
+                            if info['winner'] == 'player':
+                                self.win_count += 1
+                            else:
+                                self.loss_count += 1
+
+            # Print comprehensive update every 1000 steps
+            if self.n_calls % 1000 == 0:
+                print(f"\n{'='*70}")
+                print(f"TRAINING UPDATE @ {self.num_timesteps:,} steps")
+                print(f"{'='*70}")
+
+                # === PERFORMANCE METRICS (Most Important) ===
+                if self.episode_rewards:
+                    recent_rewards = self.episode_rewards[-100:]  # Last 100 episodes
+                    print(f"\n[PERFORMANCE]")
+                    print(f"  Avg Reward (last 100): {np.mean(recent_rewards):.2f}")
+                    print(f"  Reward Std: {np.std(recent_rewards):.2f}")
+                    print(f"  Episodes completed: {self.episode_count}")
+
+                    if self.episode_count >= 10:
+                        total_games = self.win_count + self.loss_count
+                        if total_games > 0:
+                            win_rate = self.win_count / total_games * 100
+                            print(f"  Win Rate: {win_rate:.1f}% ({self.win_count}W / {self.loss_count}L)")
+
+                # === ENCODER HEALTH ===
+                encoder = self.model.policy.features_extractor.opponent_encoder
+
+                # 1. Gradient flow
+                grad_norm = 0.0
+                for param in encoder.parameters():
+                    if param.grad is not None:
+                        grad_norm += param.grad.norm().item() ** 2
+                grad_norm = grad_norm ** 0.5
+
+                # 2. Weight changes
+                current_weights = torch.cat([p.flatten() for p in encoder.parameters()])
+                if self.last_encoder_weights is not None:
+                    weight_change = (current_weights - self.last_encoder_weights).norm().item()
+
+                    print(f"\n[ENCODER]")
+                    print(f"  Gradient norm: {grad_norm:.6f} {'✓' if grad_norm > 1e-5 else '⚠️ LOW'}")
+                    print(f"  Weight change: {weight_change:.6f} {'✓' if weight_change > 1e-4 else '⚠️ STUCK'}")
+                self.last_encoder_weights = current_weights.clone()
+
+                # 3. Encoding diversity
+                if hasattr(self.model, 'rollout_buffer') and self.model.rollout_buffer.size() > 0:
+                    buffer = self.model.rollout_buffer
+                    sample_size = min(20, buffer.buffer_size)
+                    obs_samples = buffer.observations[:sample_size]
+
+                    encoder.eval()
+                    with torch.no_grad():
+                        encodings = []
+                        for obs in obs_samples:
+                            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(encoder.device)
+                            base_dim = self.model.policy.features_extractor.base_obs_dim
+                            history_dim = self.model.policy.features_extractor.history_dim
+                            history_flat = obs_t[:, base_dim:base_dim + history_dim]
+                            history = history_flat.view(1, encoder.history_length, encoder.opponent_obs_dim)
+                            enc = encoder(history).cpu().numpy()[0]
+                            encodings.append(enc)
+                    encoder.train()
+
+                    encodings = np.array(encodings)
+                    enc_std = encodings.std(axis=0).mean()  # diversity across samples
+                    print(f"  Encoding diversity: {enc_std:.4f} {'✓' if enc_std > 0.01 else '⚠️ COLLAPSED'}")
+
+                # === LEARNING STABILITY ===
+                print(f"\n[LEARNING]")
+
+                # Policy loss (from logger if available)
+                if hasattr(self.model, 'logger') and self.model.logger:
+                    try:
+                        # Access recent logged values
+                        if hasattr(self.model.logger, 'name_to_value'):
+                            if 'train/policy_loss' in self.model.logger.name_to_value:
+                                policy_loss = self.model.logger.name_to_value['train/policy_loss']
+                                print(f"  Policy Loss: {policy_loss:.4f}")
+                            if 'train/value_loss' in self.model.logger.name_to_value:
+                                value_loss = self.model.logger.name_to_value['train/value_loss']
+                                print(f"  Value Loss: {value_loss:.4f}")
+                            if 'train/entropy_loss' in self.model.logger.name_to_value:
+                                entropy = self.model.logger.name_to_value['train/entropy_loss']
+                                print(f"  Entropy: {entropy:.4f} {'✓' if entropy > 0.001 else '⚠️ LOW (less exploration)'}")
+                    except:
+                        pass
+
+                # Explained variance (how well value function predicts returns)
+                if hasattr(self.model, 'rollout_buffer') and self.model.rollout_buffer.size() > 0:
+                    buffer = self.model.rollout_buffer
+                    if hasattr(buffer, 'returns') and hasattr(buffer, 'values'):
+                        returns = buffer.returns.flatten()
+                        values = buffer.values.flatten()
+                        var_returns = np.var(returns)
+                        if var_returns > 0:
+                            explained_var = 1 - np.var(returns - values) / var_returns
+                            print(f"  Explained Variance: {explained_var:.3f} {'✓' if explained_var > 0.5 else '⚠️ LOW'}")
+
+                print(f"{'='*70}\n")
+
+            return super()._on_step()
+
+    training_callback = TrainingMonitor(
+        save_freq=TRAINING_CONFIG["save_freq"],
+        save_path=CHECKPOINT_DIR,
+        name_prefix="rl_model",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
+    )
+
     print("🚀 Training started!\n")
 
     # Train!
     model.learn(
         total_timesteps=TRAINING_CONFIG["total_timesteps"],
-        callback=checkpoint_callback,
+        callback=training_callback,
         log_interval=1,
     )
 

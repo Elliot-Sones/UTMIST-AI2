@@ -95,9 +95,9 @@ DEVICE = get_device()
 # TRAINING CONFIGURATION
 # ============================================================================
 
-CHECKPOINT_DIR = "checkpoints/strategy_encoder_training"
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-TENSORBOARD_DIR = Path(CHECKPOINT_DIR) / "tb_logs"
+CHECKPOINT_DIR = Path("checkpoints/strategy_encoder_training")
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+TENSORBOARD_DIR = CHECKPOINT_DIR / "tb_logs"
 TENSORBOARD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Strategy encoder configuration

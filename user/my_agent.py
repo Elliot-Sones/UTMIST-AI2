@@ -344,6 +344,11 @@ class SubmittedAgent(Agent):
             'dropout': 0.08,
         }
 
+        # Opponent history buffer for strategy encoding
+        self._opponent_history = None
+        self._history_length = self._strategy_config['history_length']
+        self._history_features = self._strategy_config['input_features']
+
     def _initialize(self) -> None:
         """Initialize the agent with environment info."""
         if self.mode == "rules":
@@ -421,8 +426,8 @@ class SubmittedAgent(Agent):
         if self.mode == "rules":
             return None
 
-        # Use working checkpoint from test_run directory
-        model_path = "checkpoints/test_run/rl_model_15003_steps.zip"
+        # Use 500k trained model from Desktop
+        model_path = "/Users/elliot18/Desktop/rl_model_500000_steps.zip"
         if os.path.isfile(model_path):
             print(f"Using trained model: {model_path}")
             return model_path
@@ -431,6 +436,64 @@ class SubmittedAgent(Agent):
             print("Falling back to rule-based agent...")
             self.mode = "rules"
             return None
+
+    def _extract_opponent_features(self, obs):
+        """Extract 13 opponent features from observation."""
+        import numpy as np
+
+        # Extract opponent sections from observation (using correct keys)
+        opp_pos = self.obs_helper.get_section(obs, "opponent_pos")  # [x, y]
+        opp_vel = self.obs_helper.get_section(obs, "opponent_vel")  # [vx, vy]
+        opp_state = self.obs_helper.get_section(obs, "opponent_state")  # scalar
+        opp_dmg = self.obs_helper.get_section(obs, "opponent_damage")  # scalar
+        opp_stocks = self.obs_helper.get_section(obs, "opponent_stocks")  # scalar
+        opp_facing = self.obs_helper.get_section(obs, "opponent_facing")  # scalar
+        opp_jumps = self.obs_helper.get_section(obs, "opponent_jumps_left")  # scalar
+        opp_grounded = self.obs_helper.get_section(obs, "opponent_grounded")  # scalar
+        opp_aerial = self.obs_helper.get_section(obs, "opponent_aerial")  # scalar
+        opp_stun = self.obs_helper.get_section(obs, "opponent_stun_frames")  # scalar
+        opp_dodge = self.obs_helper.get_section(obs, "opponent_dodge_timer")  # scalar
+
+        # Combine into 13-feature vector
+        features = np.array([
+            opp_pos[0], opp_pos[1],    # 2: position
+            opp_vel[0], opp_vel[1],    # 2: velocity
+            float(opp_state),          # 1: state ID
+            float(opp_dmg),            # 1: damage percent
+            float(opp_stocks),         # 1: stocks remaining
+            float(opp_facing),         # 1: facing direction
+            float(opp_jumps),          # 1: jumps left
+            float(opp_grounded),       # 1: is grounded
+            float(opp_aerial),         # 1: is aerial
+            float(opp_stun),           # 1: stun frames
+            float(opp_dodge),          # 1: dodge timer
+        ], dtype=np.float32)
+
+        return features
+
+    def _augment_observation(self, obs):
+        """Augment observation with opponent history for strategy encoding."""
+        import numpy as np
+
+        # Extract current opponent features
+        current_opp_features = self._extract_opponent_features(obs)
+
+        # Initialize history buffer if needed
+        if self._opponent_history is None:
+            self._opponent_history = np.zeros(
+                (self._history_length, self._history_features),
+                dtype=np.float32
+            )
+
+        # Roll history and add current features
+        self._opponent_history = np.roll(self._opponent_history, -1, axis=0)
+        self._opponent_history[-1] = current_opp_features
+
+        # Flatten history and concatenate with observation
+        history_flat = self._opponent_history.flatten()
+        augmented_obs = np.concatenate([obs, history_flat])
+
+        return augmented_obs
 
     def predict(self, obs):
         """Choose an action for the current observation."""
@@ -442,7 +505,9 @@ class SubmittedAgent(Agent):
             return self._rule_agent.predict(obs)
 
         try:
-            action, _ = self.model.predict(obs, deterministic=True)
+            # Augment observation with opponent history
+            augmented_obs = self._augment_observation(obs)
+            action, _ = self.model.predict(augmented_obs, deterministic=True)
             return action
         except Exception as e:
             print(f"❌ Prediction failed: {e}")

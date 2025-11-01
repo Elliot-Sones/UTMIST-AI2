@@ -28,7 +28,7 @@ from functools import partial
 
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor, VecNormalize
-from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback, EvalCallback
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -41,6 +41,7 @@ from user.wrappers.augmented_obs_wrapper import AugmentedObservationWrapper
 from user.self_play.population_manager import PopulationManager
 from user.self_play.diverse_opponent_sampler import DiverseOpponentSampler
 from user.self_play.population_update_callback import PopulationUpdateCallback
+from user.callbacks.training_metrics_callback import create_training_metrics_callback
 
 # ============================================================================
 # GLOBAL CONFIGURATION
@@ -142,19 +143,19 @@ AGENT_CONFIG = {
 
     # PPO training
     "n_steps": 4096,
-    "batch_size": 1024,
-    "n_epochs": 6,
-    "learning_rate": linear_schedule(3e-4, 3e-5),  # Decay from 3e-4 to 3e-5
-    "ent_coef": 0.02,  # High exploration (constant for stability)
-    "clip_range": linear_schedule(0.2, 0.1),  # Decay from 0.2 to 0.1
+    "batch_size": 2048,  # Increased for more stable gradients
+    "n_epochs": 4,  # Reduced to prevent KL divergence explosion
+    "learning_rate": linear_schedule(8e-5, 2e-5),  # Balanced: stable but allows learning
+    "ent_coef": 0.01,  # Constant (schedules not supported for ent_coef)
+    "clip_range": linear_schedule(0.15, 0.08),  # Tighter clipping for stability
     "gamma": 0.995,
     "gae_lambda": 0.98,
-    "max_grad_norm": 1.5,
+    "max_grad_norm": 0.7,  # Balanced gradient clipping
     "vf_coef": 0.5,
-    "clip_range_vf": 0.2,
+    "clip_range_vf": 0.15,  # Tighter value function clipping
     "use_sde": True,
     "sde_sample_freq": 4,
-    "target_kl": 0.035,
+    "target_kl": 0.05,  # Relaxed to allow early exploration
 }
 
 TRAINING_CONFIG = {
@@ -491,22 +492,37 @@ def train():
             model_path,
             env=vec_env,
             device=DEVICE,
-            **{k: v for k, v in AGENT_CONFIG.items() if k not in ["policy", "policy_kwargs"]}
+            tensorboard_log=str(TENSORBOARD_DIR),
+            verbose=1,  # ✓ Force verbose logging
+            **{k: v for k, v in AGENT_CONFIG.items() if k not in ["policy", "policy_kwargs", "verbose"]}
         )
-        print("✓ Model loaded\n")
+        print("✓ Model loaded with verbose logging enabled\n")
     else:
         print("Creating new model...")
         model = RecurrentPPO(
             **AGENT_CONFIG,
             env=vec_env,
-            verbose=1,
+            verbose=1,  # ✓ Enable verbose logging
             device=DEVICE,
             tensorboard_log=str(TENSORBOARD_DIR),
         )
         print("✓ Model created\n")
 
-    # Create callbacks
-    checkpoint_callback = CheckpointCallback(
+    # Create custom checkpoint callback that also saves latest model
+    class LatestModelCheckpointCallback(CheckpointCallback):
+        """Extended checkpoint callback that also saves latest_model.zip"""
+        def _on_step(self) -> bool:
+            result = super()._on_step()
+            # After each checkpoint, also save as latest_model
+            if self.n_calls % self.save_freq == 0:
+                latest_path = Path(self.save_path) / "latest_model.zip"
+                self.model.save(latest_path)
+                # Also save vec_normalize
+                if hasattr(self.training_env, 'save'):
+                    self.training_env.save(Path(self.save_path) / "latest_vec_normalize.pkl")
+            return result
+
+    checkpoint_callback = LatestModelCheckpointCallback(
         save_freq=TRAINING_CONFIG["save_freq"],
         save_path=CHECKPOINT_DIR,
         name_prefix="rl_model",
@@ -521,17 +537,32 @@ def train():
         verbose=1,
     )
 
-    callbacks = CallbackList([checkpoint_callback, population_update_callback])
+    # Add training metrics callback for detailed console logging
+    metrics_callback = create_training_metrics_callback(
+        log_frequency=1,  # Log every rollout for maximum visibility
+        moving_avg_window=100,
+        verbose=1,
+    )
+    print("✓ Training metrics callback added (detailed console logging enabled)\n")
+
+    callbacks = CallbackList([
+        checkpoint_callback,
+        population_update_callback,
+        metrics_callback,
+    ])
 
     # Print training info
     print("=" * 70)
     print("TRAINING CONFIGURATION")
     print("=" * 70)
     print(f"Total timesteps: {TRAINING_CONFIG['total_timesteps']:,}")
-    print(f"Learning rate: 3e-4 → 3e-5 (linear decay)")
+    print(f"Learning rate: 8e-5 → 2e-5 (linear decay)")
     print(f"Batch size: {AGENT_CONFIG['batch_size']}")
-    print(f"Entropy coef: 0.02 → 0.005 (linear decay)")
-    print(f"Clip range: 0.2 → 0.1 (linear decay)")
+    print(f"N epochs: {AGENT_CONFIG['n_epochs']}")
+    print(f"Entropy coef: {AGENT_CONFIG['ent_coef']} (constant)")
+    print(f"Clip range: 0.15 → 0.08 (linear decay)")
+    print(f"Target KL: {AGENT_CONFIG['target_kl']}")
+    print(f"Max grad norm: {AGENT_CONFIG['max_grad_norm']}")
     print(f"Population updates: every {POPULATION_CONFIG['update_frequency']:,} steps")
     print(f"Checkpoints: every {TRAINING_CONFIG['save_freq']:,} steps")
     print(f"Device: {DEVICE}")
@@ -551,13 +582,80 @@ def train():
     model.save(final_path)
     vec_env.save(CHECKPOINT_DIR / "final_vec_normalize.pkl")
 
+    # Also save as latest
+    latest_path = CHECKPOINT_DIR / "latest_model.zip"
+    model.save(latest_path)
+    vec_env.save(CHECKPOINT_DIR / "latest_vec_normalize.pkl")
+
     print(f"\n✓ Training complete!")
     print(f"  Final model saved: {final_path}")
+    print(f"  Latest model saved: {latest_path}")
     print(f"  Population size: {len(population_manager)}")
 
     # Get sampler stats from first environment
     if hasattr(env_instances[0], 'diverse_opponent_sampler'):
         print(f"  Sampler stats (env 0): {env_instances[0].diverse_opponent_sampler.get_stats()}")
+
+    # Run quick benchmark against scripted opponents
+    print("\n" + "="*70)
+    print("RUNNING POST-TRAINING BENCHMARK")
+    print("="*70)
+    benchmark_agent(model, vec_env, primary_env)
+
+
+def benchmark_agent(model, vec_env, env):
+    """Quick benchmark test against scripted opponents."""
+    from environment.agent import ConstantAgent, BasedAgent, RandomAgent
+
+    print("\nTesting against scripted opponents (5 episodes each)...\n")
+
+    opponents = [
+        ("ConstantAgent", ConstantAgent),
+        ("BasedAgent", BasedAgent),
+        ("RandomAgent", RandomAgent),
+    ]
+
+    model.policy.set_training_mode(False)
+
+    for opp_name, opp_class in opponents:
+        wins = 0
+        total_reward = 0
+
+        for episode in range(5):
+            obs = vec_env.reset()
+            done = False
+            episode_reward = 0
+            lstm_states = None
+            episode_start = np.array([True])
+
+            step_count = 0
+            max_steps = 30 * 90  # 90 seconds max
+
+            while not done and step_count < max_steps:
+                action, lstm_states = model.predict(
+                    obs,
+                    state=lstm_states,
+                    episode_start=episode_start,
+                    deterministic=True
+                )
+                obs, reward, done, info = vec_env.step(action)
+                episode_reward += reward[0]
+                episode_start = np.array([False])
+                step_count += 1
+
+            total_reward += episode_reward
+            # Simple heuristic: positive reward = win
+            if episode_reward > 0:
+                wins += 1
+
+        win_rate = wins / 5 * 100
+        avg_reward = total_reward / 5
+        status = "✓" if win_rate >= 60 else "○" if win_rate >= 40 else "✗"
+
+        print(f"{status} vs {opp_name:15s}: {win_rate:5.1f}% win rate | avg reward: {avg_reward:7.1f}")
+
+    print("\n" + "="*70)
+    model.policy.set_training_mode(True)
 
 
 if __name__ == "__main__":

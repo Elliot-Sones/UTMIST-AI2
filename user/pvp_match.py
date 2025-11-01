@@ -23,8 +23,8 @@ pygame.init()
 # Supply a checkpoint path only when using the RL controller.
 # ---------------------------------------------------------------------------
 AGENT_1_TYPE = "rl"
-AGENT_1_MODEL_PATH = "/rl_model_700000_steps.zip"
-AGENT_2_TYPE = "rules"
+AGENT_1_MODEL_PATH = "/Users/elliot18/Desktop/rl_model_900000_steps.zip"
+AGENT_2_TYPE = "human"
 AGENT_2_MODEL_PATH = None
 
 

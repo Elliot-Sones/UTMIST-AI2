@@ -20,12 +20,17 @@ except Exception:
     from supabase import create_client
 
     def _get_sb_client():
-        url = os.environ["SUPABASE_URL"]
-        key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        if not url or not key:
+            return None
         return create_client(url, key)
 
     def create_participant(username: str) -> None:
         client = _get_sb_client()
+        if client is None:
+            logger.warning("Supabase credentials not found - skipping database registration")
+            return
         existing = client.table("ai2_leaderboard").select("username").eq("username", username).execute()
         rows = []
         if hasattr(existing, "data") and isinstance(existing.data, list):
@@ -38,6 +43,9 @@ except Exception:
 
     def update_validation_status(username: str, status: bool) -> None:
         client = _get_sb_client()
+        if client is None:
+            logger.warning("Supabase credentials not found - skipping database update")
+            return
         client.table("ai2_leaderboard").update({"validation_status": status}).eq("username", username).execute()
 
 @pytest.mark.timeout(60) 

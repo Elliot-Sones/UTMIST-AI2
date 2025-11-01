@@ -678,7 +678,8 @@ def train():
 
     # Lightweight training monitor - tracks essential metrics
     class TrainingMonitor(CheckpointCallback):
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args, env=None, **kwargs):
+            self.training_env = env  # Store env reference before calling super
             super().__init__(*args, **kwargs)
             self.last_encoder_weights = None
             self.episode_rewards = []

@@ -152,6 +152,9 @@ class SimpleOpponentEncoder(nn.Module):
         self.register_buffer('buffer_idx', torch.tensor(0))
         self.diversity_strength = 0.1  # How much noise to add when diversity is low
 
+        # Store encodings for diversity loss computation
+        self.last_batch_encodings = None
+
         self.to(self.device)
 
     def forward(self, opponent_history):
@@ -175,22 +178,33 @@ class SimpleOpponentEncoder(nn.Module):
         # Encode to latent space
         encoding = self.encoder(flat_history)
 
-        # Diversity regularization: maintain varied outputs
-        if self.training:
-            # Store outputs in buffer
+        # CRITICAL: Explicit diversity loss to prevent collapse
+        if self.training and batch_size > 1:
+            # Compute batch-wise standard deviation per dimension
+            encoding_std = encoding.std(dim=0).mean()  # Higher = more diverse
+
+            # Diversity loss: penalize low variance (we want high variance)
+            # Using negative std as loss (minimize negative = maximize positive)
+            diversity_loss = -encoding_std * 0.5  # Scale factor for loss strength
+
+            # Inject into computational graph without changing forward output
+            # During forward: diversity_loss - diversity_loss.detach() = 0
+            # During backward: gradients flow through diversity_loss
+            encoding = encoding + (diversity_loss - diversity_loss.detach())
+
+            # Additional noise injection if still too collapsed
+            with torch.no_grad():
+                if encoding_std < 0.05:
+                    # Aggressive noise to break out of collapse
+                    noise = torch.randn_like(encoding) * 0.5
+                    encoding = encoding + noise
+
+            # Track in buffer for monitoring
             with torch.no_grad():
                 for i in range(min(batch_size, encoding.shape[0])):
                     idx = int(self.buffer_idx.item()) % 100
                     self.output_buffer[idx] = encoding[i].detach()
                     self.buffer_idx += 1
-
-                # Check diversity: compute std across buffer
-                buffer_std = self.output_buffer.std(dim=0).mean()
-
-                # If diversity too low, add noise to force variation
-                if buffer_std < 0.05:  # Threshold: diversity should be > 0.05
-                    noise = torch.randn_like(encoding) * self.diversity_strength
-                    encoding = encoding + noise
 
         return encoding
 
@@ -874,7 +888,11 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 1.1.0 - Strategy-Gated Architecture (Forces encoder dependency)")
+    print("Version 1.2.0 - Gating + Explicit Diversity Loss + Aggressive Noise")
+    print("  - Strategy-gated architecture (forces encoder dependency)")
+    print("  - Explicit diversity loss (penalizes low variance)")
+    print("  - Aggressive noise injection (0.5 when collapsed)")
+    print("  - 8 diverse opponents (aggressive, defensive, aerial, etc.)\n")
 
     # Train!
     model.learn(

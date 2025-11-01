@@ -18,6 +18,7 @@ Run:
 import os
 import sys
 import random
+import inspect
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # Apple Silicon support
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
@@ -155,6 +156,14 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 TENSORBOARD_DIR = Path(CHECKPOINT_DIR) / "tb_logs"
 TENSORBOARD_DIR.mkdir(parents=True, exist_ok=True)
 
+_LSTM_KWARGS = {
+    "dropout": 0.1,
+}
+if "layer_norm" in inspect.signature(nn.LSTM).parameters:
+    _LSTM_KWARGS["layer_norm"] = True
+else:
+    print("⚠ PyTorch LSTM does not support layer_norm; continuing without it.")
+
 # Agent hyperparameters
 AGENT_CONFIG = {
     # LSTM policy
@@ -179,10 +188,7 @@ AGENT_CONFIG = {
         },
         "ortho_init": False,
         "log_std_init": -0.5,
-        "lstm_kwargs": {
-            "dropout": 0.1,
-            "layer_norm": True,
-        },
+        "lstm_kwargs": _LSTM_KWARGS,
     },
 
     # PPO training

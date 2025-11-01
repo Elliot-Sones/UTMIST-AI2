@@ -679,7 +679,7 @@ def train():
     # Lightweight training monitor - tracks essential metrics
     class TrainingMonitor(CheckpointCallback):
         def __init__(self, *args, env=None, **kwargs):
-            self.training_env = env  # Store env reference before calling super
+            self.env_ref = env  # Store env reference before calling super
             super().__init__(*args, **kwargs)
             self.last_encoder_weights = None
             self.episode_rewards = []
@@ -741,7 +741,7 @@ def train():
 
                         # Show opponent distribution
                         try:
-                            base_env = self.training_env.envs[0]
+                            base_env = self.env_ref.envs[0] if hasattr(self.env_ref, 'envs') else self.env_ref
                             current_env = base_env
                             while current_env is not None:
                                 if hasattr(current_env, 'opponent_cfg'):

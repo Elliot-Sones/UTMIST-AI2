@@ -129,15 +129,16 @@ class SimpleOpponentEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.device = device if device is not None else DEVICE
 
-        # Simple 2-layer MLP
+        # Simple 2-layer MLP with dropout to prevent collapse
         input_dim = opponent_obs_dim * history_length
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
+            nn.Dropout(0.1),  # Prevent encoder collapse
             nn.Linear(256, latent_dim),
             nn.LayerNorm(latent_dim),
-            nn.ReLU()
+            nn.Tanh()  # Bounded outputs prevent explosion
         )
 
         self.to(self.device)
@@ -342,6 +343,8 @@ AGENT_CONFIG = {
     "clip_range": 0.2,
     "gamma": 0.99,
     "gae_lambda": 0.95,
+    "max_grad_norm": 0.5,        # Prevent exploding gradients
+    "vf_coef": 0.5,              # Value function coefficient
 }
 
 # Training settings
@@ -535,6 +538,8 @@ def train():
         clip_range=AGENT_CONFIG["clip_range"],
         gamma=AGENT_CONFIG["gamma"],
         gae_lambda=AGENT_CONFIG["gae_lambda"],
+        max_grad_norm=AGENT_CONFIG["max_grad_norm"],
+        vf_coef=AGENT_CONFIG["vf_coef"],
         policy_kwargs=policy_kwargs,
         device=DEVICE,
     )
@@ -564,9 +569,22 @@ def train():
             self.episode_count = 0
 
         def _on_step(self):
-            # Track episode outcomes
-            if hasattr(self.locals, 'infos'):
-                for info in self.locals.get('infos', []):
+            # Track episode outcomes - try multiple ways to get the data
+            infos = None
+            if hasattr(self, 'locals') and 'infos' in self.locals:
+                infos = self.locals['infos']
+            elif hasattr(self, 'model') and hasattr(self.model, 'ep_info_buffer'):
+                # Alternative: use model's episode info buffer
+                if len(self.model.ep_info_buffer) > 0:
+                    for ep_info in self.model.ep_info_buffer:
+                        if 'r' in ep_info and ep_info['r'] not in [r for r in self.episode_rewards[-10:]]:
+                            self.episode_rewards.append(ep_info['r'])
+                            self.episode_lengths.append(ep_info.get('l', 0))
+                            self.episode_count += 1
+                    infos = []  # Prevent double counting below
+
+            if infos is not None:
+                for info in infos:
                     if 'episode' in info:
                         # Episode finished - track reward and length
                         self.episode_rewards.append(info['episode']['r'])
@@ -664,7 +682,8 @@ def train():
                         if encodings:
                             encodings = np.array(encodings)
                             enc_std = encodings.std(axis=0).mean()  # diversity across samples
-                            print(f"  Encoding diversity: {enc_std:.4f} {'✓' if enc_std > 0.01 else '⚠️ COLLAPSED'}")
+                            # With Tanh activation, expect diversity 0.1-0.3
+                            print(f"  Encoding diversity: {enc_std:.4f} {'✓' if enc_std > 0.05 else '⚠️ COLLAPSED'}")
                     except Exception as e:
                         print(f"  Encoding diversity: [Error: {e}]")
 
@@ -683,8 +702,10 @@ def train():
                                 value_loss = self.model.logger.name_to_value['train/value_loss']
                                 print(f"  Value Loss: {value_loss:.4f}")
                             if 'train/entropy_loss' in self.model.logger.name_to_value:
-                                entropy = self.model.logger.name_to_value['train/entropy_loss']
-                                print(f"  Entropy: {entropy:.4f} {'✓' if entropy > 0.001 else '⚠️ LOW (less exploration)'}")
+                                entropy_loss = self.model.logger.name_to_value['train/entropy_loss']
+                                # Entropy loss is negative (we want to maximize entropy)
+                                # More negative = higher actual entropy (good!)
+                                print(f"  Entropy Loss: {entropy_loss:.4f} {'✓' if entropy_loss < -0.01 else '⚠️ LOW exploration'}")
                     except:
                         pass
 

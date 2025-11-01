@@ -144,11 +144,9 @@ AGENT_CONFIG = {
     "n_steps": 4096,
     "batch_size": 1024,
     "n_epochs": 6,
-    "learning_rate": 3e-4,
-    "min_learning_rate": 3e-5,
-    "ent_coef": 0.02,  # High exploration for diverse strategies
-    "clip_range": 0.2,
-    "clip_range_final": 0.1,
+    "learning_rate": linear_schedule(3e-4, 3e-5),  # Decay from 3e-4 to 3e-5
+    "ent_coef": linear_schedule(0.02, 0.005),  # Decay from 0.02 to 0.005
+    "clip_range": linear_schedule(0.2, 0.1),  # Decay from 0.2 to 0.1
     "gamma": 0.995,
     "gae_lambda": 0.98,
     "max_grad_norm": 1.5,
@@ -530,9 +528,10 @@ def train():
     print("TRAINING CONFIGURATION")
     print("=" * 70)
     print(f"Total timesteps: {TRAINING_CONFIG['total_timesteps']:,}")
-    print(f"Learning rate: {AGENT_CONFIG['learning_rate']} → {AGENT_CONFIG['min_learning_rate']}")
+    print(f"Learning rate: 3e-4 → 3e-5 (linear decay)")
     print(f"Batch size: {AGENT_CONFIG['batch_size']}")
-    print(f"Entropy coef: {AGENT_CONFIG['ent_coef']}")
+    print(f"Entropy coef: 0.02 → 0.005 (linear decay)")
+    print(f"Clip range: 0.2 → 0.1 (linear decay)")
     print(f"Population updates: every {POPULATION_CONFIG['update_frequency']:,} steps")
     print(f"Checkpoints: every {TRAINING_CONFIG['save_freq']:,} steps")
     print(f"Device: {DEVICE}")

@@ -175,16 +175,42 @@ POPULATION_CONFIG = {
     "use_population_prob": 0.70,  # 70% population, 30% scripted
 }
 
+# Action patterns for ClockworkAgent
+AGGRESSIVE_PATTERN = [
+    (15, ['d']), (3, ['d', 'j']), (2, []), (3, ['d', 'j']),
+    (15, ['d']), (5, ['d', 'l']), (10, ['d']), (3, ['j']),
+]
+
+DEFENSIVE_PATTERN = [
+    (20, []), (5, ['a']), (15, []), (3, ['j']),
+    (10, []), (4, ['l']), (25, []),
+]
+
+HIT_AND_RUN_PATTERN = [
+    (12, ['d']), (2, ['j']), (10, ['a']), (5, []),
+    (10, ['d']), (3, ['d', 'l']), (15, ['a']), (8, []),
+]
+
+AERIAL_PATTERN = [
+    (5, ['d']), (15, ['space']), (3, ['j']), (8, []),
+    (10, ['d']), (15, ['space']), (3, ['l']), (10, []),
+]
+
+SPECIAL_SPAM_PATTERN = [
+    (8, ['d']), (5, ['l']), (5, []), (5, ['l']),
+    (10, ['d']), (5, ['l']), (8, []), (3, ['j']), (5, ['l']),
+]
+
 # Scripted opponent mix (30% when population available, 100% initially)
 OPPONENT_MIX = {
     "constant": (0.05, partial(ConstantAgent)),
     "based": (0.10, partial(BasedAgent)),
     "random": (0.05, partial(RandomAgent)),
-    "clockwork_aggressive": (0.05, partial(ClockworkAgent, sequence_name="aggressive")),
-    "clockwork_defensive": (0.03, partial(ClockworkAgent, sequence_name="defensive")),
-    "clockwork_hit_run": (0.03, partial(ClockworkAgent, sequence_name="hit_and_run")),
-    "clockwork_aerial": (0.03, partial(ClockworkAgent, sequence_name="aerial")),
-    "clockwork_special": (0.03, partial(ClockworkAgent, sequence_name="special_spam")),
+    "clockwork_aggressive": (0.05, partial(ClockworkAgent, action_sheet=AGGRESSIVE_PATTERN)),
+    "clockwork_defensive": (0.03, partial(ClockworkAgent, action_sheet=DEFENSIVE_PATTERN)),
+    "clockwork_hit_run": (0.03, partial(ClockworkAgent, action_sheet=HIT_AND_RUN_PATTERN)),
+    "clockwork_aerial": (0.03, partial(ClockworkAgent, action_sheet=AERIAL_PATTERN)),
+    "clockwork_special": (0.03, partial(ClockworkAgent, action_sheet=SPECIAL_SPAM_PATTERN)),
 }
 
 # ============================================================================

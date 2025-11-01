@@ -631,8 +631,12 @@ def train():
     print(f"  Observation dim: {env.observation_space.shape[0]}")
     print(f"  LSTM handles temporal patterns over raw obs\n")
 
-    # Use enhanced policy class
-    policy_class = AGENT_CONFIG.get("policy_class", RecurrentPPO.policy_class)
+    # Use enhanced policy class (fallback to default MlpLstmPolicy if not specified)
+    policy_class = AGENT_CONFIG.get("policy_class")
+    if policy_class is None:
+        # Import default policy for fallback
+        from sb3_contrib.common.recurrent.policies import MlpLstmPolicy
+        policy_class = MlpLstmPolicy
 
     # Build advanced schedules for better convergence
     lr_schedule = cosine_schedule(
@@ -971,7 +975,7 @@ def train():
     )
 
     print("🚀 Training started\n")
-    print("Version 4.0 - ENHANCED STATE-OF-THE-ART RecurrentPPO")
+    print("Version 4.0 - ENHANCED STATE-OF-THE-ART RecurrentPPO-Grok")
     print("="*70)
     print("  - Advanced LSTM: 3-layer, 384-hidden with LayerNorm + Dropout")
     print("  - Enhanced rewards: Position control, combos, timing, momentum")

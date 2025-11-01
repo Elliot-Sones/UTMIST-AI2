@@ -58,14 +58,16 @@ class EnhancedRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
         observation_space,
         action_space,
         lr_schedule,
-        lstm_hidden_size=384,  # Increased from 256 for better capacity
-        n_lstm_layers=3,        # Increased from 2 for deeper temporal modeling
-        dropout=0.1,           # Dropout for regularization
         **kwargs
     ):
-        # Override policy_kwargs with enhanced architecture
+        # Get LSTM parameters from policy_kwargs, with defaults
         policy_kwargs = kwargs.get('policy_kwargs', {})
-        policy_kwargs.update({
+        lstm_hidden_size = policy_kwargs.get('lstm_hidden_size', 384)
+        n_lstm_layers = policy_kwargs.get('n_lstm_layers', 3)
+        dropout = policy_kwargs.get('dropout', 0.1)
+
+        # Override policy_kwargs with enhanced architecture
+        enhanced_policy_kwargs = {
             "lstm_hidden_size": lstm_hidden_size,
             "n_lstm_layers": n_lstm_layers,
             "net_arch": {
@@ -76,9 +78,12 @@ class EnhancedRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
             "shared_lstm": False,
             "enable_critic_lstm": True,
             "share_features_extractor": True,
-        })
+        }
 
-        kwargs['policy_kwargs'] = policy_kwargs
+        # Merge with existing policy_kwargs
+        enhanced_policy_kwargs.update(policy_kwargs)
+        kwargs['policy_kwargs'] = enhanced_policy_kwargs
+
         super().__init__(observation_space, action_space, lr_schedule, **kwargs)
 
         # Store dropout for later use
@@ -655,6 +660,17 @@ def train():
     )
 
     # Create Enhanced RecurrentPPO model with advanced architecture
+    # For our custom policy class, we need to pass LSTM parameters via policy_kwargs
+    if policy_class == EnhancedRecurrentActorCriticPolicy:
+        policy_kwargs = {
+            "lstm_hidden_size": AGENT_CONFIG["lstm_hidden_size"],
+            "n_lstm_layers": AGENT_CONFIG["n_lstm_layers"],
+            "dropout": AGENT_CONFIG["dropout"],
+        }
+    else:
+        # For default policy, use standard policy_kwargs
+        policy_kwargs = {}
+
     model = RecurrentPPO(
         policy_class,  # Use our enhanced policy class
         env,
@@ -673,13 +689,10 @@ def train():
         target_kl=AGENT_CONFIG["target_kl"],
         use_sde=AGENT_CONFIG["use_sde"],
         sde_sample_freq=AGENT_CONFIG["sde_sample_freq"],
+        policy_kwargs=policy_kwargs,  # Pass LSTM parameters here
         device=DEVICE,
         tensorboard_log=str(TENSORBOARD_DIR),
         seed=GLOBAL_SEED,
-        # Enhanced LSTM parameters
-        lstm_hidden_size=AGENT_CONFIG["lstm_hidden_size"],
-        n_lstm_layers=AGENT_CONFIG["n_lstm_layers"],
-        dropout=AGENT_CONFIG["dropout"],
     )
 
     print(f"✓ RecurrentPPO model created on {DEVICE}\n")

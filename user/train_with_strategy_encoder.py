@@ -1,4 +1,4 @@
-"""
+git """
 UTMIST AI² - Strategy-Conditioned RecurrentPPO with Population-Based Self-Play
 ================================================================================
 
@@ -740,11 +740,16 @@ def train():
     print(f"\n✓ Training complete!")
     print(f"  Final model saved: {final_path}")
     print(f"  Latest model saved: {latest_path}")
-    print(f"  Population size: {len(population_manager)}")
 
-    # Get sampler stats from first environment
-    if hasattr(env_instances[0], 'diverse_opponent_sampler'):
+    # Get population size from callback's population manager
+    if hasattr(population_update_callback, 'population_manager'):
+        print(f"  Population size: {len(population_update_callback.population_manager)}")
+
+    # Get sampler stats from first environment (only works with DummyVecEnv)
+    if len(env_instances) > 0 and hasattr(env_instances[0], 'diverse_opponent_sampler'):
         print(f"  Sampler stats (env 0): {env_instances[0].diverse_opponent_sampler.get_stats()}")
+    else:
+        print(f"  Sampler stats: Not available (using multiprocessing)")
 
     # Run quick benchmark against scripted opponents
     print("\n" + "="*70)

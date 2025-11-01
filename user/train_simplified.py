@@ -776,7 +776,7 @@ def train():
                     print(f"  Weight change (How mcuh params moved): {weight_change:.6f} {'✓' if weight_change > 1e-4 else '⚠️ STUCK'}")
                 self.last_encoder_weights = current_weights.clone()
 
-                # 3. Encoding diversity
+                # 3. Encoding diversity (NEW: no history buffer, just current state)
                 if hasattr(self.model, 'rollout_buffer') and self.model.rollout_buffer.size() > 0:
                     try:
                         buffer = self.model.rollout_buffer
@@ -784,34 +784,26 @@ def train():
                         obs_samples = buffer.observations[:sample_size]
 
                         base_dim = self.model.policy.features_extractor.base_obs_dim
-                        history_dim = self.model.policy.features_extractor.history_dim
+                        opponent_obs_dim = self.model.policy.features_extractor.opponent_obs_dim
 
                         encoder.eval()
                         with torch.no_grad():
                             encodings = []
                             for obs in obs_samples:
-                                # Observation is already a flat array
+                                # Observation: [player_state, opponent_state]
+                                # Extract opponent state (second half)
                                 if len(obs.shape) == 1:
-                                    # Extract history portion from end of observation
-                                    history_flat = obs[base_dim:]
+                                    opponent_state = obs[base_dim//2:]
                                 else:
-                                    # Already batched
-                                    history_flat = obs[:, base_dim:]
-
-                                # Ensure we have the right size
-                                if history_flat.shape[-1] != history_dim:
-                                    continue
+                                    opponent_state = obs[:, base_dim//2:]
 
                                 # Convert to tensor
-                                history_t = torch.FloatTensor(history_flat).to(encoder.device)
-                                if len(history_t.shape) == 1:
-                                    history_t = history_t.unsqueeze(0)
+                                opponent_t = torch.FloatTensor(opponent_state).to(encoder.device)
+                                if len(opponent_t.shape) == 1:
+                                    opponent_t = opponent_t.unsqueeze(0)
 
-                                # Reshape to [batch, seq_len, obs_dim]
-                                history = history_t.view(-1, encoder.history_length, encoder.opponent_obs_dim)
-
-                                # Get encoding
-                                enc = encoder(history).cpu().numpy()
+                                # Get encoding (encoder now takes current state only!)
+                                enc = encoder(opponent_t).cpu().numpy()
                                 if len(enc.shape) > 1:
                                     enc = enc[0]
                                 encodings.append(enc)
@@ -821,7 +813,7 @@ def train():
                             encodings = np.array(encodings)
                             enc_std = encodings.std(axis=0).mean()  # diversity across samples
                             # With Tanh activation, expect diversity 0.1-0.3
-                            print(f"  Encoding diversity(how much the encoding varies between samples): {enc_std:.4f} {'✓' if enc_std > 0.05 else '⚠️ COLLAPSED'}")
+                            print(f"  Encoding diversity (how much encodings vary): {enc_std:.4f} {'✓' if enc_std > 0.05 else '⚠️ COLLAPSED'}")
                     except Exception as e:
                         print(f"  Encoding diversity: [Error: {e}]")
 

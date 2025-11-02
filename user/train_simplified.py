@@ -1,4 +1,5 @@
 """
+Current:
 UTMIST AI² - RecurrentPPO (LSTM-only) Training
 ================================================
 
@@ -7,8 +8,23 @@ Architecture: Pure RecurrentPPO with MlpLstmPolicy (no custom encoder).
 - No feature extractor customization
 - LSTM handles temporal credit assignment over raw observations
 
-Run:
-    python user/train_simplified.py
+Plan: 
+
+Defined goal: have a model that is so good that it can beat you in the game. As it recognises your strategy and knows how to counter it
+
+Build the unstoppable research grade overpowered agent.
+
+Parts of the model: 
+
+Encoding strategy
+
+RNN 
+
+RL 
+
+Self adverserial +randomization of training
+
+
 """
 
 # ============================================================================
